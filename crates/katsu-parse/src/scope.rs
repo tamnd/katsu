@@ -45,6 +45,8 @@
 //! Direct `eval` and `with` poison a scope and lose static resolution for everything in it. Both
 //! are refused by the adapter today, so there is nothing here to poison.
 
+use std::rc::Rc;
+
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
@@ -101,7 +103,11 @@ impl BindingKind {
 #[derive(Clone, Debug)]
 pub struct Binding {
     /// The name as written.
-    pub name: String,
+    ///
+    /// Shared with the key in the scope it was declared in, because a declaration otherwise costs
+    /// two copies of the same short string and a file of two hundred small functions has a
+    /// thousand declarations in it.
+    pub name: Rc<str>,
     /// The declarator, from the name to the end of the initialiser if there is one.
     ///
     /// The end matters as much as the start. A `let` is in its dead zone until its initialiser has
@@ -272,7 +278,7 @@ struct BlockScope {
     /// The braces this scope covers, used to decide whether a hoisted `var` passes through it.
     span: Span,
     /// The names declared directly in it.
-    names: FxHashMap<String, BindingId>,
+    names: FxHashMap<Rc<str>, BindingId>,
 }
 
 /// The function currently being walked, and where its own scope sits on the block stack.
@@ -443,7 +449,7 @@ impl Analyser {
     ) -> Result<BindingId, ScopeError> {
         let scope = self.blocks.last().expect("a scope is always open");
 
-        if let Some(existing) = scope.names.get(&name.name).copied() {
+        if let Some(existing) = scope.names.get(name.name.as_str()).copied() {
             let existing = self.bindings[existing.0 as usize].kind;
             if existing.is_exclusive() || kind.is_exclusive() {
                 return Err(already_declared(name));
@@ -465,8 +471,9 @@ impl Analyser {
                 .expect("a program has fewer than four billion bindings"),
         );
         let function = self.current();
+        let shared: Rc<str> = Rc::from(name.name.as_str());
         self.bindings.push(Binding {
-            name: name.name.clone(),
+            name: Rc::clone(&shared),
             span,
             kind,
             function,
@@ -478,7 +485,7 @@ impl Analyser {
             .last_mut()
             .expect("a scope is always open")
             .names
-            .insert(name.name.clone(), id);
+            .insert(shared, id);
         Ok(id)
     }
 
@@ -1077,12 +1084,12 @@ mod tests {
         let captured = scopes
             .bindings()
             .iter()
-            .find(|binding| binding.name == "captured")
+            .find(|binding| &*binding.name == "captured")
             .expect("the name is declared");
         let plain = scopes
             .bindings()
             .iter()
-            .find(|binding| binding.name == "plain")
+            .find(|binding| &*binding.name == "plain")
             .expect("the name is declared");
         assert!(captured.captured);
         assert!(!plain.captured);
