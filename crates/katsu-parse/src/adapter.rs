@@ -777,7 +777,7 @@ fn assignment_target_span(target: &oxc::AssignmentTarget<'_>) -> oxc::Span {
 /// Only ever called on the error path, so a scan from the start of the file is fine and a line
 /// table would be a cache with nothing to serve. The column counts characters rather than bytes,
 /// because a column that lands mid character in a file with an accent in it is worse than useless.
-fn line_and_column(source: &str, offset: u32) -> (u32, u32) {
+pub(crate) fn line_and_column(source: &str, offset: u32) -> (u32, u32) {
     let offset = (offset as usize).min(source.len());
     let before = &source[..offset];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;

@@ -10,6 +10,11 @@
 //! exists to protect. The number that matters for the startup budget is the total anyway, since a
 //! program pays for both or neither.
 //!
+//! Scope analysis is measured separately as well as inside the `parse` total, because it is the
+//! one pass here that can be handed an already adapted tree without poking a hole in the boundary
+//! the adapter exists to keep. The two numbers together say how much of the frontend budget the
+//! resolution costs, which is the thing to watch as it learns about more of the language.
+//!
 //! Two shapes are measured because they stress different things. A file of small functions is what
 //! real code looks like and what the per node cost shows up in. A single long function is the
 //! adapter's recursion depth and vector growth with no function boundaries to break it up.
@@ -23,7 +28,7 @@ use std::hint::black_box;
 use std::sync::LazyLock;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use katsu_parse::parse;
+use katsu_parse::{parse, scope};
 
 /// A file of small functions, roughly the shape of a module a person would write.
 ///
@@ -63,14 +68,17 @@ static TYPED_MODULE: LazyLock<String> = LazyLock::new(|| {
     source
 });
 
+/// The three sources, with the path that decides how each one is parsed.
+const SOURCES: [(&str, &str, &LazyLock<String>); 3] = [
+    ("many_functions", "many.js", &MANY_FUNCTIONS),
+    ("one_long_function", "long.js", &ONE_LONG_FUNCTION),
+    ("typed_module", "typed.ts", &TYPED_MODULE),
+];
+
 fn frontend(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse");
 
-    for (name, path, source) in [
-        ("many_functions", "many.js", &*MANY_FUNCTIONS),
-        ("one_long_function", "long.js", &*ONE_LONG_FUNCTION),
-        ("typed_module", "typed.ts", &*TYPED_MODULE),
-    ] {
+    for (name, path, source) in SOURCES {
         group.throughput(Throughput::Bytes(source.len() as u64));
         group.bench_function(name, |b| {
             b.iter(|| {
@@ -86,5 +94,20 @@ fn frontend(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, frontend);
+/// Scope analysis on its own, over a tree that has already been adapted.
+fn scopes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scope");
+
+    for (name, path, source) in SOURCES {
+        let module = parse(path, source).expect("should parse");
+        group.throughput(Throughput::Bytes(source.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| scope::analyse(black_box(&module.ast)).expect("should resolve"));
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, frontend, scopes);
 criterion_main!(benches);
