@@ -2,6 +2,34 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.0.3
+
+Three pull requests on. The frontend section of M0 is finished, so a source file now goes all the way to verified bytecode. Nothing executes that bytecode yet, and the interpreter is the next thing.
+
+### Bytecode
+
+An instruction set to lower into, in #29. Sixty odd opcodes in decoded enum form, register based and three address, with the byte encoding deliberately deferred until there is an on disk cache that needs one. A `FunctionBlueprint` carries the code, the constant pool, the source positions and the frame size, and it can verify itself: every register inside the frame, every jump target inside the code, every constant index in range, and the last instruction a terminator. The disassembler exists for the same reason, so a lowering test asserts on something that reads like bytecode rather than on a struct literal.
+
+Source positions are stored as a delta compressed sidecar rather than a field on each instruction, so an instruction stays small and a position is still available for every one of them. Retrofitting positions after the fact is a thing that never actually happens, so they are there from the first opcode.
+
+### Frontend
+
+Lowering, in #31. A single walk from the resolved tree to a blueprint per function, with registers allocated on a stack discipline and the frame size as a watermark that allocation raises and nothing lowers. Operands are released before the destination is allocated, which keeps `a * b + c` in three registers instead of five and is safe because a three address op reads every operand before it writes anything. Reading a local returns the variable's own slot instead of copying it, and the one hazard that comes with that, an operand that assigns to the variable the other operand just read, is handled by pinning the earlier value into a temporary.
+
+Jump targets are absolute instruction indices patched after the fact, emitted as `u32::MAX` rather than zero so that a target nobody patched is a number the verifier rejects on sight instead of a plausible index that happens to be wrong.
+
+Lowering is a seventh to a fifth of the frontend, measured on all three reference machines and recorded in spec 04.5.1. Together with scope analysis that is about a third of the frontend, which puts the other two thirds in the parser and the adapter, and it says the startup budget will be won in the laziness work rather than in either pass we wrote. TypeScript annotations cost lowering nothing, for the same reason they cost scope analysis nothing: erasure happens in the adapter.
+
+### Packaging
+
+The Intel macOS binary is built on a runner that still exists, in #30. GitHub retired the Intel macOS image and the release job had been pointing at it.
+
+### Known gaps
+
+The three from 0.0.1 are unchanged: no ropes so concatenation is quadratic, no hash flooding resistance until the realm can carry a per process seed, and the atom table's buckets sit outside the cage and so miss the heap census. The four from 0.0.2 in the scope pass are unchanged too. Two more are named in lowering: `arguments` and `new` are refused by name with a line and a column, because the first needs frames that do not exist and the second needs the object model from spec 07.
+
+Native Windows runs the frontend 20 to 40 percent slower than WSL2 on the same silicon, and `parse` on a file of small functions is 554 us against 323 us. That gap is too large to be code generation and it is written down here so that it gets chased rather than absorbed.
+
 ## 0.0.2
 
 Two pull requests on from the first tag. Still nothing runs, and the interpreter is still the next thing, but the platform layer now covers all three operating systems and the frontend resolves every name it parses.
