@@ -16,6 +16,37 @@ The reason not to compress registers is that a compressed double has to be boxed
 
 The consequence is that loading a value from a slot into a register is a decompress (add the cage base, or a shift plus add for a Smi) and storing is a compress with a check. Those are one or two instructions, they are what every V8 property access already pays, and they are the price of the memory goal.
 
+### 7.1.1 The 64 bit register encoding, decided
+
+This is the concrete scheme, implemented in `crates/katsu-vm/src/value.rs`. It is JavaScriptCore's, and the interesting part is why it is not the scheme everybody reaches for first.
+
+The obvious NaN boxing scheme says that a double is anything that is not a NaN, and that every quiet NaN bit pattern is therefore free to carry a payload. That is wrong on the hardware we ship on. x86 SSE produces `0xFFF8_0000_0000_0000` as the result of an invalid operation, which is a *negative* quiet NaN, so the sign bit cannot be used to separate payloads from arithmetic results and the free space is not where the scheme assumes it is. Engines that started with the naive layout ended up carving exceptions into it. Offsetting the doubles avoids the question rather than answering it.
+
+The encoding, on 64 bit platforms:
+
+| Range | Meaning |
+|---|---|
+| `0x0000_0000_0000_0000` | empty, meaning no value at all, distinct from `undefined` |
+| `0x0000_0000_0000_0002` | `null` |
+| `0x0000_0000_0000_0006` | `false` |
+| `0x0000_0000_0000_0007` | `true` |
+| `0x0000_0000_0000_000A` | `undefined` |
+| `0x0000_0000_0000_0000 ..= 0x0000_FFFF_FFFF_FFFF` | pointer, otherwise |
+| `0x0002_0000_0000_0000 ..= 0xFFF2_0000_0000_0000` | double, with `2^49` added |
+| `0xFFFE_0000_0000_0000 ..= 0xFFFE_FFFF_FFFF_FFFF` | 32 bit integer in the low half |
+
+A double is encoded by adding `2^49` to its bit pattern and decoded by subtracting it. Every finite double, every infinity, and the one canonical NaN lands in a band that sits above every representable pointer and below the integer tag, so the three cases are separated by a single unsigned comparison each and no case needs a mask.
+
+Two details that are load bearing. NaN is canonicalised to `0x7FF8_0000_0000_0000` before the offset is added, because without that the largest NaN bit pattern wraps past the integer tag and becomes an integer. JavaScript has exactly one observable NaN, so nothing is lost. And the immediates are laid out so the common predicates are one mask and one compare: `null` is `0b0010` and `undefined` is `0b1010`, differing in one bit, so the nullish test that `??` and `?.` need is a mask and a compare rather than two compares. `false` is `0b0110` and `true` is `0b0111` on the same principle, with the value itself in the low bit.
+
+Integers get the top of the range rather than the bottom because a negative integer sign extends, and putting the tag above the sign extension is what lets the payload be read with a truncation instead of a mask and a shift.
+
+`from_f64` chooses the integer form when the double is exactly an integer in range, which is what a bytecode does when it does not yet know the shape of a number. It deliberately keeps negative zero as a double, because `Object.is(-0, 0)` is false and collapsing it to the integer zero would be an observable bug.
+
+The pointer range asserts rather than masks. Current 64 bit platforms give userspace 48 bits of address and the cage in 7.2 is a 4 GB reservation well inside that, so a real heap pointer always fits. If a future platform hands out wider addresses we want a panic on the first allocation, not silently truncated pointers.
+
+Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. On an M series laptop, over batches of 1024 values, encoding an integer costs about 0.26 ns per value, a round trip through encode and decode about 0.05 ns per value, and the integer predicate about 0.06 ns per value, all of which is the compiler vectorising work that has no branches in it. The number to take from that is not the speed, it is that the tagging is not a serial dependency and does not stop the vectoriser.
+
 ## 7.2 The cage
 
 All of the JavaScript heap lives in one reserved region of virtual address space per isolate, aligned so that the base can be held in a pinned register and the compression is a masked add.
