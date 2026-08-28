@@ -910,12 +910,41 @@ impl<'a> Lowerer<'a> {
                 Ok(register)
             }
             ExprKind::Logical { op, left, right } => {
-                let register = self.destination(dst);
+                // The rule three doc comments above this one, which this arm used to break. A
+                // short circuiting operator evaluates its left side, keeps the value, and then
+                // evaluates its right side, so building the result in the destination writes the
+                // destination before an operand that is still allowed to read it. When the
+                // destination is a variable's own slot that is the variable being read, and
+                // `v = 1.5 && ('x' + v)` gave back the 1.5 instead of the old `v`.
+                //
+                // The compound form of the same operator has always allocated here, with a comment
+                // saying the result has to end up in a register that is nobody's variable. It was
+                // right and this was the same problem one arm over.
+                //
+                // Found by the differential harness against node. The cost is one move on
+                // `let x = a || b`, and removing it needs to know whether the right side reads the
+                // variable the destination belongs to, which is a walk with the resolutions in hand
+                // rather than the shape check `writes_a_variable` does.
+                let wanted = self.destination(dst);
+                let register = if wanted.0 < self.first_temp {
+                    self.alloc()
+                } else {
+                    wanted
+                };
                 self.expr_into(left, register)?;
                 let jump = self.short_circuit(at, *op, register);
                 self.expr_into(right, register)?;
                 self.patch(jump);
-                Ok(register)
+                if register != wanted {
+                    self.emit(
+                        at,
+                        Op::Move {
+                            dst: wanted,
+                            src: register,
+                        },
+                    );
+                }
+                Ok(wanted)
             }
             ExprKind::Assign { op, target, value } => self.assign(at, *op, target, value, dst),
             ExprKind::Conditional {
@@ -1975,11 +2004,12 @@ mod tests {
             &code(&lowered("let a = null; let b = a ?? 1;")),
             "
             load_null r0
-            move r1, r0
-            load_null r2
-            equal r3, r1, r2, ic0
-            jump_if_false r3, @6
-            load_int r1, 1
+            move r2, r0
+            load_null r3
+            equal r4, r2, r3, ic0
+            jump_if_false r4, @6
+            load_int r2, 1
+            move r1, r2
             load_undefined r2
             return r2
             ",
@@ -1988,15 +2018,39 @@ mod tests {
 
     #[test]
     fn and_short_circuits_without_evaluating_the_right_side() {
+        // The result is built in a temporary and moved into `b` at the end rather than built in
+        // `b`, because the right side of a short circuiting operator runs after the left side has
+        // already produced a value and is allowed to read the destination while it does.
         assert_code(
             &code(&lowered("let a = 1; let b = a && 2;")),
             "
             load_int r0, 1
-            move r1, r0
-            jump_if_false r1, @4
-            load_int r1, 2
+            move r2, r0
+            jump_if_false r2, @4
+            load_int r2, 2
+            move r1, r2
             load_undefined r2
             return r2
+            ",
+        );
+    }
+
+    #[test]
+    fn a_short_circuiting_operator_does_not_clobber_the_variable_it_assigns_to() {
+        // `v = 1.5 && ('x' + v)` printed "x1.5" instead of "x3", because the left side landed in
+        // `v`'s own slot before the right side read `v`. Asserted on the bytecode rather than on
+        // the answer so that the shape that was wrong is the thing being checked: the left side
+        // goes to a temporary and `v` is written once, at the end.
+        assert_code(
+            &code(&lowered("let v = 3; v = 1.5 && v;")),
+            "
+            load_int r0, 3
+            load_const r1, k0
+            jump_if_false r1, @4
+            move r1, r0
+            move r0, r1
+            load_undefined r1
+            return r1
             ",
         );
     }

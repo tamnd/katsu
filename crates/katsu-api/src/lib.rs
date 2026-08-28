@@ -80,10 +80,11 @@ impl Runtime {
     pub fn new() -> Result<Runtime, Error> {
         let mut interpreter =
             Interpreter::new().map_err(|error| Error::Fatal(error.to_string()))?;
-        // The globals a program is entitled to assume are there. One call today and a list of them
-        // later, and it is here rather than inside `Interpreter::new` because the interpreter is the
-        // machine and this is the standard library it happens to be started with. An embedder that
-        // wants a bare machine wants the interpreter, not this.
+        // The globals a program is entitled to assume are there. It is here rather than inside
+        // `Interpreter::new` because the interpreter is the machine and this is the standard library
+        // it happens to be started with. An embedder that wants a bare machine wants the
+        // interpreter, not this.
+        katsu_builtins::install_globals(&mut interpreter)?;
         katsu_builtins::install_console(&mut interpreter)?;
         Ok(Runtime { interpreter })
     }

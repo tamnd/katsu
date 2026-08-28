@@ -2,7 +2,7 @@
 
 A JavaScript and TypeScript runtime written in Rust. Its own JIT, built from scratch, no V8 and no JavaScriptCore. An ahead of time mode that compiles your program into a Rust binary. Enough Node.js compatibility that unmodified npm packages run. Two way interop with Rust that is pleasant from both sides.
 
-**Status: M0, most of the way through.** `katsu run` executes a program and `console.log` prints, which is the smallest thing a runtime can do that is worth measuring, and the conformance runner reports 6.65% of test262. That number is 5,405 cases of the 81,225 it attempted, and it is small for one specific reason worth knowing before you read anything into it: 75,804 of the cases it could not run stop at the same `switch` statement in the suite's own harness, so most of the suite is not being attempted rather than being failed. There are no objects, no functions, no modules and no event loop yet. If you want to know what the finished thing is supposed to be and why, read [`spec/`](spec/). If you want to know what is actually built, read the [milestones](https://github.com/tamnd/katsu/milestones).
+**Status: M0, most of the way through.** `katsu run` executes a program and `console.log` prints, which is the smallest thing a runtime can do that is worth measuring, and the conformance runner reports 6.65% of test262. That number is 5,405 cases of the 81,225 it attempted, and it is small for one specific reason worth knowing before you read anything into it: 75,804 of the cases it could not run stop at the same `switch` statement in the suite's own harness, so most of the suite is not being attempted rather than being failed. The differential harness agrees with node on two thousand generated programs per commit, after fixing the three bugs its first run found. There are no objects, no functions, no modules and no event loop yet. If you want to know what the finished thing is supposed to be and why, read [`spec/`](spec/). If you want to know what is actually built, read the [milestones](https://github.com/tamnd/katsu/milestones).
 
 ## The goal
 
@@ -78,6 +78,16 @@ cargo run --release -p test262-runner -- --filter language/asi --top 30
 ```
 
 A run that legitimately changes the result is blessed with `--bless` and the regenerated file goes in the same pull request as the change that caused it. The suite revision is pinned in CI and recorded in the expectations file, because the suite gains and renames tests every week and a run against a different revision produces a diff that looks exactly like a regression.
+
+The differential harness generates programs from a seed and compares what katsu does with them against what node does, which is a different question from conformance: test262 asks whether we follow the standard and this asks whether we behave like the implementation everybody's code was written against. It needs node on the path and says so rather than quietly comparing katsu with itself and reporting that everything agreed.
+
+```
+cargo run --release -p differential
+cargo run --release -p differential -- --count 50000 --seed 12345
+cargo run --release -p differential -- --only 449
+```
+
+Every divergence prints the program shrunk down to the statements that still reproduce it and the seed to get it back. Its first run found three bugs: `undefined` was not a binding, `console.log(-0)` printed `0`, and the short circuiting operators built their result in the destination register before evaluating the right hand side, so `v = 1.5 && ('x' + v)` read back the value it had just written. [`spec/14-quality-bar.md`](spec/14-quality-bar.md) section 14.5.1 has the detail.
 
 Benchmarks run on the reference machines named in [`spec/15-benchmarks.md`](spec/15-benchmarks.md) rather than on whatever laptop is nearest, because a timing without a machine attached to it is not a result. `cargo run -p xtask -- machines` lists them and says which ones are reachable, and `cargo run -p xtask -- bench --machine gamingpc -p katsu-vm` runs a crate's benchmarks on the x86-64 reference by checking out the current commit there, which it refuses to do if that commit has not been pushed.
 
