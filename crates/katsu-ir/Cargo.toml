@@ -22,3 +22,10 @@ thiserror.workspace = true
 [features]
 default = []
 serde = ["dep:serde", "smallvec/serde"]
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "pool"
+harness = false
