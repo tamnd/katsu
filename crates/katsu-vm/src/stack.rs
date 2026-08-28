@@ -85,6 +85,14 @@ pub enum StackError {
 /// Three of the six describe this frame and three describe how to get back out of it. That split is
 /// worth noticing, because `return_pc` and `return_to` are about the caller and living on the callee
 /// is what makes a return one pop rather than a search.
+///
+/// The two words calls added, `function` and `context`, took the header from sixteen bytes to
+/// twenty four, and that is not free. On the 13900K a push and pop pair went from 6.40 ns to 7.71 ns
+/// when the only change was the two new fields, which is 22 percent of the cheapest call there is.
+/// The same change costs nothing measurable on the m4. Padding the header to thirty two bytes did
+/// not help, so this is the extra store and the load that reads across it rather than the multiply
+/// an odd element size costs. Spec 5.4.1 has the numbers and the way back down to sixteen bytes,
+/// which is a `u32` base and finding `size` and `return_to` somewhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Index into the value region where this frame's register zero lives.
@@ -212,9 +220,14 @@ impl Stack {
 
     /// Every value slot that belongs to a live frame.
     ///
-    /// This is the root set, and the reason the header is not stored inline. A collector walks this
-    /// slice and every element in it is a value, with no frame boundaries to respect and no words to
-    /// skip. See the note at the top of this module.
+    /// This is most of the root set, and the reason the header is not stored inline. A collector
+    /// walks this slice and every element in it is a value, with no frame boundaries to respect and
+    /// no words to skip. See the note at the top of this module.
+    ///
+    /// It stopped being all of the root set when frames grew a context. A frame's context is a heap
+    /// pointer that lives in the header rather than in a register, so a collector has to walk
+    /// [`Stack::frames`] for those as well. Nothing collects yet, so this is a note for M1 rather
+    /// than a bug: the pointer is here, it is just not in this slice.
     #[must_use]
     pub fn roots(&self) -> &[Value] {
         // SAFETY: slots below `top` belong to a live frame, every one of them was written by `push`

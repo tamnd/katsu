@@ -122,7 +122,11 @@ There is also `#[loop_match]`, the experimental computed goto style work in rust
 
 `crates/katsu-vm/src/interpret.rs` is strategy A, written flat. Every opcode is one arm of one match, the arm does the work, and nothing is hidden behind a generic helper that takes a closure. That costs some repetition and it buys the property 5.2 is actually asking for, which is that the semantics of an opcode are readable in one place. It also means an arm can be split into a fast path and a slow path when the quickening in 5.5 arrives, without unpicking an abstraction first.
 
-Everything that happens inside a single frame runs: the loads and moves, arithmetic, the bitwise operators, comparisons, the unary operators, the temporal dead zone checks, jumps, back edges and `return`. Strings run too, now that the interpreter owns an isolate: a string literal reaches a register, two of them concatenate, they compare by code unit and they convert to numbers and booleans by the rules the standard gives. Calls, closures, environments, globals and property access still need an object with a shape to point at, which M0 does not have yet, so every one of them falls through to the arm at the bottom of the match and produces an error naming the opcode. A refusal that says `get_index is not implemented yet` is worth a great deal more than a wrong answer, and it is the difference between a runtime that is incomplete and one that is untrustworthy.
+Everything that happens inside a single frame runs: the loads and moves, arithmetic, the bitwise operators, comparisons, the unary operators, the temporal dead zone checks, jumps, back edges and `return`. Strings run too, now that the interpreter owns an isolate: a string literal reaches a register, two of them concatenate, they compare by code unit and they convert to numbers and booleans by the rules the standard gives.
+
+Calls, closures and environments run as well. A call pushes a frame, copies the arguments out of a run of the caller's own registers, runs the callee and writes what it returned into the register the call names. A function nested inside another one becomes a closure over the environment it was written in, and a variable a closure captures moves out of a register and into a context, which is a heap object holding one cell per captured variable and a pointer to the context outside it. Recursion works, a closure outlives the call that made it, two closures over the same function get a cell each, and a program that never stops calling itself gets the depth limit rather than a segmentation fault.
+
+Globals, property access and method calls still need an object with a shape to point at, which M0 does not have yet, so those fall through to the arm at the bottom of the match and produce an error naming the opcode. A refusal that says `get_index is not implemented yet` is worth a great deal more than a wrong answer, and it is the difference between a runtime that is incomplete and one that is untrustworthy.
 
 The numeric conversions live in their own module, because each of them is a place where the obvious Rust expression is subtly not what JavaScript says. `ToInt32` is a modulo and a fold rather than a cast, so `1e10 | 0` is `1410065408` while `1e10 as i32` saturates. A shift count is taken modulo thirty two, so `1 << 32` is `1`. Exponentiation disagrees with IEEE `pow` in exactly two places, `1 ** NaN` and `(-1) ** Infinity`, both of which are `NaN` in JavaScript and one in IEEE. Relational comparison between two numbers is the one case where the obvious expression is right, because Rust's float operators are the IEEE ones and already return false on both sides of a `NaN`, which is what the standard asks for. That is why each of the four relational opcodes uses its own operator on its fast path rather than sharing one helper that returns a three way answer. The standard's abstract relational comparison really does have three outcomes, less, not less, and undefined for a `NaN`, but the undefined case only becomes visible once the code has to decide which way to negate, and it only has to decide that on the slow path. On the fast path `a >= b` is a single instruction that is already correct.
 
@@ -176,6 +180,36 @@ Concatenating is a different order of magnitude, because it allocates. Sixty nan
 
 The benchmark uses a fresh isolate per iteration because every concatenation allocates and there is no collector to take it back yet. That is the only benchmark in the workspace whose shape is dictated by a milestone that has not landed, and it goes back to an ordinary persistent interpreter once M4 gives the heap a way to reclaim. Until then the concatenation number carries a fixed setup cost that a real program would pay once, so read it as an upper bound.
 
+### 5.3.4 What a call costs
+
+Three benchmarks, all compiled from source rather than assembled by hand, because the point is what a program pays and not what an opcode costs in isolation. A thousand `id(1)` statements against a function whose whole body is `return x`, which is the shortest call there is. A thousand calls through a closure whose body reads one variable it captured, which is what any function that uses a name from where it was written pays on top. And `fib(20)`, which is recursion with a real stack under it and the oldest benchmark in the business.
+
+`fib(20)` makes 21,891 calls, counting the outermost one. The count satisfies `C(n) = 1 + C(n-1) + C(n-2)`, which closes to `2 * F(n+1) - 1`, and `F(21)` is 10,946. That number is in the benchmark as a constant so that criterion divides by it and reports the cost of one call rather than the cost of one tree.
+
+| Operation, per call | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| A call and a return | 7.01 ns | 9.46 ns | 9.90 ns |
+| The same through a closure that reads one captured variable | 14.71 ns | 15.49 ns | 15.87 ns |
+| A call inside `fib(20)` | 20.42 ns | 23.24 ns | 23.50 ns |
+
+The Windows column is the lower of two runs of every row, because that box moves by up to a fifth between runs in one direction only, and background work makes a benchmark slower rather than faster. The gamingpc column was taken with a load average of about 3.6 on an otherwise idle desktop, which is WSL2 doing its own housekeeping.
+
+A bare call and return is seven to ten nanoseconds, which is close to the stack work in 5.4.1 plus the dispatch for the two opcodes around it, so there is nothing hiding in the call path that the frame does not explain. A call inside `fib` costs three times that, and it should: each call runs a comparison, a conditional jump, two subtractions, an addition, two `return` paths and the two calls themselves, so about ten instructions at the one and a half nanoseconds 5.3.1 measured, on top of its own frame. Twenty nanoseconds is roughly what those parts add up to.
+
+The row that does not add up is the closure. Reading one captured variable and adding it doubles the cost of the call, and a load and an add are not seven nanoseconds of work. The read goes through the frame header to find the context, decodes a slot, checks that it really points at a context, bounds checks the cell index against the context's length and builds an `Option` at each step, which is four dependent loads and four branches to fetch one value that a real engine gets in one instruction. It is correct and it is measured, and it is the first thing the quickening in 5.5 should take, because a captured read has exactly the shape an inline cache wants: the hop count and the slot are known at compile time and the only thing that varies is the context.
+
+Node is the point of comparison and there are two of them, because comparing our interpreter against a fully warmed optimizing compiler answers a different question than comparing it against Node's interpreter.
+
+| `fib(20)`, per call | m4 | gamingpc-win |
+|---|---|---|
+| katsu, interpreter only | 20.42 ns | 23.50 ns |
+| Node 26 with `--jitless`, so V8's interpreter only | 14.13 ns | 17.78 ns |
+| Node 26 as it ships | 1.62 ns | 1.60 ns |
+
+Measured with the same `fib(20)`, two hundred calls of warmup and then a thousand timed runs through `performance.now`, on the same machines and with the same pinning as the rows above. There is no gamingpc column because the WSL2 side of that box has no Node installed, and `--jitless` turns off the optimizing tiers and the baseline compiler and leaves Ignition, which is the closest thing V8 has to what we have today.
+
+Two honest readings come out of that table. Our tier 0 is within about a third to a half of V8's tier 0 on this shape, which is a reasonable place to be for an interpreter that is a few weeks old against one that has been tuned for a decade, and the gap is roughly the closure row above plus the integer quickening that 5.5 has not built yet. And Node as it ships is twelve to fifteen times faster than either interpreter, because TurboFan has compiled `fib` into machine code with the recursion inlined and the small integer arithmetic unboxed. That is the number the goal in 02 is about, and nothing in this document closes it. Tier 1 in document 06 is what has to.
+
 ## 5.4 Our own stack
 
 JavaScript frames live on a contiguous stack that we allocate and manage, not on the Rust call stack.
@@ -203,23 +237,34 @@ Fixed prologue, then arguments, then registers. Frame size is known from the blu
 
 The frame header is not inline in the region. That is a deviation from the layout drawn above and the reason is the first of the three arguments for having our own stack at all. With the header inline, every slot in the region is a value except the ones that are not, and the root scanner has to walk frame by frame, read each blueprint to learn its frame size, and skip the right number of words at the right offsets. Off by one there means either tracing a saved program counter as though it were a pointer or missing a live object, and both of those surface as a crash somewhere else entirely. With the header in its own vector, the root set is a slice and there is nothing left to get wrong. The cost is a second allocation and a second cache line touched per call, which is measured below rather than waved at, and if it ever outweighs the safety the header can move back and the tests will not change.
 
+The header holds six numbers now rather than four. Three of them describe the frame, which are where its register zero lives in the region, how many slots it owns and which function in the loaded unit it is running, and one is the environment it reads captured variables through. The other two describe the caller, which are the instruction to resume at and the register the returned value goes into. Keeping the caller's two on the callee is what makes a return a pop and a pair of reads rather than a search, and keeping the function index rather than a pointer to the blueprint is what keeps a frame from borrowing the unit the caller owns.
+
 A pushed frame is fully initialised: the arguments are copied into the registers the calling convention names, and every slot above them is set to `undefined`. That is not only about a read reaching a slot before a write does. A slot still holding the dead frame's pointer is an object the collector would keep alive, and once the collector moves things it is a pointer that gets followed after the object it named has gone. Popping does not clear anything, because the slots stop being roots the moment the top moves down and the next push overwrites all of them.
+
+There are two ways to push, and the difference between them is where the arguments come from. The embedder calling in passes a slice from outside the region. A call inside the program passes a run of the caller's own registers, and those are copied from one part of the region straight into another without ever being gathered into a vector on the way, which is exactly what 4.5 makes the register allocator put arguments in consecutive registers for. The count the callee declares and the count the call site passed are kept apart and the smaller one wins: too few arguments leaves the rest `undefined`, and too many drops the extras, because the registers above the parameters are the callee's scratch and writing an argument into one would corrupt a temporary. The extras are not gone in principle, they are what `arguments` and a rest parameter read, and neither of those exists yet.
 
 The depth limit is ten thousand frames, which is roughly where Node raises `RangeError: Maximum call stack size exceeded` on a default thread stack. A program written against Node that recurses to just under its limit should not fail here, and one that runs away should fail at a comparable point rather than after eating a hundred times the memory. Running out of the reservation raises the same error. Both are ordinary errors and not panics, because a JavaScript program is allowed to catch this one and carry on.
 
 | Operation | m4 | gamingpc | gamingpc-win |
 |---|---|---|---|
-| Push and pop a frame | 5.3 ns | 6.3 ns | 6.7 ns |
-| Push and pop with three arguments | 7.4 ns | 6.3 ns | 7.0 ns |
-| A hundred frames down and back, per frame | 5.1 ns | 4.2 ns | 6.3 ns |
-| Read a register | 0.48 ns | 0.34 ns | 0.38 ns |
-| Write a register | 0.62 ns | 0.41 ns | 0.54 ns |
-| Two reads and a write | 1.06 ns | 0.80 ns | 0.99 ns |
-| Scan eight hundred root slots | 78.6 ns | 253 ns | 310 ns |
+| Push and pop a frame | 5.73 ns | 7.99 ns | 7.96 ns |
+| Push and pop with three arguments from outside | 7.51 ns | 7.85 ns | 8.27 ns |
+| A call and its return, arguments from the caller's registers | 7.70 ns | 8.21 ns | 8.03 ns |
+| A hundred frames down and back, per frame | 8.51 ns | 5.52 ns | 5.70 ns |
+| Read a register | 0.46 ns | 0.33 ns | 0.35 ns |
+| Write a register | 0.57 ns | 0.41 ns | 0.46 ns |
+| Two reads and a write | 1.06 ns | 0.77 ns | 0.85 ns |
+| Scan eight hundred root slots | 76.1 ns | 256 ns | 258 ns |
 
 Measured on the three reference machines from document 15.5, with eight slot frames because that is roughly what lowering produces for a small function.
 
-A call costs six nanoseconds of stack work on every machine, which puts the second cache line the split costs somewhere under a nanosecond and settles the question the module doc raises about itself. Two reads and a write is what a three address instruction pays before it does anything, and at around one nanosecond it is a few cycles, which is the floor a register machine is supposed to have. The argument copy is free on the two x86 machines and costs two nanoseconds on the M4, which is small enough and consistent enough across reruns to be a real difference in how the two chips handle a short unaligned copy rather than noise.
+A call costs eight nanoseconds of stack work on every machine, which puts the second cache line the split costs somewhere under a nanosecond and settles the question the module doc raises about itself. Two reads and a write is what a three address instruction pays before it does anything, and at around one nanosecond it is a few cycles, which is the floor a register machine is supposed to have.
+
+The recursion row is a hundred real calls with three arguments each before anything is popped, which is not what it measured before calls existed, so it is a new number rather than a changed one. On the two x86 machines it is cheaper per frame than a single push and pop in a loop, at 5.5 against 8.0 nanoseconds, because a loop that pops what it just pushed makes every iteration wait for the one before it while a hundred pushes in a row do not. On the m4 it is the other way round, at 8.5 against 5.7, which is the argument copy showing up a hundred times rather than once.
+
+The first row got 24 percent slower when calls landed, from 6.40 ns to 7.99 ns on the pinned Linux machine, and the cause is worth writing down because it is the same shape as the three in 5.3.2. It is not the code in `push`. The frame header grew from sixteen bytes to twenty four when it gained the function index and the context, and that is the whole difference: applying only those two fields to the previous commit, with nothing else changed, reproduces the regression exactly, at 7.71 ns. Padding the header out to thirty two bytes, which restores the power of two element size a `Vec` indexes with a shift rather than a multiply, does not help, so it is the extra store and the load that reads across it and not the indexing. The same change costs nothing measurable on the m4, where sixteen and twenty four byte headers are within noise of each other. The way back down to sixteen bytes exists and is not free: a `u32` base rather than a `usize`, `size` read from the callee's blueprint instead of stored, and `return_to` recovered by decoding the call instruction at the return address. That trades a store on every call for two loads on every return, so it needs measuring rather than assuming, and it is not worth doing before the frame stops changing shape.
+
+The argument copy costs two nanoseconds on the m4 and nothing on the two x86 machines, which is consistent across reruns and is how the two chips handle a short copy rather than noise. Copying the arguments out of the caller's own registers, which is what a real call does, is no more expensive than copying them in from outside, so the calling convention in 4.5 is getting what it was designed for.
 
 The root scan is the one place the M4 is not merely competitive. Walking eight hundred slots takes 78.6 ns there against 253 ns on a pinned performance core of a 13900K, which is over three times faster on a loop that is nothing but a linear read and a tag test. That is a memory bandwidth result rather than a code result and it does not generalise to anything else in this table, but it is worth writing down, because root scanning is a cost the collector pays on every cycle and it says the machines will disagree about collector tuning later.
 
