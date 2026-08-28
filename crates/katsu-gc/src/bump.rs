@@ -42,6 +42,12 @@ pub enum ObjectKind {
     String,
     /// A closure, not counting the shared blueprint.
     Closure,
+    /// A function written in Rust, not counting the table entry that holds the code.
+    ///
+    /// Its own line rather than a closure, because these are allocated once each when a realm is
+    /// built and never again, so a number that moves here means a builtin was added and a number
+    /// that moves in `closures` means a program made a function. Two different questions.
+    Native,
     /// One level of environment, holding the variables a nested function captured.
     Context,
     /// A shape, which is shared across every object with that layout.
@@ -57,11 +63,12 @@ pub enum ObjectKind {
 
 impl ObjectKind {
     /// Every category, in the order the census prints them.
-    pub const ALL: [ObjectKind; 8] = [
+    pub const ALL: [ObjectKind; 9] = [
         ObjectKind::Object,
         ObjectKind::Elements,
         ObjectKind::String,
         ObjectKind::Closure,
+        ObjectKind::Native,
         ObjectKind::Context,
         ObjectKind::Shape,
         ObjectKind::Properties,
@@ -76,6 +83,7 @@ impl ObjectKind {
             ObjectKind::Elements => "elements",
             ObjectKind::String => "strings",
             ObjectKind::Closure => "closures",
+            ObjectKind::Native => "natives",
             ObjectKind::Context => "contexts",
             ObjectKind::Shape => "shapes",
             ObjectKind::Properties => "properties",
@@ -89,10 +97,11 @@ impl ObjectKind {
             ObjectKind::Elements => 1,
             ObjectKind::String => 2,
             ObjectKind::Closure => 3,
-            ObjectKind::Context => 4,
-            ObjectKind::Shape => 5,
-            ObjectKind::Properties => 6,
-            ObjectKind::Other => 7,
+            ObjectKind::Native => 4,
+            ObjectKind::Context => 5,
+            ObjectKind::Shape => 6,
+            ObjectKind::Properties => 7,
+            ObjectKind::Other => 8,
         }
     }
 }
@@ -119,7 +128,7 @@ pub struct KindTotals {
 /// these ones learning to decrease.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Census {
-    totals: [KindTotals; 8],
+    totals: [KindTotals; 9],
     /// Bytes handed out in total, after alignment padding.
     pub allocated_bytes: u64,
     /// Allocations in total.

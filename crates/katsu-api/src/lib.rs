@@ -172,12 +172,28 @@ mod tests {
     #[test]
     fn something_this_build_cannot_run_says_so_and_names_it() {
         let mut runtime = runtime();
-        // Calls run now, so the opcode this stops at is the global load in front of the call rather
-        // than the call itself. It is still the case being checked: something the frontend can lower
-        // and the loop cannot run is named rather than being guessed at or crashed on.
+        // Globals run now, so the opcode this stops at has moved along again, to reading a property
+        // off a value. It is still the case being checked: something the frontend can lower and the
+        // loop cannot run is named rather than being guessed at or crashed on.
         let error = runtime
-            .eval("ok.js", "console.log(1)")
-            .expect_err("globals are not implemented yet");
+            .eval("ok.js", "'katsu'.length")
+            .expect_err("property access is not implemented yet");
         assert!(matches!(error, Error::NotImplemented(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn a_name_that_was_never_bound_reads_as_a_reference_error() {
+        // What `console.log(1)` does in this build: the global load in front of the call is a real
+        // instruction now, and nothing has put `console` in the global scope yet, so the program
+        // stops the way Node stops on a name that does not exist rather than the way it stops on a
+        // feature we have not written.
+        let mut runtime = runtime();
+        let error = runtime
+            .eval("bad.js", "console.log(1)")
+            .expect_err("nothing is bound to console yet");
+        assert_eq!(
+            error.to_string(),
+            "uncaught exception: ReferenceError: console is not defined"
+        );
     }
 }

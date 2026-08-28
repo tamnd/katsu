@@ -42,6 +42,16 @@
 //! `closure_call` adds a read through the environment so that the cost of capturing is visible next
 //! to the cost of calling.
 //!
+//! The `globals` group is the other half of a name lookup. A local is an index into the frame and
+//! costs nothing worth measuring, and a global is a hash table, so this is the first name in the
+//! language that is not free. It is measured per instruction like the dispatch group, and the number
+//! to read it against is `move_chain`, which is the same instruction shape with no lookup in it.
+//!
+//! The `native` group is a call that leaves the interpreter. It has the same shape as `call_return`
+//! on purpose: the callee is already in a register and the body does nothing, so the difference
+//! between the two is the difference between pushing a frame and making a Rust call. Every builtin
+//! in the runtime will pay this, so it is worth knowing before there are any.
+//!
 //! The call benchmarks come from source rather than from assembled bytecode, because a call is the
 //! one place where the cost depends on what lowering and scope analysis decided, and hand written
 //! bytecode would measure my guess at those decisions.
@@ -50,7 +60,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use katsu_ir::{CacheIndex, CodeOffset, ConstantPool, FunctionBlueprint, Op, Register};
-use katsu_vm::Interpreter;
+use katsu_vm::{Interpreter, RuntimeError, Value};
 
 /// How many instructions a straight line body holds, long enough that the frame push either side of
 /// it is noise and short enough to stay well inside the instruction cache.
@@ -337,5 +347,87 @@ fn calls(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, straight_line, loops, strings, calls);
+/// A native that does nothing at all, so that a call to it measures the boundary and not the body.
+///
+/// The `Result` is the signature every native has and not a return this one needs, which is exactly
+/// what makes it the right shape to measure the boundary with.
+#[allow(clippy::unnecessary_wraps)]
+fn nothing(_: &mut Interpreter, _: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::UNDEFINED)
+}
+
+/// An interpreter with a global to read and a native to call.
+fn realm() -> Interpreter {
+    let mut interpreter = Interpreter::new().expect("should reserve a stack");
+    interpreter
+        .define_global("answer", Value::from_i32(42))
+        .expect("should have room");
+    interpreter
+        .define_native("nothing", nothing)
+        .expect("should have room");
+    interpreter
+}
+
+fn globals(c: &mut Criterion) {
+    let mut group = c.benchmark_group("globals");
+    group.throughput(Throughput::Elements(CHAIN as u64));
+
+    // A name that is bound, read over and over. The hash is of four bytes and not of the text,
+    // because the name in the constant pool was interned when the unit loaded, and the number here
+    // is what says whether that was worth doing.
+    let mut source = String::new();
+    for _ in 0..CHAIN {
+        source.push_str("answer;\n");
+    }
+    let loads = program(&source);
+    group.bench_function("global_load", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&loads))));
+    });
+
+    // Two instructions per line rather than one, the constant and the store, so this sits next to
+    // `move_chain` rather than next to `global_load`. What it says is that writing a global is a
+    // hash and an insert into a table that already has the key.
+    let mut source = String::new();
+    for _ in 0..CHAIN {
+        source.push_str("answer = 1;\n");
+    }
+    let stores = program(&source);
+    group.bench_function("global_store", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&stores))));
+    });
+
+    group.finish();
+}
+
+fn natives(c: &mut Criterion) {
+    let mut group = c.benchmark_group("native");
+    group.throughput(Throughput::Elements(CALLS as u64));
+
+    // The same shape as `call_return` so the two numbers can be read against each other: the callee
+    // is in a register, one argument goes with it, and the body does nothing. What is left is the
+    // difference between pushing a frame and leaving the loop for a Rust call.
+    let mut source = String::from("const f = nothing;\n");
+    for _ in 0..CALLS {
+        source.push_str("f(1);\n");
+    }
+    let chain = program(&source);
+    group.bench_function("native_call", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&chain))));
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    straight_line,
+    loops,
+    strings,
+    calls,
+    globals,
+    natives
+);
 criterion_main!(benches);
