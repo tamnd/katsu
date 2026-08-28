@@ -64,6 +64,18 @@ Node's `--experimental-strip-types` historically refused several of these. We ac
 
 `katsu check` shells out to TypeScript 7, which shipped July 2026 as a Go native compiler that type checks the VS Code codebase in 10.6 seconds against 125.7 on the old one. We do not ship a type checker and we do not pretend to. Note for document 09: TypeScript 7.0 has no stable programmatic API, that is promised for 7.1, so anything that wants machine readable checker output has to wait or parse JSON diagnostics.
 
+### 4.2.1 How `katsu check` finds a compiler, as built
+
+Shelling out sounds like one line and it is not, because the interesting part is which compiler gets run. The search is in `crates/katsu/src/check.rs` and it looks in three places in a fixed order.
+
+`KATSU_TSC` wins outright, because somebody who set it has a reason and no amount of searching beats knowing. Then `node_modules/.bin/tsc`, walking up from the file being checked. Then a `tsc` on the path. When there is none anywhere, the error names all three places rather than saying it could not find one, since not found leaves somebody guessing which of the three they were supposed to have set up.
+
+The project compiler beating one on the path is the part worth defending. A project pins its TypeScript version in its `package.json` and its types only check against that version, so a globally installed compiler of a different version is not a substitute for the pinned one, it is a different answer to the same question. Every other tool in this ecosystem resolves this way and a runtime that did not would be the surprising one. On Windows the file to look for is `tsc.cmd`, because npm writes a `.cmd` shim next to the extensionless shell script and Rust will not run the shell script.
+
+What gets checked is a project when there is a `tsconfig.json` at or above the entry, and the single named file when there is not. Checking one file of a project with default settings reports errors the project does not have and misses errors it does, so those are two different commands and the code that picks between them is a pure function with a test on it. Either way `--noEmit` goes on, because this command answers a question and does not produce anything.
+
+The compiler's exit code is forwarded and nothing of ours is printed over the top of it. A summary in front of the diagnostics somebody actually needs to read is noise, and inventing our own exit code would break every script that already branches on `tsc`'s.
+
 ## 4.3 Module resolution
 
 This has to be a bug for bug reimplementation, because getting it 95% right means five percent of packages fail to load and the user has no idea why.
