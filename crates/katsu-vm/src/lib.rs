@@ -4,12 +4,14 @@
 //! See `spec/05-interpreter.md` for dispatch, `spec/07-object-model.md` for values and
 //! shapes, and `spec/03-architecture.md` for why an isolate is `Send` but not `Sync`.
 
+mod stack;
 mod value;
 
 use std::fmt;
 
 use katsu_ir::FunctionBlueprint;
 
+pub use stack::{Frame, Stack, StackError};
 pub use value::Value;
 
 /// Why a source file could not be turned into something executable.

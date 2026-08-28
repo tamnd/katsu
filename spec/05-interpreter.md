@@ -139,6 +139,32 @@ Frame layout:
 
 Fixed prologue, then arguments, then registers. Frame size is known from the blueprint, so pushing a frame is a bounds check and a pointer bump.
 
+### 5.4.1 The stack, as built
+
+`crates/katsu-vm/src/stack.rs` reserves eight megabytes of address space at startup and commits sixty four kilobytes of it. Reserving is free and committing is what the memory budget in 02.3 counts, so an isolate that never calls anything pays for one chunk rather than for the depth it could have reached. Growing commits another chunk, and shrinking does not hand anything back, because a program that recursed once usually recurses again and the syscall costs more than the page.
+
+The frame header is not inline in the region. That is a deviation from the layout drawn above and the reason is the first of the three arguments for having our own stack at all. With the header inline, every slot in the region is a value except the ones that are not, and the root scanner has to walk frame by frame, read each blueprint to learn its frame size, and skip the right number of words at the right offsets. Off by one there means either tracing a saved program counter as though it were a pointer or missing a live object, and both of those surface as a crash somewhere else entirely. With the header in its own vector, the root set is a slice and there is nothing left to get wrong. The cost is a second allocation and a second cache line touched per call, which is measured below rather than waved at, and if it ever outweighs the safety the header can move back and the tests will not change.
+
+A pushed frame is fully initialised: the arguments are copied into the registers the calling convention names, and every slot above them is set to `undefined`. That is not only about a read reaching a slot before a write does. A slot still holding the dead frame's pointer is an object the collector would keep alive, and once the collector moves things it is a pointer that gets followed after the object it named has gone. Popping does not clear anything, because the slots stop being roots the moment the top moves down and the next push overwrites all of them.
+
+The depth limit is ten thousand frames, which is roughly where Node raises `RangeError: Maximum call stack size exceeded` on a default thread stack. A program written against Node that recurses to just under its limit should not fail here, and one that runs away should fail at a comparable point rather than after eating a hundred times the memory. Running out of the reservation raises the same error. Both are ordinary errors and not panics, because a JavaScript program is allowed to catch this one and carry on.
+
+| Operation | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| Push and pop a frame | 5.3 ns | 6.3 ns | 6.7 ns |
+| Push and pop with three arguments | 7.4 ns | 6.3 ns | 7.0 ns |
+| A hundred frames down and back, per frame | 5.1 ns | 4.2 ns | 6.3 ns |
+| Read a register | 0.48 ns | 0.34 ns | 0.38 ns |
+| Write a register | 0.62 ns | 0.41 ns | 0.54 ns |
+| Two reads and a write | 1.06 ns | 0.80 ns | 0.99 ns |
+| Scan eight hundred root slots | 78.6 ns | 253 ns | 310 ns |
+
+Measured on the three reference machines from document 15.5, with eight slot frames because that is roughly what lowering produces for a small function.
+
+A call costs six nanoseconds of stack work on every machine, which puts the second cache line the split costs somewhere under a nanosecond and settles the question the module doc raises about itself. Two reads and a write is what a three address instruction pays before it does anything, and at around one nanosecond it is a few cycles, which is the floor a register machine is supposed to have. The argument copy is free on the two x86 machines and costs two nanoseconds on the M4, which is small enough and consistent enough across reruns to be a real difference in how the two chips handle a short unaligned copy rather than noise.
+
+The root scan is the one place the M4 is not merely competitive. Walking eight hundred slots takes 78.6 ns there against 253 ns on a pinned performance core of a 13900K, which is over three times faster on a loop that is nothing but a linear read and a tag test. That is a memory bandwidth result rather than a code result and it does not generalise to anything else in this table, but it is worth writing down, because root scanning is a cost the collector pays on every cycle and it says the machines will disagree about collector tuning later.
+
 ## 5.5 Quickening and inline caches in the interpreter
 
 An opcode rewrites itself in place after it learns what it is dealing with. `Add` becomes `Add.Int32` once a site has only seen integers, with a guard that falls back to the generic form and rewrites again to `Add.Generic` if the guard fails twice. `GetProp` becomes `GetProp.Mono` carrying a shape identifier and a slot offset in its inline cache.
