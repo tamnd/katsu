@@ -130,9 +130,18 @@ impl Interrupt {
 /// One thread is one isolate is one stack, so the interpreter owns the isolate rather than borrowing
 /// it. Handing them out separately would allow two stacks over one heap, which is the arrangement
 /// spec 3 rules out and the reason the collector needs no read barriers.
+///
+/// The isolate is behind a pointer and the stack is not. An isolate is two hundred and eighty bytes
+/// of heap bookkeeping that the dispatch loop only touches when a string is involved, and the stack
+/// is what every single instruction reads and writes. Holding the isolate inline makes the
+/// interpreter three hundred and forty four bytes instead of seventy two, and that measured slower
+/// on both reference machines: a move, the cheapest instruction there is, went from 0.86 ns to 1.07
+/// ns on a pinned 13900K and from 0.79 ns to 0.94 ns on an M4. Putting the stack first with
+/// `repr(C)` recovered almost none of it, so it is the size of the thing the loop holds and not the
+/// offsets inside it.
 #[derive(Debug)]
 pub struct Interpreter {
-    isolate: Isolate,
+    isolate: Box<Isolate>,
     stack: Stack,
     interrupt: Interrupt,
 }
@@ -147,7 +156,9 @@ impl Interpreter {
     /// either.
     pub fn new() -> Result<Interpreter, RuntimeError> {
         Ok(Interpreter {
-            isolate: Isolate::new().map_err(|error| RuntimeError::Range(error.to_string()))?,
+            isolate: Box::new(
+                Isolate::new().map_err(|error| RuntimeError::Range(error.to_string()))?,
+            ),
             stack: Stack::new()?,
             interrupt: Interrupt::default(),
         })
