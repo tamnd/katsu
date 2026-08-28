@@ -50,7 +50,7 @@ use std::rc::Rc;
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
-    DeclKind, Expr, ExprKind, Func, Ident, Module, Span, Stmt, StmtKind, Target, TargetKind,
+    Case, DeclKind, Expr, ExprKind, Func, Ident, Module, Span, Stmt, StmtKind, Target, TargetKind,
 };
 
 /// Which function a scope belongs to.
@@ -308,6 +308,10 @@ struct BlockScope {
 struct Frame {
     id: FunctionId,
     base: usize,
+    /// The enclosing function's loop count, put back when this one ends.
+    loops: usize,
+    /// The enclosing function's count of loops and switches together.
+    breakables: usize,
 }
 
 /// One identifier occurrence, before slots exist.
@@ -325,6 +329,14 @@ struct Analyser {
     blocks: Vec<BlockScope>,
     frames: Vec<Frame>,
     references: Vec<RawReference>,
+    /// How many loops enclose the statement being walked, which is what `continue` needs.
+    loops: usize,
+    /// How many loops and switches together, which is what `break` needs.
+    ///
+    /// Two counters rather than one, because `continue` inside a switch is an error and `break`
+    /// inside one is not, and both counters reset at a function boundary because a `break` cannot
+    /// leave the function it was written in.
+    breakables: usize,
 }
 
 impl Analyser {
@@ -406,7 +418,13 @@ impl Analyser {
         self.frames.push(Frame {
             id,
             base: self.blocks.len(),
+            loops: self.loops,
+            breakables: self.breakables,
         });
+        // A `break` cannot leave the function it was written in, so a function written inside a
+        // loop starts the count again rather than inheriting it.
+        self.loops = 0;
+        self.breakables = 0;
         self.push_block(span);
         id
     }
@@ -416,6 +434,8 @@ impl Analyser {
         let frame = self.frames.pop().expect("a function scope was pushed");
         debug_assert_eq!(frame.id, id, "function scopes nest");
         self.blocks.truncate(frame.base);
+        self.loops = frame.loops;
+        self.breakables = frame.breakables;
     }
 
     fn push_block(&mut self, span: Span) {
@@ -561,6 +581,11 @@ impl Analyser {
                     }
                 }
                 StmtKind::While { body, .. } => self.hoist_vars(std::slice::from_ref(body))?,
+                StmtKind::Switch { cases, .. } => {
+                    for case in cases {
+                        self.hoist_vars(&case.body)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -574,6 +599,49 @@ impl Analyser {
             self.statement(statement)?;
         }
         Ok(())
+    }
+
+    /// Declare the names of every clause of a switch, then walk all of them.
+    ///
+    /// Every clause shares the one scope the caller has already pushed, so the declarations of all
+    /// of them go in before any of them is walked. That is what makes a `let` in a later clause
+    /// visible, and in its dead zone, in an earlier one, and it is also what makes the same name
+    /// declared in two clauses the redeclaration error it is.
+    fn switch_body(&mut self, cases: &[Case]) -> Result<(), ScopeError> {
+        for case in cases {
+            self.declare_lexicals(&case.body)?;
+        }
+        for case in cases {
+            if let Some(test) = &case.test {
+                self.expression(test)?;
+            }
+            for statement in &case.body {
+                self.statement(statement)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk something a `break` can leave, and that a `continue` can restart if it is a loop.
+    ///
+    /// The counters go up for the body and are put back after it, so the question a `break` asks is
+    /// answered by whether the count is zero rather than by a search back up a stack. They are put
+    /// back rather than decremented because the body can fail part way through a nested function,
+    /// which zeroes them on the way in and never gets to the line that restores them, and a
+    /// decrement from zero would panic on the way back out of a program that is already refused.
+    fn breakable(
+        &mut self,
+        is_loop: bool,
+        body: impl FnOnce(&mut Self) -> Result<(), ScopeError>,
+    ) -> Result<(), ScopeError> {
+        let saved = (self.loops, self.breakables);
+        if is_loop {
+            self.loops += 1;
+        }
+        self.breakables += 1;
+        let result = body(self);
+        (self.loops, self.breakables) = saved;
+        result
     }
 
     fn statement(&mut self, statement: &Stmt) -> Result<(), ScopeError> {
@@ -619,13 +687,46 @@ impl Analyser {
             }
             StmtKind::While { test, body } => {
                 self.expression(test)?;
-                self.statement(body)?;
+                self.breakable(true, |walker| walker.statement(body))?;
             }
             StmtKind::Block(body) => {
                 self.push_block(statement.span);
                 let result = self.block_body(body);
                 self.blocks.pop();
                 result?;
+            }
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                // The discriminant is evaluated before the scope exists, which is not a detail:
+                // `switch (x) { case 1: let x = 2; }` reads the outer `x` and would be a dead zone
+                // error if the clauses' scope were open around it.
+                self.expression(discriminant)?;
+                self.push_block(statement.span);
+                let result = self.breakable(false, |this| this.switch_body(cases));
+                self.blocks.pop();
+                result?;
+            }
+            // Both are early errors rather than runtime ones, and the messages are Node's word for
+            // word, because a program that fails to parse in one engine and parses in another is
+            // the most confusing kind of incompatibility there is.
+            StmtKind::Break => {
+                if self.breakables == 0 {
+                    return Err(ScopeError {
+                        span: statement.span,
+                        message: "Illegal break statement".to_owned(),
+                    });
+                }
+            }
+            StmtKind::Continue => {
+                if self.loops == 0 {
+                    return Err(ScopeError {
+                        span: statement.span,
+                        message: "Illegal continue statement: no surrounding iteration statement"
+                            .to_owned(),
+                    });
+                }
             }
             StmtKind::Empty => {}
         }
@@ -977,8 +1078,20 @@ mod tests {
                     expression_idents(test, out);
                     variable_idents(std::slice::from_ref(body), out);
                 }
+                StmtKind::Switch {
+                    discriminant,
+                    cases,
+                } => {
+                    expression_idents(discriminant, out);
+                    for case in cases {
+                        if let Some(test) = &case.test {
+                            expression_idents(test, out);
+                        }
+                        variable_idents(&case.body, out);
+                    }
+                }
                 StmtKind::Block(body) => variable_idents(body, out),
-                StmtKind::Empty => {}
+                StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {}
             }
         }
     }
@@ -1534,6 +1647,75 @@ mod tests {
                 .to_string()
                 .contains("Missing initializer in const declaration"),
             "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_need_something_to_leave() {
+        // Both messages are Node's word for word. A program that is a syntax error in one engine
+        // and a running program in another is the worst kind of incompatibility, and a program
+        // that is a syntax error in both but says so differently is the second worst, because it
+        // is what ends up in somebody's test expectations.
+        assert_eq!(refused("break;").2, "Illegal break statement");
+        assert_eq!(
+            refused("continue;").2,
+            "Illegal continue statement: no surrounding iteration statement"
+        );
+
+        // A switch is something to break out of and is not something to continue.
+        analysed("switch (1) { case 1: break; }");
+        assert_eq!(
+            refused("switch (1) { case 1: continue; }").2,
+            "Illegal continue statement: no surrounding iteration statement"
+        );
+
+        // A loop is both, and being past the loop is not being in it.
+        analysed("while (0) { break; }");
+        analysed("while (0) { continue; }");
+        assert_eq!(refused("while (0) {} break;").2, "Illegal break statement");
+
+        // A function is a wall. The loop outside it is not a loop this `break` can see.
+        assert_eq!(
+            refused("while (0) { function f() { break; } }").2,
+            "Illegal break statement"
+        );
+    }
+
+    #[test]
+    fn every_clause_of_a_switch_shares_one_scope_and_it_opens_before_the_first_test() {
+        // The intuitive reading is that each clause is its own scope, and it is not what the
+        // standard says. One `let` in the last clause is in scope for all of them, so the `x` the
+        // first clause reads is the one being declared three lines down and reading it early is a
+        // dead zone error rather than a read of the outer `x`.
+        let source = "let x = 1; switch (0) { case 0: x; break; case 1: let x = 2; }";
+        let scopes = analysed(source);
+        let inner = resolved(&scopes, source, "x", 1);
+        let binding = inner.binding.expect("the read resolves to a binding");
+        assert!(
+            scopes.bindings()[binding.0 as usize].needs_dead_zone,
+            "the read in the first clause is a read of the let three clauses down"
+        );
+
+        // The discriminant is evaluated before that scope exists, so it reads the outer name, and
+        // the case tests are evaluated inside it, so they do not.
+        let source = "let y = 1; switch (y) { case y: let y = 2; }";
+        let scopes = analysed(source);
+        let discriminant = resolved(&scopes, source, "y", 1);
+        let test = resolved(&scopes, source, "y", 2);
+        assert_ne!(
+            discriminant.binding, test.binding,
+            "the discriminant is outside the clauses' scope and the case test is inside it"
+        );
+    }
+
+    #[test]
+    fn a_var_written_in_a_clause_hoists_out_of_the_switch() {
+        let source = "switch (0) { case 0: var x = 1; } x;";
+        let scopes = analysed(source);
+        assert_eq!(
+            resolved(&scopes, source, "x", 0).binding,
+            resolved(&scopes, source, "x", 1).binding,
+            "the same binding, because a var does not stop at the switch's braces"
         );
     }
 

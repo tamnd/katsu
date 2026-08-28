@@ -376,6 +376,23 @@ pub struct Func {
     pub strict: bool,
 }
 
+/// One clause of a `switch`.
+///
+/// The test is absent for `default`. The statements are not a scope of their own: every clause of a
+/// switch shares one block scope, so a `let` in one clause is visible in the next and is in its
+/// temporal dead zone until its own clause runs. Giving each clause a scope would be the intuitive
+/// reading and it is not what the standard says.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Case {
+    /// The whole clause, from `case` or `default` to the start of the next one.
+    pub span: Span,
+    /// The value compared against the discriminant, absent for `default`.
+    pub test: Option<Expr>,
+    /// The statements of the clause, which fall through into the next clause unless something
+    /// leaves.
+    pub body: Vec<Stmt>,
+}
+
 /// A statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stmt {
@@ -424,6 +441,21 @@ pub enum StmtKind {
         /// The body.
         body: Box<Stmt>,
     },
+    /// `switch`, with its clauses in the order they were written.
+    Switch {
+        /// The value every clause is compared against, evaluated once.
+        discriminant: Expr,
+        /// The clauses, `default` among them and in its written position, because where it sits
+        /// decides where control lands when nothing matched and also what falls through into it.
+        cases: Vec<Case>,
+    },
+    /// `break`, which leaves the nearest enclosing loop or switch.
+    ///
+    /// No label, because a labelled statement is not in the subset yet and a label can only name
+    /// one, so there is nothing a label could refer to.
+    Break,
+    /// `continue`, which starts the next iteration of the nearest enclosing loop.
+    Continue,
     /// A braced block, which is a scope for `let` and `const`.
     Block(Vec<Stmt>),
     /// A lone semicolon.

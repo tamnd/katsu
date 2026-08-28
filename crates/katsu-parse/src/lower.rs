@@ -47,8 +47,8 @@ use katsu_ir::{
 };
 
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module, Span,
-    Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Case, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module,
+    Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 use crate::scope::{BindingKind, FunctionId, Reference, Resolution, Scopes};
 
@@ -162,6 +162,42 @@ struct Lowerer<'a> {
     max_target: u32,
     /// Where the function ends, which is the position the epilogue is attributed to.
     end: u32,
+    /// The loops and switches the statement being lowered is inside, innermost last.
+    enclosing: Vec<Enclosing>,
+}
+
+/// A construct `break` can leave and, if it is a loop, that `continue` can go round again.
+///
+/// Both lists hold jumps that have been emitted with no target yet. A `break` cannot know where the
+/// end of the construct is, because the rest of the body has not been lowered, and a `continue`
+/// deliberately does not jump straight back to the top even though the top is known: it aims at the
+/// back edge instruction at the bottom of the loop, so that every iteration passes through the
+/// counter the tiering decision is going to read.
+struct Enclosing {
+    /// True for a loop, false for a switch, which is the whole difference `continue` cares about.
+    loops: bool,
+    /// Jumps waiting for the instruction after the construct.
+    breaks: Vec<usize>,
+    /// Jumps waiting for the back edge, empty for a switch.
+    continues: Vec<usize>,
+}
+
+impl Enclosing {
+    fn loop_() -> Self {
+        Self {
+            loops: true,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        }
+    }
+
+    fn switch() -> Self {
+        Self {
+            loops: false,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        }
+    }
 }
 
 impl<'a> Lowerer<'a> {
@@ -184,6 +220,7 @@ impl<'a> Lowerer<'a> {
             next_temp: scope.frame_slots,
             max_target: 0,
             end: span.end,
+            enclosing: Vec::new(),
         }
     }
 
@@ -328,6 +365,15 @@ impl<'a> Lowerer<'a> {
     /// Point a jump emitted earlier at the next instruction to be emitted.
     fn patch(&mut self, jump: usize) {
         let target = self.here();
+        self.patch_to(jump, target);
+    }
+
+    /// Point a jump emitted earlier at an instruction that already exists.
+    ///
+    /// Only a switch needs this. Its jump past the tests lands on whichever clause is the default,
+    /// and that clause can be anywhere among the others, so the target is known after the fact
+    /// rather than at the point the jump is patched.
+    fn patch_to(&mut self, jump: usize, target: CodeOffset) {
         self.blueprint.code[jump].set_jump_target(target);
         self.max_target = self.max_target.max(target.0);
     }
@@ -624,6 +670,11 @@ impl<'a> Lowerer<'a> {
     /// Enter a scope: create its bindings, then run its statements.
     fn body(&mut self, body: &[Stmt]) -> Result<(), LowerError> {
         self.scope_prelude(body)?;
+        self.statements(body)
+    }
+
+    /// Run a list of statements in a scope somebody else has already entered.
+    fn statements(&mut self, body: &[Stmt]) -> Result<(), LowerError> {
         for statement in body {
             self.statement(statement)?;
         }
@@ -638,7 +689,16 @@ impl<'a> Lowerer<'a> {
     /// is also the only one that works, since a function declared here can capture a `let` declared
     /// below it.
     fn scope_prelude(&mut self, body: &[Stmt]) -> Result<(), LowerError> {
-        for statement in body {
+        self.scope_prelude_parts(std::slice::from_ref(&body))
+    }
+
+    /// The same prelude for a scope whose statements arrive in more than one list.
+    ///
+    /// A switch is the one of those. Its clauses are separate lists of statements and one shared
+    /// scope, so all of their holes go in before any of their closures, exactly as they would if
+    /// the clauses were written as one block.
+    fn scope_prelude_parts(&mut self, parts: &[&[Stmt]]) -> Result<(), LowerError> {
+        for statement in parts.iter().copied().flatten() {
             let StmtKind::Declare { kind, bindings } = &statement.kind else {
                 continue;
             };
@@ -650,7 +710,7 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        for statement in body {
+        for statement in parts.iter().copied().flatten() {
             let StmtKind::Function(func) = &statement.kind else {
                 continue;
             };
@@ -766,31 +826,158 @@ impl<'a> Lowerer<'a> {
                     None => self.patch(branch),
                 }
             }
-            StmtKind::While { test, body } => {
-                let top = self.here();
-                let mark = self.next_temp;
-                let cond = self.expr(test)?;
-                self.release(mark);
-                let exit = self.emit(
-                    at,
-                    Op::JumpIfFalse {
-                        cond,
-                        target: UNPATCHED,
-                    },
-                );
-
-                self.statement(body)?;
-                let profile = self.cache();
-                self.emit(
-                    at,
-                    Op::LoopBackEdge {
-                        target: top,
-                        profile,
-                    },
-                );
-                self.patch(exit);
+            StmtKind::While { test, body } => self.while_loop(at, test, body)?,
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => self.switch(at, discriminant, cases)?,
+            StmtKind::Break => {
+                let jump = self.emit(at, Op::Jump { target: UNPATCHED });
+                self.enclosing
+                    .last_mut()
+                    .expect("scope analysis rejected a break with nothing to leave")
+                    .breaks
+                    .push(jump);
+            }
+            StmtKind::Continue => {
+                let jump = self.emit(at, Op::Jump { target: UNPATCHED });
+                self.enclosing
+                    .iter_mut()
+                    .rev()
+                    .find(|frame| frame.loops)
+                    .expect("scope analysis rejected a continue with no loop around it")
+                    .continues
+                    .push(jump);
             }
             StmtKind::Block(body) => self.body(body)?,
+        }
+        Ok(())
+    }
+
+    /// Lower a `while`.
+    ///
+    /// The test is at the top and the jump back is at the bottom, so an iteration costs one taken
+    /// backwards jump rather than a test and a forwards jump, and a loop that never runs costs one
+    /// test and nothing else.
+    fn while_loop(&mut self, at: u32, test: &Expr, body: &Stmt) -> Result<(), LowerError> {
+        let top = self.here();
+        let mark = self.next_temp;
+        let cond = self.expr(test)?;
+        self.release(mark);
+        let exit = self.emit(
+            at,
+            Op::JumpIfFalse {
+                cond,
+                target: UNPATCHED,
+            },
+        );
+
+        self.enclosing.push(Enclosing::loop_());
+        let result = self.statement(body);
+        let frame = self.enclosing.pop().expect("the loop frame was pushed");
+        result?;
+
+        // Every `continue` lands here, on the back edge itself rather than past it, so a loop that
+        // is mostly continues still counts its iterations and still gets to a hotter tier.
+        for jump in frame.continues {
+            self.patch(jump);
+        }
+        let profile = self.cache();
+        self.emit(
+            at,
+            Op::LoopBackEdge {
+                target: top,
+                profile,
+            },
+        );
+        self.patch(exit);
+        for jump in frame.breaks {
+            self.patch(jump);
+        }
+        Ok(())
+    }
+
+    /// Lower a `switch`.
+    ///
+    /// The shape is a run of comparisons followed by the clause bodies laid out in source order, so
+    /// that falling out of the bottom of one clause falls into the next one, which is what the
+    /// language does and what a jump table would have to work to reproduce.
+    ///
+    /// Two things about the order are the standard's rather than ours. The comparisons run in
+    /// source order over the clauses that have a test, which is why a `default` in the middle does
+    /// not stop the clauses after it from being compared, and the scope holding the clauses'
+    /// declarations is created before the first comparison rather than at the first clause that
+    /// runs, which is why a `case` test can be in the dead zone of a `let` written three clauses
+    /// further down.
+    fn switch(&mut self, at: u32, discriminant: &Expr, cases: &[Case]) -> Result<(), LowerError> {
+        let mark = self.next_temp;
+        let value = self.expr(discriminant)?;
+        // Every test is evaluated after this and any of them can assign, so a discriminant that
+        // came back in a variable's own slot is copied out of it first.
+        let value = self.pin(at, value, true);
+
+        let parts: Vec<&[Stmt]> = cases.iter().map(|case| case.body.as_slice()).collect();
+        self.scope_prelude_parts(&parts)?;
+
+        // One entry per clause, holding the jump that reaches it, and nothing for the default,
+        // which is reached by falling off the end of the comparisons instead.
+        let mut entries: Vec<Option<usize>> = Vec::with_capacity(cases.len());
+        for case in cases {
+            let Some(test) = case.test.as_ref() else {
+                entries.push(None);
+                continue;
+            };
+            let inner = self.next_temp;
+            let candidate = self.expr(test)?;
+            let matched = self.alloc();
+            let cache = self.cache();
+            self.emit(
+                case.span.start,
+                Op::StrictEqual {
+                    dst: matched,
+                    lhs: value,
+                    rhs: candidate,
+                    cache,
+                },
+            );
+            let jump = self.emit(
+                case.span.start,
+                Op::JumpIfTrue {
+                    cond: matched,
+                    target: UNPATCHED,
+                },
+            );
+            self.release(inner);
+            entries.push(Some(jump));
+        }
+
+        // Nothing matched. Where that goes depends on whether there is a default, and that is not
+        // known as an instruction offset until the bodies have been laid out.
+        let miss = self.emit(at, Op::Jump { target: UNPATCHED });
+        self.release(mark);
+
+        self.enclosing.push(Enclosing::switch());
+        let mut default_target = None;
+        let mut result = Ok(());
+        for (case, entry) in cases.iter().zip(entries) {
+            match entry {
+                Some(jump) => self.patch(jump),
+                None => default_target = Some(self.here()),
+            }
+            result = self.statements(&case.body);
+            if result.is_err() {
+                break;
+            }
+        }
+        let frame = self.enclosing.pop().expect("the switch frame was pushed");
+        result?;
+
+        match default_target {
+            Some(target) => self.patch_to(miss, target),
+            None => self.patch(miss),
+        }
+        for jump in frame.breaks {
+            self.patch(jump);
         }
         Ok(())
     }
@@ -1961,6 +2148,159 @@ mod tests {
             load_int r1, 1
             add r0, r0, r1, ic1
             loop_back_edge @1, ic2
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_switch_compares_every_case_first_and_then_lays_the_bodies_out_in_order() {
+        assert_code(
+            &code(&lowered(
+                "let x = 2; switch (x) { case 1: x = 10; case 2: x = 20; }",
+            )),
+            "
+            load_int r0, 2
+            move r1, r0
+            load_int r2, 1
+            strict_equal r3, r1, r2, ic0
+            jump_if_true r3, @9
+            load_int r2, 2
+            strict_equal r3, r1, r2, ic1
+            jump_if_true r3, @10
+            jump @11
+            load_int r0, 10
+            load_int r0, 20
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn falling_out_of_one_clause_falls_into_the_next_and_a_break_leaves_the_switch() {
+        // The two jump targets are the whole test. The `break` at @7 goes to @9, which is past the
+        // default clause rather than into it, and the default at @8 is reached from @5 by falling
+        // off the end of the comparisons rather than by a jump of its own.
+        assert_code(
+            &code(&lowered(
+                "let x = 1; switch (x) { case 1: x = 10; break; default: x = 20; }",
+            )),
+            "
+            load_int r0, 1
+            move r1, r0
+            load_int r2, 1
+            strict_equal r3, r1, r2, ic0
+            jump_if_true r3, @6
+            jump @8
+            load_int r0, 10
+            jump @9
+            load_int r0, 20
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_default_in_the_middle_is_still_compared_against_last() {
+        // The comparison for `case 2` is emitted even though `default` was written before it, and
+        // the miss jump at @8 goes to @10, which is the default's body sitting between the two
+        // case bodies. Every other jump in the lowerer is patched to wherever the next instruction
+        // is going to land, and this is the one that is not, which is what `patch_to` is for.
+        assert_code(
+            &code(&lowered(
+                "let x = 2; switch (x) { case 1: x = 10; default: x = 20; case 2: x = 30; }",
+            )),
+            "
+            load_int r0, 2
+            move r1, r0
+            load_int r2, 1
+            strict_equal r3, r1, r2, ic0
+            jump_if_true r3, @9
+            load_int r2, 2
+            strict_equal r3, r1, r2, ic1
+            jump_if_true r3, @11
+            jump @10
+            load_int r0, 10
+            load_int r0, 20
+            load_int r0, 30
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn continue_jumps_to_the_back_edge_and_not_to_the_top_of_the_loop() {
+        // Going to the top directly would skip the back edge, and the back edge is the instruction
+        // that counts iterations for tiering, so a loop whose body always continued would look
+        // cold no matter how long it ran.
+        assert_code(
+            &code(&lowered(
+                "let i = 0; while (i < 10) { i = i + 1; continue; }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 10
+            less r1, r0, r1, ic0
+            jump_if_false r1, @8
+            load_int r1, 1
+            add r0, r0, r1, ic1
+            jump @7
+            loop_back_edge @1, ic2
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_break_in_a_loop_leaves_the_loop_and_not_just_the_iteration() {
+        assert_code(
+            &code(&lowered("let i = 0; while (i < 10) { break; }")),
+            "
+            load_int r0, 0
+            load_int r1, 10
+            less r1, r0, r1, ic0
+            jump_if_false r1, @6
+            jump @6
+            loop_back_edge @1, ic1
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_continue_inside_a_switch_inside_a_loop_leaves_both() {
+        // A switch catches `break` and does not catch `continue`, so the two statements in this
+        // body go to different places. The `break` at @13 goes to @14, which is past the switch
+        // and still inside the loop, so `i = i + 1` runs. The `continue` at @12 goes to @16, the
+        // back edge, so it does not.
+        assert_code(
+            &code(&lowered(
+                "let i = 0; while (i < 10) { switch (i) { case 1: continue; case 2: break; } i = i + 1; }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 10
+            less r1, r0, r1, ic0
+            jump_if_false r1, @17
+            move r1, r0
+            load_int r2, 1
+            strict_equal r3, r1, r2, ic1
+            jump_if_true r3, @12
+            load_int r2, 2
+            strict_equal r3, r1, r2, ic2
+            jump_if_true r3, @13
+            jump @14
+            jump @16
+            jump @14
+            load_int r1, 1
+            add r0, r0, r1, ic3
+            loop_back_edge @1, ic4
             load_undefined r1
             return r1
             ",

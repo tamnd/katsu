@@ -29,8 +29,8 @@ use oxc_ast::ast as oxc;
 
 use crate::ParseError;
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module, Span,
-    Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Case, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module,
+    Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 
 /// Turn one parsed program into our tree.
@@ -145,6 +145,41 @@ impl Adapter<'_> {
                 let body = self.branch(&node.body, strict)?;
                 Stmt::new(span(node.span), StmtKind::While { test, body })
             }
+
+            oxc::Statement::SwitchStatement(node) => {
+                let discriminant = self.expression(&node.discriminant, strict)?;
+                let mut cases = Vec::with_capacity(node.cases.len());
+                for case in &node.cases {
+                    let test = match case.test.as_ref() {
+                        Some(test) => Some(self.expression(test, strict)?),
+                        None => None,
+                    };
+                    cases.push(Case {
+                        span: span(case.span),
+                        test,
+                        body: self.statements(&case.consequent, strict)?,
+                    });
+                }
+                Stmt::new(
+                    span(node.span),
+                    StmtKind::Switch {
+                        discriminant,
+                        cases,
+                    },
+                )
+            }
+
+            // A label can only be attached by a labelled statement, which is not in the subset, so
+            // a label here has nothing to name and refusing it costs nothing today.
+            oxc::Statement::BreakStatement(node) => match node.label {
+                Some(_) => return self.refuse("a labelled break", node.span),
+                None => Stmt::new(span(node.span), StmtKind::Break),
+            },
+
+            oxc::Statement::ContinueStatement(node) => match node.label {
+                Some(_) => return self.refuse("a labelled continue", node.span),
+                None => Stmt::new(span(node.span), StmtKind::Continue),
+            },
 
             oxc::Statement::VariableDeclaration(node) => {
                 // `declare const x: number` describes something that exists elsewhere and emits no
@@ -700,15 +735,12 @@ fn assign_op(operator: oxc::AssignmentOperator) -> AssignOp {
 /// `ForStatement`. The list is the to do list for M1 and M2 read from the other end.
 fn statement_name(statement: &oxc::Statement<'_>) -> &'static str {
     match statement {
-        oxc::Statement::BreakStatement(_) => "break",
-        oxc::Statement::ContinueStatement(_) => "continue",
         oxc::Statement::DebuggerStatement(_) => "debugger",
         oxc::Statement::DoWhileStatement(_) => "a do while loop",
         oxc::Statement::ForInStatement(_) => "a for in loop",
         oxc::Statement::ForOfStatement(_) => "a for of loop",
         oxc::Statement::ForStatement(_) => "a for loop",
         oxc::Statement::LabeledStatement(_) => "a label",
-        oxc::Statement::SwitchStatement(_) => "a switch",
         oxc::Statement::ThrowStatement(_) => "throw",
         oxc::Statement::TryStatement(_) => "try",
         oxc::Statement::WithStatement(_) => "with",
@@ -1033,7 +1065,6 @@ mod tests {
         assert_eq!(refused("t.js", "for (const x of xs) {}"), "a for of loop");
         assert_eq!(refused("t.js", "try { f(); } catch {}"), "try");
         assert_eq!(refused("t.js", "throw new Error();"), "throw");
-        assert_eq!(refused("t.js", "switch (x) {}"), "a switch");
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
         assert_eq!(refused("t.js", "let x = { a: 1 };"), "an object literal");
@@ -1126,6 +1157,60 @@ mod tests {
             panic!("expected a while");
         };
         assert!(matches!(body.kind, StmtKind::Block(_)));
+    }
+
+    #[test]
+    fn a_switch_keeps_its_clauses_in_source_order_and_the_default_keeps_its_place() {
+        let StmtKind::Switch { cases, .. } = one(
+            "t.js",
+            "switch (a) { case 1: f(); default: g(); case 2: break; }",
+        )
+        .kind
+        else {
+            panic!("expected a switch");
+        };
+        let tests: Vec<bool> = cases.iter().map(|case| case.test.is_some()).collect();
+        assert_eq!(
+            tests,
+            [true, false, true],
+            "the default stays in the middle"
+        );
+        assert_eq!(
+            cases[2].body.len(),
+            1,
+            "a clause body is a list, not a block"
+        );
+        assert!(matches!(cases[2].body[0].kind, StmtKind::Break));
+    }
+
+    #[test]
+    fn a_clause_with_nothing_in_it_is_a_clause_with_an_empty_body() {
+        // `case 1:` with no statements is how fallthrough to a shared body is written, and it has
+        // to survive as a clause, because dropping it would change which values reach that body.
+        let StmtKind::Switch { cases, .. } =
+            one("t.js", "switch (a) { case 1: case 2: f(); }").kind
+        else {
+            panic!("expected a switch");
+        };
+        assert_eq!(cases.len(), 2);
+        assert!(cases[0].body.is_empty());
+        assert_eq!(cases[1].body.len(), 1);
+    }
+
+    #[test]
+    fn a_label_on_a_break_or_a_continue_is_refused_by_name() {
+        // The labels themselves are not in the subset yet, so a labelled jump has nothing to name.
+        // Refusing it costs nothing today and stops it silently becoming an unlabelled jump, which
+        // would run and go to the wrong place.
+        assert_eq!(refused("t.js", "l: while (a) { break l; }"), "a label");
+        assert_eq!(
+            refused("t.js", "while (a) { break l; }"),
+            "a labelled break"
+        );
+        assert_eq!(
+            refused("t.js", "while (a) { continue l; }"),
+            "a labelled continue"
+        );
     }
 
     #[test]
