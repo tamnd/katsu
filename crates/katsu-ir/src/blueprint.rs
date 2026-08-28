@@ -68,6 +68,56 @@ pub enum BlueprintError {
     /// Control runs off the end of the function.
     #[error("the code does not end in a return or a jump")]
     FallsOffTheEnd,
+    /// A handler protects a range that is not a range, or points somewhere that is not code.
+    #[error("handler {at} protects [{start}, {end}) and lands at {target}, in {len} instructions")]
+    HandlerOutOfRange {
+        /// Which entry in the table.
+        at: usize,
+        /// The first instruction it protects.
+        start: u32,
+        /// One past the last instruction it protects.
+        end: u32,
+        /// Where it sends control.
+        target: u32,
+        /// How many instructions there are.
+        len: usize,
+    },
+    /// A handler stores the caught value into a register the frame does not have.
+    #[error("handler {at} catches into r{register}, but the frame holds {frame_size} registers")]
+    HandlerRegisterOutOfRange {
+        /// Which entry in the table.
+        at: usize,
+        /// The register it names.
+        register: u16,
+        /// How many the frame has.
+        frame_size: u16,
+    },
+}
+
+/// One protected range of instructions, and where a throw inside it lands.
+///
+/// `spec/04-frontend.md` chose a table over a stack of active handlers, which is the JVM's choice
+/// and for the JVM's reason: entering a `try` then costs nothing at all, because there is nothing
+/// to push, and a throw pays for the search instead. A `try` inside a hot loop is far more common
+/// than a throw inside one, so that is the right way round.
+///
+/// The range is half open, `start` included and `end` excluded, and it covers the protected block
+/// only. The handler's own instructions are outside it, which is what stops a throw inside a
+/// `catch` from being caught by the `catch` it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handler {
+    /// The first instruction this handler protects.
+    pub start: CodeOffset,
+    /// One past the last instruction this handler protects.
+    pub end: CodeOffset,
+    /// Where control goes when something inside the range throws.
+    pub target: CodeOffset,
+    /// The register the thrown value is stored into before the handler runs.
+    ///
+    /// Always a real register, even for `catch {}` with no binding, because the search has to put
+    /// the value somewhere and a register it then never reads is cheaper than a second kind of
+    /// entry to describe the difference.
+    pub register: Register,
 }
 
 /// Everything the runtime knows about one function before it has ever been called.
@@ -105,6 +155,13 @@ pub struct FunctionBlueprint {
     pub blueprints: Vec<FunctionBlueprint>,
     /// How many inline cache slots this function's sites need.
     pub cache_slots: u32,
+    /// The ranges this function protects, innermost first.
+    ///
+    /// Order is the whole of the search rule: the first entry whose range contains the throwing
+    /// instruction wins. Lowering emits an entry when it has finished the block the entry protects,
+    /// so a `try` nested inside another finishes first and lands earlier in the table, and the
+    /// innermost handler is the one that catches without anything having to compare two ranges.
+    pub handlers: Vec<Handler>,
 }
 
 impl FunctionBlueprint {
@@ -176,6 +233,30 @@ impl FunctionBlueprint {
             }
         }
 
+        for (at, handler) in self.handlers.iter().enumerate() {
+            let (start, end, target) = (handler.start.0, handler.end.0, handler.target.0);
+            // An empty range is rejected as well as a backwards one. A `try {}` with nothing in it
+            // cannot throw, so lowering has no reason to emit an entry for it, and one that does
+            // has made a mistake worth hearing about rather than a handler that never fires.
+            if start >= end || end as usize > self.code.len() || target as usize >= self.code.len()
+            {
+                return Err(BlueprintError::HandlerOutOfRange {
+                    at,
+                    start,
+                    end,
+                    target,
+                    len: self.code.len(),
+                });
+            }
+            if handler.register.0 >= self.frame_size {
+                return Err(BlueprintError::HandlerRegisterOutOfRange {
+                    at,
+                    register: handler.register.0,
+                    frame_size: self.frame_size,
+                });
+            }
+        }
+
         match self.code.last() {
             Some(op) if op.is_terminator() => {}
             _ => return Err(BlueprintError::FallsOffTheEnd),
@@ -185,6 +266,17 @@ impl FunctionBlueprint {
             nested.verify()?;
         }
         Ok(())
+    }
+
+    /// The handler that catches a throw at instruction `at`, if this function has one.
+    ///
+    /// A linear scan, and it stays one until a function with enough handlers to notice turns up.
+    /// The table is almost always empty and is one or two entries when it is not, so a binary
+    /// search would be a longer way of reading the first element.
+    pub fn handler_for(&self, at: CodeOffset) -> Option<&Handler> {
+        self.handlers
+            .iter()
+            .find(|handler| handler.start <= at && at < handler.end)
     }
 
     /// A readable listing of the code, including every function written inside it.
@@ -226,6 +318,22 @@ impl FunctionBlueprint {
                 write!(out, "  ; {constant}")?;
             }
             writeln!(out)?;
+        }
+
+        // After the code, because it is a fact about a range of instructions rather than about any
+        // one of them, and there is nowhere in the listing to hang it that would not be a lie. It
+        // is printed at all because it is the only thing that says where a throw goes: no
+        // instruction in the listing above mentions a handler, which is the point of the design and
+        // would make a disassembly without this section quietly incomplete.
+        if !self.handlers.is_empty() {
+            writeln!(out, "{indent}  handlers:")?;
+            for handler in &self.handlers {
+                writeln!(
+                    out,
+                    "{indent}    [{}, {}) -> {} into r{}",
+                    handler.start.0, handler.end.0, handler.target.0, handler.register.0
+                )?;
+            }
         }
 
         for (index, nested) in self.blueprints.iter().enumerate() {
@@ -323,6 +431,7 @@ fn highest_register(op: Op) -> Option<Register> {
         | Op::StoreUpvalue { src, .. }
         | Op::StoreGlobal { src, .. }
         | Op::Return { src }
+        | Op::Throw { src }
         | Op::JumpIfTrue { cond: src, .. }
         | Op::JumpIfFalse { cond: src, .. } => smallvec![src],
         Op::Add { dst, lhs, rhs, .. }
@@ -388,9 +497,19 @@ fn last_argument(first: Register, count: u16) -> Register {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlueprintError, FunctionBlueprint};
+    use super::{BlueprintError, FunctionBlueprint, Handler};
     use crate::constant::ConstIndex;
     use crate::op::{BlueprintIndex, CacheIndex, CodeOffset, Op, Register};
+
+    /// One entry, spelled with plain numbers so a table in a test reads as a table.
+    fn handler(start: u32, end: u32, target: u32, register: u16) -> Handler {
+        Handler {
+            start: CodeOffset(start),
+            end: CodeOffset(end),
+            target: CodeOffset(target),
+            register: Register(register),
+        }
+    }
 
     fn returning_a_constant() -> FunctionBlueprint {
         let mut blueprint = FunctionBlueprint {
@@ -576,6 +695,89 @@ mod tests {
             outer.verify().expect_err("should be refused"),
             BlueprintError::FallsOffTheEnd
         ));
+    }
+
+    #[test]
+    fn a_handler_table_is_checked_the_way_the_code_is() {
+        // A bad entry is a bug in lowering that would otherwise show up as a jump into the middle
+        // of nowhere at the worst possible moment, which is while something is already throwing.
+        let table = |handler| FunctionBlueprint {
+            handlers: vec![handler],
+            ..returning_a_constant()
+        };
+
+        // An empty range as well as a backwards one. A `try {}` with nothing in it cannot throw,
+        // so lowering has no reason to emit an entry for it.
+        assert!(matches!(
+            table(handler(1, 1, 0, 0))
+                .verify()
+                .expect_err("empty range"),
+            BlueprintError::HandlerOutOfRange { .. }
+        ));
+        assert!(matches!(
+            table(handler(1, 0, 0, 0))
+                .verify()
+                .expect_err("backwards range"),
+            BlueprintError::HandlerOutOfRange { .. }
+        ));
+        assert!(matches!(
+            table(handler(0, 9, 0, 0))
+                .verify()
+                .expect_err("past the end"),
+            BlueprintError::HandlerOutOfRange { .. }
+        ));
+        assert!(matches!(
+            table(handler(0, 2, 9, 0))
+                .verify()
+                .expect_err("a target past the end"),
+            BlueprintError::HandlerOutOfRange { .. }
+        ));
+        assert!(matches!(
+            table(handler(0, 2, 0, 4))
+                .verify()
+                .expect_err("a register the frame does not have"),
+            BlueprintError::HandlerRegisterOutOfRange { .. }
+        ));
+
+        table(handler(0, 2, 1, 0)).verify().expect("a good entry");
+    }
+
+    #[test]
+    fn the_handler_a_throw_finds_is_the_first_entry_that_contains_it() {
+        // Order is the search rule, so a lookup is a scan and the first hit wins. Lowering puts an
+        // entry in when it has finished the block it protects, which is what makes the innermost
+        // one first without anything here comparing two ranges.
+        let blueprint = FunctionBlueprint {
+            handlers: vec![handler(0, 1, 1, 0), handler(0, 2, 1, 0)],
+            ..returning_a_constant()
+        };
+
+        assert_eq!(
+            blueprint.handler_for(CodeOffset(0)),
+            Some(&handler(0, 1, 1, 0)),
+            "both contain it and the first one wins"
+        );
+        assert_eq!(
+            blueprint.handler_for(CodeOffset(1)),
+            Some(&handler(0, 2, 1, 0)),
+            "the end of a range is not in it, so the second entry is the only match"
+        );
+        assert_eq!(blueprint.handler_for(CodeOffset(2)), None);
+        assert!(
+            returning_a_constant().handler_for(CodeOffset(0)).is_none(),
+            "a function with no table catches nothing"
+        );
+    }
+
+    #[test]
+    fn a_disassembly_shows_the_table_because_no_instruction_mentions_it() {
+        let blueprint = FunctionBlueprint {
+            handlers: vec![handler(0, 2, 1, 0)],
+            ..returning_a_constant()
+        };
+        let listing = blueprint.disassemble();
+        assert!(listing.contains("handlers:"), "{listing}");
+        assert!(listing.contains("[0, 2) -> 1 into r0"), "{listing}");
     }
 
     #[test]

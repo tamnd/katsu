@@ -25,7 +25,7 @@ The opcode families:
 | Iteration | `ForInPrepare`, `ForInNext`, `GetIterator`, `IteratorNext`, `IteratorClose` |
 | Allocation | `NewObject`, `NewArray`, `NewClosure`, `NewRegExp`, `CloneObjectLiteral` |
 | Generators | `Suspend`, `Resume`, `GeneratorStore`, `GeneratorRestore` |
-| Exceptions | `Throw`, `ReThrow`, `PopHandler` |
+| Exceptions | `Throw` |
 | Modules | `LdModuleVar`, `StModuleVar`, `ImportDynamic`, `ImportMeta` |
 | Type queries | `TypeOf`, `ToNumber`, `ToString`, `ToObject`, `ToPropertyKey` |
 
@@ -41,7 +41,9 @@ What exists is the decoded form, one Rust enum with one variant per opcode. The 
 
 Jumps carry an absolute instruction index rather than a signed offset. An offset is smaller and relocatable and is what the encoded form will use. An absolute index is the one that cannot be wrong by a sign, which matters more while the forward reference patch list in lowering is new.
 
-Every opcode in the set has a construct in the M0 subset that lowers to it. The families listed above that M0 has no syntax for, iteration and generators and modules and private names and exception handlers, are deliberately absent. An opcode with no producer is an opcode whose semantics nobody has had to think about, and it sits in the file looking implemented.
+Every opcode in the set has a construct in the subset that lowers to it. The families with no syntax yet, iteration and generators and modules and private names, are deliberately absent. An opcode with no producer is an opcode whose semantics nobody has had to think about, and it sits in the file looking implemented.
+
+The exception family started as three opcodes in the table above and is one, which is the table design of 4.10 showing up in the instruction set. `PopHandler` was there because a handler stack has to be popped, and there is no handler stack to pop. `ReThrow` was there because a `finally` has to put back whatever it interrupted, and that is a completion token in a register rather than an opcode of its own, so when `finally` lands it will not add one. What is left is `Throw`, which takes a register and never comes back.
 
 Four opcodes exist that the table above does not name. Three are there because a static analysis found something a run time check would otherwise have to find. `LoadUninitialized` writes the hole into a `let` or `const` slot when its scope is entered, and `ThrowIfUninitialized` is the dead zone check, emitted only where scope analysis says a reference can reach one. `ThrowConstAssignment` is the third, and it is an opcode rather than an early error because Node reports assignment to a `const` as a run time TypeError.
 
@@ -133,6 +135,14 @@ Reading a named property, writing one and calling a method all run now, against 
 Writing has three outcomes rather than one, and all three are the language rather than gaps. A write to an object stores. A write to `undefined` or `null` throws, because there is nothing there to write to. A write to a number, a string or a boolean has nowhere to go, so sloppy mode drops it and strict mode throws `Cannot create property 'x' on number '5'`, naming the value as well as its type. Both messages are Node's word for word, and the strict case is reachable because the blueprint already knows whether the function it came from is strict.
 
 An object literal runs, and it runs as a `new_object` followed by one `set_prop` per property rather than as one instruction that takes a list. That is three or four instructions where one would do and it is deliberate, because a store is the operation that takes a shape transition, so building a literal out of stores means a literal and an object grown a property at a time reach the same shape and neither of them needs a second code path. It also means every property of a literal is already an inline cache site without inventing a new kind of cache. The count in `new_object` is a promise about what the stores after it are about to put in, so a literal is one allocation with room rather than an allocation and then a properties array, and an object that ends up with more than it was built for grows the ordinary way. The one thing lowering has to be careful about is that a literal writes its destination before its operands run, since the stores need somewhere to store into, so `x = {a: (x = 1)}` builds into a temporary rather than into `x`.
+
+Exceptions run, which is the first control flow in the interpreter that is not a jump inside one function. `throw` is one opcode that never returns to the instruction after it, entering a `try` is no opcode at all, and `Interpreter::handle` is what decides where a throw goes by reading the table 4.10 describes. The search crosses frames rather than stopping at the one that threw, so a throw at the bottom of a call chain finds a handler above it and every frame in between is popped without finishing, which is the whole reason `throw` is worth having. What a `catch` binds is a register like a function parameter, written by the search itself when it finds the handler, and a captured one lands in a temporary that the first instruction of the handler copies into its cell.
+
+Three things are deliberately not catchable, and they are a list in one function rather than a flag on each error: running out of memory, being asked to stop, and reaching an opcode this build has not written yet. The first two are not catchable in Node either, and the third is a gap in katsu rather than an event in the program, so letting a `catch` swallow one would turn a missing feature into a wrong answer. Everything else is, including a stack overflow, which Node reports as a catchable `RangeError` and so does this.
+
+An engine error stays a name and a message until something catches it, and becomes an object with those two as own properties at the moment a handler takes it. Almost no `TypeError` is ever caught, so the allocation is paid at the `catch` rather than at the throw, and 5.3.7 measures what that is worth and what is still left to move. It is not an `Error` yet in the sense that there is no `Error` for it to be an instance of, so `e.name` and `e.message` read correctly while `e instanceof Error` and `e.stack` wait on prototypes and source spans. That difference is visible in what `console.log(e)` prints, and it is written down here and in the differential corpus rather than left to be found.
+
+`finally` does not run and is refused by name at the parser, because it is not a third clause on the side of the other two: it has to run when the block finishes, when the block throws, and when the block returns or breaks or continues out of it, and getting that right is a completion token threaded through lowering rather than another table entry.
 
 A key computed at run time and `delete` still do not run, so those fall through to the arm at the bottom of the match and produce an error naming the opcode. A refusal that says `get_index is not implemented yet` is worth a great deal more than a wrong answer, and it is the difference between a runtime that is incomplete and one that is untrustworthy. The parser refuses the parts of object literal syntax that have nothing to build against yet, each by its own name, so a spread, a getter, a setter, a method, a computed name and a numeric name each say what they are rather than sharing one message.
 
@@ -263,6 +273,28 @@ A property read is about three times a global read and about six times a registe
 That is the number M1 has to beat, and writing it down is the point of measuring it. An inline cache does not make the scan faster, it removes the scan, so the comparison M1 owes is a guard against a shape versus this, on the same benchmark, on the same machine.
 
 The measurement paid for itself immediately. The first run of it reported 43 nanoseconds for a property read on Windows, more than three times what the scan could possibly cost, and the cause was not in the lookup at all. The opcode arm was building the text of the property name for the error message it might need, on the way through, whether or not it was going to fail, and reading a constant back out of the pool allocates a `String`. Moving the message into a cold function that a successful read never calls took the same benchmark from 43.0 to 11.8 nanoseconds on the same machine minutes apart. It is the same lesson as all three in 5.3.2: the cost was in code that was there for the case that does not happen, and nothing but a benchmark was ever going to point at it.
+
+### 5.3.7 What a `try` costs when nothing goes wrong, and what a throw costs when something does
+
+The handler table of 4.10 is a trade, and both sides of it are measurable, so both sides are measured here rather than argued about. All five numbers are a thousand iterations of a `while` loop divided by a thousand, so they are per iteration and not per instruction, and the loop is the same loop in all five.
+
+These ran on the m4 only. The other two reference machines were not reachable when this was written, and one column is enough for what the table is for, which is the ratios inside it. The absolutes belong next to the ones in 5.3.5 and should be read as the same machine on a different day.
+
+| Operation | m4 |
+|---|---|
+| An iteration of a plain loop, for scale | 17.21 ns |
+| The same iteration wrapped in a `try` that never fires | 19.83 ns |
+| An iteration that throws a number and catches it in the same frame | 14.55 ns |
+| The same throw caught three frames up | 50.32 ns |
+| The same shape throwing a `TypeError` instead of a number | 153.14 ns |
+
+The first two rows are the claim the design exists to make, and the honest version of it is not zero. A `try` that never fires costs one `jump` per exit, over the handler and into the code after it, which is the same jump an `if` with no `else` emits, plus one register of frame width for the slot the caught value would land in. Nothing is pushed on entry and nothing is popped on exit, because there is no handler stack to push onto, and that is the part the design was for. Both of those remaining costs come from lowering the handler in line, and lowering it out of line would remove them, which is a thing to do rather than a thing to explain.
+
+The third row is the one that looks wrong and is not. An iteration that throws is cheaper than an iteration that does the arithmetic, because throwing skips the arithmetic and the jump and replaces them with one `throw`, a walk of a one entry table and a store into the handler's register. The useful reading is not that throwing is free but that a throw caught nearby is in the same range as ordinary instructions rather than an order of magnitude above them, which is what a table search should cost when the table is short.
+
+The fourth row prices unwinding. Three frames of distance adds 35.8 ns, and three calls measured on the same machine in the same session cost 25.5 ns of that, so popping a frame and missing its handler table is about 3.4 ns, which is the frame pop and a table that is empty. A throw is charged for the calls it has to walk back through and very little else.
+
+The fifth row is the one with a number worth acting on. A caught `TypeError` costs 138 ns more than a caught number, and deferring the object to the `catch` only removes part of that. What is left at the throw is the message, which is a `format!` and a `String` before anything knows whether a handler exists, and what is left at the `catch` is interning the name, allocating the message on the heap and building a two property object with a shape. The first half is the one to attack, because it is paid by every engine error including the ones nothing catches, and making the message a closure over what it needs rather than a built string would move all of it behind the same test that already defers the object. That is exactly the shape of the bug 5.3.6 found in property reads and it is worth writing down before it is fixed rather than after.
 
 ## 5.4 Our own stack
 

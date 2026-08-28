@@ -75,6 +75,16 @@
 //! costs, and it is the number a jump table would have to beat to be worth building. Reported per
 //! clause tested rather than per switch, so the two shapes are directly comparable.
 //!
+//! The `exceptions` group prices both halves of the trade `spec/04-frontend.md` made when it chose a
+//! handler table over a handler stack, and it is reported per loop iteration because that is the
+//! unit both halves are paid in. `loop_without_try` and `loop_inside_try` are the same arithmetic
+//! with and without a `try` that never fires, and the gap between them is what a program pays for
+//! writing a `try` around a hot loop body. `throw_caught_in_the_same_frame` is what the search costs
+//! when something does throw, `throw_caught_three_frames_up` adds the unwinding, and the gap between
+//! those two is what one frame is worth. `engine_error_caught` is the same shape with a `TypeError`
+//! instead of a thrown number, so the cost of building the error object at the `catch` rather than
+//! at the throw is a difference between two measured numbers rather than a claim.
+//!
 //! The call benchmarks come from source rather than from assembled bytecode, because a call is the
 //! one place where the cost depends on what lowering and scope analysis decided, and hand written
 //! bytecode would measure my guess at those decisions.
@@ -654,6 +664,86 @@ fn switches(c: &mut Criterion) {
     group.finish();
 }
 
+/// How many times each exception benchmark goes round its loop.
+///
+/// A thousand, so that one measurement is a run of iterations rather than a frame push either side
+/// of a handful of them, and the same count for the loop that throws as for the loop that does not
+/// so that the two numbers divide by the same thing.
+const ATTEMPTS: i32 = 1_000;
+
+fn exceptions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("exceptions");
+    group.throughput(Throughput::Elements(ATTEMPTS as u64));
+
+    // The claim the handler table exists to make, measured rather than asserted. These two loops do
+    // the same arithmetic and one of them is wrapped in a `try` that never fires, so whatever a
+    // `try` costs when nothing goes wrong shows up here multiplied by a thousand.
+    //
+    // What it costs is one `jump` per iteration, over the handler and into the code after it, which
+    // is the same jump an `if` with no `else` emits and is the whole difference between the two
+    // listings. Nothing is pushed on the way in and nothing is popped on the way out, because there
+    // is no handler stack to push onto. The remaining gap that a jump does not explain is the frame
+    // being one register wider, since the caught value needs a slot whether or not anything is ever
+    // caught. Both of those are worth removing later by lowering the handler out of line, and
+    // neither is the cost this design exists to avoid.
+    let plain = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ total = total + i; i = i + 1; }}"
+    ));
+    group.bench_function("loop_without_try", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&plain))));
+    });
+
+    let guarded = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ total = total + i; }} catch \
+         (e) {{ total = 0; }} i = i + 1; }}"
+    ));
+    group.bench_function("loop_inside_try", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&guarded))));
+    });
+
+    // What a throw costs when it does fire, which is the other half of the trade. The value is a
+    // number rather than an engine error, so this measures the search and the landing without the
+    // allocation an error object would add on top.
+    let thrown = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ throw i; }} catch (e) {{ total \
+         = total + e; }} i = i + 1; }}"
+    ));
+    group.bench_function("throw_caught_in_the_same_frame", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&thrown))));
+    });
+
+    // The same throw with three frames between it and the handler, which is the shape that makes
+    // the search a loop rather than a lookup. The gap between this and the one above is what
+    // unwinding a frame costs.
+    let across = program(&format!(
+        "function bottom(n) {{ throw n; }} function middle(n) {{ return bottom(n); }} function top \
+         (n) {{ return middle(n); }} let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ \
+         top(i); }} catch (e) {{ total = total + e; }} i = i + 1; }}"
+    ));
+    group.bench_function("throw_caught_three_frames_up", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&across))));
+    });
+
+    // An engine error rather than a thrown value, which is where the object gets built. The gap
+    // between this and `throw_caught_in_the_same_frame` is what deferring that allocation to the
+    // `catch` is worth, since it is the whole of what a caught engine error costs over a caught
+    // number.
+    let engine = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ null.x; }} catch (e) {{ total = \
+         total + 1; }} i = i + 1; }}"
+    ));
+    group.bench_function("engine_error_caught", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&engine))));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     straight_line,
@@ -664,6 +754,7 @@ criterion_group!(
     globals,
     properties,
     objects,
-    natives
+    natives,
+    exceptions
 );
 criterion_main!(benches);

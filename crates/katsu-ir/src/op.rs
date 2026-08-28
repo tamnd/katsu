@@ -421,6 +421,15 @@ pub enum Op {
     /// Return `src` to the caller.
     Return { src: Register },
 
+    /// Throw `src`.
+    ///
+    /// Where control goes is not in the instruction, and that is the design rather than an
+    /// omission. Every function carries a table of the ranges it protects, so entering a `try`
+    /// costs nothing at all and a throw pays for the search. `spec/04-frontend.md` picked that
+    /// trade the way the JVM picked it, because a `try` inside a hot loop is far more common than
+    /// a throw inside one.
+    Throw { src: Register },
+
     /// Stamp a closure out of `blueprint`, capturing the current environment, into `dst`.
     NewClosure {
         dst: Register,
@@ -521,6 +530,7 @@ impl Op {
             Self::Return { .. }
                 | Self::Jump { .. }
                 | Self::LoopBackEdge { .. }
+                | Self::Throw { .. }
                 | Self::ThrowConstAssignment
         )
     }
@@ -638,6 +648,7 @@ impl fmt::Display for Op {
                 key.0
             ),
             Self::Return { src } => write!(f, "return {src}"),
+            Self::Throw { src } => write!(f, "throw {src}"),
             Self::NewClosure { dst, blueprint } => write!(f, "new_closure {dst}, {blueprint}"),
             Self::NewObject { dst, slots } => write!(f, "new_object {dst}, {slots}"),
             Self::Jump { target } => write!(f, "jump {target}"),
