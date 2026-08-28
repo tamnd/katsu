@@ -6,6 +6,7 @@
 
 mod adapter;
 pub mod ast;
+pub mod scope;
 
 use katsu_ir::FunctionBlueprint;
 use oxc_allocator::Allocator;
@@ -40,6 +41,23 @@ pub enum ParseError {
         /// What we hit, named the way a JavaScript programmer would name it.
         construct: &'static str,
     },
+    /// The source parsed, and then broke a rule the language checks before running anything.
+    ///
+    /// A redeclared name and a `const` with no initialiser are both errors that a program has to
+    /// be refused for even if the line they are on never runs, which is why they are found here
+    /// rather than by the interpreter. The message is the one the other engines use, because these
+    /// end up in somebody's test expectations.
+    #[error("{path}:{line}:{column}: {message}")]
+    EarlyError {
+        /// The file the rule was broken in.
+        path: String,
+        /// One based line.
+        line: u32,
+        /// One based column, counted in characters.
+        column: u32,
+        /// What is wrong.
+        message: String,
+    },
     /// Lowering is not implemented for this construct yet.
     ///
     /// This variant exists so that M0 fails loudly and specifically rather than producing
@@ -64,6 +82,8 @@ pub struct ParsedModule {
     /// nothing in here borrows from it. That is the cost of owning our own tree and it is the
     /// price of the parser staying swappable.
     pub ast: ast::Module,
+    /// Every name in the tree, resolved to a slot.
+    pub scopes: scope::Scopes,
     /// The lowered top level code, empty until lowering lands in M0.
     pub top_level: FunctionBlueprint,
 }
@@ -97,9 +117,21 @@ pub fn parse(path: &str, source: &str) -> Result<ParsedModule, ParseError> {
         });
     }
 
+    let ast = adapter::adapt(path, &parsed.program)?;
+    let scopes = scope::analyse(&ast).map_err(|error| {
+        let (line, column) = adapter::line_and_column(source, error.span.start);
+        ParseError::EarlyError {
+            path: path.to_owned(),
+            line,
+            column,
+            message: error.message,
+        }
+    })?;
+
     Ok(ParsedModule {
         path: path.to_owned(),
-        ast: adapter::adapt(path, &parsed.program)?,
+        ast,
+        scopes,
         top_level: FunctionBlueprint::default(),
     })
 }
