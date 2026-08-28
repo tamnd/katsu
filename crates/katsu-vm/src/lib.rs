@@ -34,6 +34,19 @@ pub enum CompileError {
     Parse(#[from] katsu_parse::ParseError),
 }
 
+impl CompileError {
+    /// Whether this is our gap rather than the program's mistake.
+    ///
+    /// Forwarded from the parser, which is where the distinction is drawn. See
+    /// [`katsu_parse::ParseError::is_not_implemented`] for why it is worth drawing.
+    #[must_use]
+    pub const fn is_not_implemented(&self) -> bool {
+        match self {
+            CompileError::Parse(error) => error.is_not_implemented(),
+        }
+    }
+}
+
 /// Turn source text into a blueprint the interpreter can execute.
 ///
 /// The layers above the VM go through here rather than calling the parser directly, so

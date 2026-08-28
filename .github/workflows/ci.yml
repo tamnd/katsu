@@ -108,6 +108,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo doc --workspace --no-deps --all-features
 
+  # The conformance ratchet from spec/14-quality-bar.md. It is here rather than on a nightly
+  # because the thing it is guarding against is a commit that quietly stops running tests, and a
+  # nightly finds that a day after the commit that caused it has been merged and forgotten.
+  conformance:
+    name: test262
+    runs-on: ubuntu-latest
+    env:
+      # Pinned, because the expectations file is a set of names taken out of the suite and the suite
+      # gains and renames tests every week. An unpinned clone would make CI fail on somebody else's
+      # commit. Moving this is its own pull request, with the re-blessed file in the same diff.
+      SUITE: ac7b5f8c39c27b55176c20ead2a69b1402d0d1d3
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/cache@v4.3.0
+        id: suite
+        with:
+          path: vendor/test262
+          key: test262-${{ env.SUITE }}
+      - name: Fetch the suite at the pinned revision
+        if: steps.suite.outputs.cache-hit != 'true'
+        run: |
+          git init vendor/test262
+          git -C vendor/test262 remote add origin https://github.com/tc39/test262
+          git -C vendor/test262 fetch --depth 1 origin "$SUITE"
+          git -C vendor/test262 checkout "$SUITE"
+      - run: cargo run --release -p test262-runner
+
   supply-chain:
     name: Supply chain
     runs-on: ubuntu-latest
