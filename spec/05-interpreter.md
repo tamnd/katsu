@@ -118,6 +118,35 @@ There is also `#[loop_match]`, the experimental computed goto style work in rust
 
 **The decision rule:** ship A, keep B behind a flag, prototype C during M2 alongside the stencil work, and pick by measurement at M3. Do not let the interpreter's dispatch strategy become a blocker for anything else, because tier 1 exists precisely so that the interpreter's ceiling does not determine the product's ceiling.
 
+### 5.3.1 The dispatch loop, as built
+
+`crates/katsu-vm/src/interpret.rs` is strategy A, written flat. Every opcode is one arm of one match, the arm does the work, and nothing is hidden behind a generic helper that takes a closure. That costs some repetition and it buys the property 5.2 is actually asking for, which is that the semantics of an opcode are readable in one place. It also means an arm can be split into a fast path and a slow path when the quickening in 5.5 arrives, without unpicking an abstraction first.
+
+Everything that happens inside a single frame runs: the loads and moves, arithmetic, the bitwise operators, comparisons, the unary operators, the temporal dead zone checks, jumps, back edges and `return`. Calls, closures, environments, globals and property access all need a heap object with a header to point at, which M0 does not have yet, so every one of them falls through to the arm at the bottom of the match and produces an error naming the opcode. A refusal that says `get_index is not implemented yet` is worth a great deal more than a wrong answer, and it is the difference between a runtime that is incomplete and one that is untrustworthy.
+
+The numeric conversions live in their own module, because each of them is a place where the obvious Rust expression is subtly not what JavaScript says. `ToInt32` is a modulo and a fold rather than a cast, so `1e10 | 0` is `1410065408` while `1e10 as i32` saturates. A shift count is taken modulo thirty two, so `1 << 32` is `1`. Exponentiation disagrees with IEEE `pow` in exactly two places, `1 ** NaN` and `(-1) ** Infinity`, both of which are `NaN` in JavaScript and one in IEEE. Relational comparison is the one case where the obvious expression is right, because Rust's float operators are the IEEE ones and already return false on both sides of a `NaN`, which is what the standard asks for.
+
+Back edges check one shared atomic word, which is the mechanism 5.6 describes, and a test proves an endless loop can be stopped from another thread. That check is the only per iteration cost the loop pays that a straight line of instructions does not.
+
+| Operation | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| Move a register | 0.87 ns | 0.78 ns | 0.85 ns |
+| Add two numbers | 1.70 ns | 2.83 ns | 2.10 ns |
+| Compare two numbers | 1.35 ns | 1.25 ns | 1.49 ns |
+| Raise to a power | 3.59 ns | 8.42 ns | 4.90 ns |
+| One counting loop iteration | 6.55 ns | 6.43 ns | 6.59 ns |
+| The same, per instruction | 1.64 ns | 1.61 ns | 1.65 ns |
+
+Measured on the three reference machines from document 15.5, a thousand instructions to a run so that the frame push either side is noise.
+
+A move is the floor, because it reads one register and writes another and everything left over is the fetch, the bounds check and the branch the match compiles into. Under a nanosecond on all three machines is a good deal better than the folklore about a single dispatch site predicts, and it is the number strategies B and C have to beat.
+
+The interesting result is that an add costs more than a comparison on both x86 machines and about the same on the M4, when the two arms do identical work apart from the operator. The difference is entirely in what happens to the result. A comparison writes a boolean, which is a tag and nothing else. An add writes a number through `Value::from_f64`, which checks whether the double is exactly an integer and re-encodes it as a tagged integer when it is, so that the next instruction to read it gets an integer rather than a boxed double. That check is the right default and it is also the single clearest argument for the integer quickening in 5.5: an `Add.Int32` that stays in integers throughout never converts to a double and never converts back, and the gap between the add row and the compare row is roughly what it stands to win.
+
+Exponentiation is the one operator that calls into libm rather than compiling to an instruction, and it is the only row where the same silicon disagrees with itself. The 13900K runs it in 8.42 ns under WSL2 and 4.90 ns natively, which is glibc's `pow` against the Microsoft runtime's and not anything we wrote. It is worth knowing before anybody reads a benchmark that leans on `Math.pow` and concludes something about the engine.
+
+The counting loop is the row that resembles a real program: a comparison, a conditional jump, an add and a back edge, with a dependency between every pair of them and a branch for the predictor to get right. Six and a half nanoseconds an iteration on all three machines, about 1.6 ns an instruction, which is close enough to the straight line rows to say the branch is predicted and the interrupt check is close to free. No comparison against Node is claimed here, because a fair one needs the differential harness and a program that both runtimes can actually run.
+
 ## 5.4 Our own stack
 
 JavaScript frames live on a contiguous stack that we allocate and manage, not on the Rust call stack.

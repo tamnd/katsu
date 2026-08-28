@@ -495,11 +495,19 @@ impl Op {
     ///
     /// Lowering uses it to avoid emitting the implicit `return undefined` after a body that already
     /// ended in a return, which is the difference between a tidy disassembly and one with dead tails
-    /// all through it.
+    /// all through it. `verify` uses it to check that the last instruction is one, because control
+    /// running off the end of the code is the one bytecode bug the interpreter cannot report.
+    ///
+    /// A back edge is on the list because it is an unconditional jump with a counter attached, so
+    /// nothing after it ever runs. That matters for `while (true) {}`, whose whole body is a loop
+    /// with no exit and whose last instruction is therefore the edge itself.
     pub const fn is_terminator(self) -> bool {
         matches!(
             self,
-            Self::Return { .. } | Self::Jump { .. } | Self::ThrowConstAssignment
+            Self::Return { .. }
+                | Self::Jump { .. }
+                | Self::LoopBackEdge { .. }
+                | Self::ThrowConstAssignment
         )
     }
 }
@@ -995,6 +1003,22 @@ mod tests {
         assert!(Op::Return { src: Register(0) }.is_terminator());
         assert!(
             Op::Jump {
+                target: CodeOffset(0)
+            }
+            .is_terminator()
+        );
+        // An unconditional jump with a counter attached, so nothing after it ever runs.
+        assert!(
+            Op::LoopBackEdge {
+                target: CodeOffset(0),
+                profile: CacheIndex(0)
+            }
+            .is_terminator()
+        );
+        // And the conditional ones are not, because control does continue when the test fails.
+        assert!(
+            !Op::JumpIfTrue {
+                cond: Register(0),
                 target: CodeOffset(0)
             }
             .is_terminator()
