@@ -59,6 +59,12 @@
 //! between the two is the difference between pushing a frame and making a Rust call. Every builtin
 //! in the runtime will pay this, so it is worth knowing before there are any.
 //!
+//! The `switch` group measures what a switch costs today, which is a run of `StrictEqual` and
+//! `JumpIfTrue` walked until one of them is true. That is a linear scan, so the two numbers to read
+//! together are the first clause and the last: the gap between them is what each clause not taken
+//! costs, and it is the number a jump table would have to beat to be worth building. Reported per
+//! clause tested rather than per switch, so the two shapes are directly comparable.
+//!
 //! The call benchmarks come from source rather than from assembled bytecode, because a call is the
 //! one place where the cost depends on what lowering and scope analysis decided, and hand written
 //! bytecode would measure my guess at those decisions.
@@ -78,6 +84,16 @@ const ITERATIONS: i32 = 1_000;
 
 /// Instructions in the body of the counting loop: the compare, the branch, the add and the edge.
 const LOOP_BODY: u64 = 4;
+
+/// How many clauses in the benchmarked switch.
+///
+/// Eight, because a real switch is small. A hundred clause switch exists and it is a dispatch table
+/// somebody wrote by hand, and measuring one would say more about the cache than about the opcodes.
+const CLAUSES: i32 = 8;
+
+/// How many times the switch benchmark goes round its loop, so that one measurement is a run of
+/// switches rather than a frame push either side of a handful of instructions.
+const SWITCHES: usize = 1_000;
 
 /// How many calls in a straight chain of them, for the same reason `CHAIN` is what it is.
 const CALLS: usize = 1_000;
@@ -507,10 +523,76 @@ fn natives(c: &mut Criterion) {
     group.finish();
 }
 
+/// A run of identical eight clause switches over a constant, which matches clause `hit`.
+///
+/// The two shapes this is called with emit exactly the same instructions and differ only in the
+/// value being switched on, so the difference between their timings is the cost of the clauses
+/// walked past and nothing else. The subject is loaded once outside the chain, because reloading it
+/// per switch would put a `LoadInt` into a measurement that is about the comparisons.
+fn switch_chain(hit: i32) -> FunctionBlueprint {
+    // r0 holds the subject, r1 the clause value being tested against it, r2 the comparison result.
+    let mut code = vec![Op::LoadInt {
+        dst: Register(0),
+        value: hit,
+    }];
+
+    // Every clause body is empty, so a switch is its comparisons and the jump past them, and what
+    // is measured is the scan rather than anything the clauses do.
+    let clauses = usize::try_from(CLAUSES).expect("a clause count is small");
+    let per_switch = clauses * 3 + 1;
+    for index in 0..SWITCHES {
+        let after = u32::try_from(1 + (index + 1) * per_switch).expect("a benchmark body is short");
+        for clause in 0..CLAUSES {
+            code.push(Op::LoadInt {
+                dst: Register(1),
+                value: clause,
+            });
+            code.push(Op::StrictEqual {
+                dst: Register(2),
+                lhs: Register(0),
+                rhs: Register(1),
+                cache: IC,
+            });
+            code.push(Op::JumpIfTrue {
+                cond: Register(2),
+                target: CodeOffset(after),
+            });
+        }
+        code.push(Op::Jump {
+            target: CodeOffset(after),
+        });
+    }
+
+    code.push(Op::Return { src: Register(0) });
+    blueprint(code)
+}
+
+fn switches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("switch");
+
+    for (name, hit) in [
+        ("switch_first_clause", 0),
+        ("switch_last_clause", CLAUSES - 1),
+    ] {
+        let body = switch_chain(hit);
+        // Per clause tested rather than per switch, so that the two shapes are on the same scale
+        // and the number to compare them by is what one clause not taken costs.
+        let tested = u64::try_from(hit + 1).expect("a clause count is small");
+        group.throughput(Throughput::Elements(SWITCHES as u64 * tested));
+        group.bench_function(name, |b| {
+            let mut interpreter = Interpreter::new().expect("should reserve a stack");
+            b.iter(|| black_box(interpreter.run(black_box(&body))));
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     straight_line,
     loops,
+    switches,
     strings,
     calls,
     globals,

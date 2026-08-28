@@ -117,6 +117,7 @@ pub(crate) fn program(seed: u64, statements: usize) -> Program {
         live: Vec::new(),
         mutable: Vec::new(),
         next: 0,
+        loops: 0,
     };
 
     let mut body = Vec::new();
@@ -146,6 +147,12 @@ struct Builder<'a> {
     /// The subset of `live` declared with `let`, which is what an assignment is allowed to target.
     mutable: Vec<String>,
     next: usize,
+    /// How many loops are open around the statement being built.
+    ///
+    /// A `break` or a `continue` with nothing around it is an early error rather than a program
+    /// that runs, and a generator that emitted one would spend its run comparing two engines'
+    /// syntax error messages instead of comparing what they compute.
+    loops: usize,
 }
 
 impl Builder<'_> {
@@ -153,15 +160,26 @@ impl Builder<'_> {
     fn statement(&mut self, depth: usize) -> String {
         // Nested blocks stop producing more blocks, because the interesting part of a control
         // structure is the first level and the rest is width the generator pays for in program size.
+        // A jump is drawn before the rest, because it is only legal some of the time and folding it
+        // into the main draw would change what every other seed produces depending on where it was.
+        if self.loops > 0 && self.random.chance(8) {
+            return if self.random.chance(2) {
+                "break;".to_owned()
+            } else {
+                "continue;".to_owned()
+            };
+        }
+
         let choice = if depth >= 2 {
             self.random.below(2)
         } else {
-            self.random.below(5)
+            self.random.below(6)
         };
         match choice {
             0 | 1 => self.declaration(),
             2 => self.assignment(),
             3 => self.branch(depth),
+            4 => self.switch_statement(depth),
             _ => self.loop_statement(depth),
         }
     }
@@ -211,12 +229,60 @@ impl Builder<'_> {
     ///
     /// The counter is not added to the live set, because it is left holding the bound in every run
     /// and printing it says nothing that the bound in the source does not already say.
+    ///
+    /// The increment is the first statement of the body rather than the last, and that is what makes
+    /// a generated `continue` safe. With the increment at the bottom, a `continue` skips it and the
+    /// loop never ends, so the generator would be back to being killed by timeouts.
     fn loop_statement(&mut self, depth: usize) -> String {
         let name = format!("i{}", self.next);
         self.next += 1;
         let bound = self.random.below(4) + 1;
+        self.loops += 1;
         let body = self.block(depth + 1);
-        format!("let {name} = 0; while ({name} < {bound}) {{ {body} {name}++; }}")
+        self.loops -= 1;
+        format!("let {name} = 0; while ({name} < {bound}) {{ {name}++; {body} }}")
+    }
+
+    /// `switch (<expr>) { case <literal>: ... }`, with a break in some clauses and not in others.
+    ///
+    /// Fallthrough is the reason this production exists. A clause with no break runs the next
+    /// clause's body as well, and an engine that lowered every clause as if it ended in a break
+    /// would pass every test written with the breaks in place. The default is put at a random
+    /// position rather than last, because it is compared after every case wherever it is written
+    /// and an engine that treated it as an else would still get the last position right.
+    fn switch_statement(&mut self, depth: usize) -> String {
+        let subject = self.expression(0);
+        let mut clauses: Vec<String> = Vec::new();
+        for _ in 0..=self.random.below(3) {
+            let value = self.case_value();
+            let body = self.block(depth + 1);
+            let leave = if self.random.chance(2) { " break;" } else { "" };
+            clauses.push(format!("case {value}: {body}{leave}"));
+        }
+        if self.random.chance(2) {
+            let body = self.block(depth + 1);
+            let at = self.random.below(clauses.len() + 1);
+            clauses.insert(at, format!("default: {body}"));
+        }
+        format!("switch ({subject}) {{ {} }}", clauses.join(" "))
+    }
+
+    /// What to write after `case`.
+    ///
+    /// Half the draws are a small integer, and that is on purpose. The comparison is strict, so a
+    /// clause whose value is `5e-324` is a clause that never runs, and a switch where nothing ever
+    /// matches tests one jump and none of the bodies. Drawing from the literal tables the rest of
+    /// the time keeps the cases where a coercion an engine should not be doing would make something
+    /// match that should not have.
+    fn case_value(&mut self) -> String {
+        if self.random.chance(2) {
+            return self.random.below(4).to_string();
+        }
+        match self.random.below(3) {
+            0 => (*self.random.pick(&NUMBERS)).to_owned(),
+            1 => format!("'{}'", self.random.pick(&STRINGS)),
+            _ => (*self.random.pick(&OTHERS)).to_owned(),
+        }
     }
 
     /// One statement inside braces, with everything it declares going out of scope after it.
@@ -375,6 +441,11 @@ mod tests {
             else {
                 continue;
             };
+            // The program that declared nothing at all prints a string instead of a list of names,
+            // which is a literal and not a name that could be out of scope.
+            if names.starts_with('\'') {
+                continue;
+            }
             for name in names.split(", ").filter(|name| !name.is_empty()) {
                 // A name is in scope at the end only if it was declared at the outermost level,
                 // which for this generator means its declaration is a whole statement of its own.
