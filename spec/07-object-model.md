@@ -45,7 +45,7 @@ Integers get the top of the range rather than the bottom because a negative inte
 
 The pointer range asserts rather than masks. Current 64 bit platforms give userspace 48 bits of address and the cage in 7.2 is a 4 GB reservation well inside that, so a real heap pointer always fits. If a future platform hands out wider addresses we want a panic on the first allocation, not silently truncated pointers.
 
-Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. They run on both reference machines from document 15.5, because an encoding whose whole justification is an x86 hardware quirk should not be measured only on ARM. Nanoseconds per value, over batches of 1024:
+Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. They run on the `m4` and `gamingpc` references from document 15.5, because an encoding whose whole justification is an x86 hardware quirk should not be measured only on ARM. Nanoseconds per value, over batches of 1024:
 
 | Benchmark | Apple M4 | Core i9-13900K |
 |---|---|---|
@@ -95,20 +95,38 @@ Narrowing a register value into a slot can fail, and `Value::to_slot` returns an
 
 Widening in the other direction cannot fail, because every thirty two bit pattern names either an integer or a byte inside the cage.
 
-Measured per operation on both reference machines from document 15.5, over batches of 4096:
+Measured per operation on the three reference machines from document 15.5, over batches of 4096, all at one commit. `gamingpc` and `gamingpc-win` are the same physical box under Linux and under Windows:
 
-| Operation | m4 | gamingpc |
-|---|---|---|
-| decompress an offset to an address | 0.10 ns | 0.10 ns |
-| compress an address back to an offset | 0.25 ns | 0.51 ns |
-| integer round trip through a slot | 0.08 ns | 0.19 ns |
-| bump allocate 24 bytes into committed pages | 2.4 ns | 2.1 ns |
-| bump allocate 37 bytes, so the rounding is on the path | 2.3 ns | 2.1 ns |
-| allocate when the pages have to be committed first | 194 ns | 243 ns |
+| Operation | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| decompress an offset to an address | 0.10 ns | 0.10 ns | 0.10 ns |
+| compress an address back to an offset | 0.27 ns | 0.52 ns | 0.56 ns |
+| integer round trip through a slot | 0.08 ns | 0.19 ns | 0.19 ns |
+| bump allocate 24 bytes into committed pages | 2.3 ns | 2.1 ns | 2.3 ns |
+| bump allocate 37 bytes, so the rounding is on the path | 2.1 ns | 2.1 ns | 2.6 ns |
+| allocate when the pages have to be committed first | 185 ns | 228 ns | 931 ns |
 
-The allocation figures include the census bookkeeping, because the census is on the allocation path rather than sampled and there is no path that skips it. The committed and uncommitted cases are reported separately on purpose, because their average describes neither of them. The last row is a syscall and belongs to the kernel more than to us, which is the honest reading of the gap between the two machines on that line.
+The allocation figures include the census bookkeeping, because the census is on the allocation path rather than sampled and there is no path that skips it. The committed and uncommitted cases are reported separately on purpose, because their average describes neither of them.
+
+The two x86-64 columns are the same silicon, so every row where they agree is a row where the operating system does not matter, and there is only one row where they do not agree. Committing pages costs four times as much on Windows, because `VirtualAlloc` with `MEM_COMMIT` does real work per page while `mprotect` on a range that is already mapped mostly updates a permission and leaves the pages to fault in later. That row is a syscall and belongs to the kernel more than to us, which is also the honest reading of the smaller gap between m4 and the other two.
+
+That row used to be 3.6 microseconds on Windows rather than 931 nanoseconds. The heap was asking the cage to commit from zero up to the new high water mark every time it grew, which is quadratic, and it is quadratic on Linux too. Linux was hiding it and Windows was not. Committing only the new chunk fixed it everywhere and is worth 12.8 percent on m4 as well.
 
 The first run on gamingpc is also where the eight gigabyte reservation first failed, with ENOMEM out of criterion's warmup. The cause was the benchmark and not the cage: criterion's `SmallInput` batching runs the setup for a whole batch before timing any of it, so hundreds of heaps were alive at once and each one holds its own reservation. Linux refuses that and macOS does not, which is the entire argument for having a second reference machine.
+
+### 7.2.2 The platform seam, as built
+
+Everything above the reservation works in terms of reserving address space and committing pages inside it, which is the same idea on every operating system. The calls that implement it are not the same idea anywhere, so they live in `crates/katsu-platform/src/sys` and nowhere else, one file per platform, selected by `cfg` at the module boundary rather than inside a function. A function with three branches in it is a function that only ever gets read on one platform.
+
+The seam is five items and no more: `page_size`, `reserve`, `release`, `commit` and `decommit`. `reservation.rs` above it does bounds checking, page rounding and error shaping, which is where the bugs actually are and which is identical everywhere, and it names no system call at all. Adding a platform means writing four functions rather than weakening anything above them, and an unsupported platform is a `compile_error!` that says so rather than a link failure three crates later.
+
+Two invariants hold on every backend and the layers above depend on both. A freshly committed page reads as zero, which is what lets a slot of all zero bits mean the integer zero with no initialisation pass over a new block. And a decommit followed by a commit gives back zeroes rather than the old contents, so a collector that recycles a block cannot see a dead object's bytes. Neither is free and the two platforms pay for them differently.
+
+On unix, decommit maps a fresh anonymous `PROT_NONE` range over the old one with `MAP_FIXED` rather than calling `madvise`. The `madvise` route is a hint, and on macOS `MADV_FREE` specifically means "you may take these pages when you need them", so the old contents can still be there on the next read. That failure would appear only under memory pressure, which is the worst possible shape for a bug. Alignment on unix is done by over reserving by one alignment and unmapping the slack at both ends, because the flag that asks the kernel for an aligned mapping is spelled differently on every platform, absent on some, and silently ignored on others.
+
+On Windows the vocabulary is already the right one, since `VirtualAlloc` has always split reserving from committing, and `MEM_DECOMMIT` is exactly the second invariant with no trick needed. The two differences are that Windows has two granularities rather than one, pages at 4 KiB and an allocation granularity of 64 KiB, and that you cannot release part of a reservation, so the over reserve and trim approach is not available. `VirtualAlloc2` takes an alignment directly through `MEM_ADDRESS_REQUIREMENTS`, which is one call instead of three, and an alignment finer than 64 KiB is rounded up to it, which still satisfies a caller who asked for less. The cage asks for four gigabytes of alignment, so this only ever matters in tests.
+
+The one thing the seam does not hide is that committing costs four times as much on Windows as on Linux on the same hardware, which is the last row of the table in 7.2.1. Nothing above the seam should be written as though a commit were cheap, and the first thing that made this visible was a growth pattern that had been quadratic since the heap was written.
 
 ## 7.3 Why not Nova's index based design
 
@@ -202,7 +220,7 @@ The atom table is open addressed with linear probing at a three quarter load fac
 
 Two gaps are worth naming. Without ropes, `a = a + b` in a loop copies both sides every time and is quadratic, which is the first thing M1 should close. And the hash is not resistant to flooding: a program that picks colliding property names can push the table into long probe runs, which is a real denial of service against a server. The fix is a per process random seed, and it has to arrive with the realm rather than later, because a seed cannot change once a hash has been cached in a string header.
 
-Measured per operation on both reference machines from 15.5:
+Measured per operation on the `m4` and `gamingpc` references from 15.5:
 
 | Operation | m4 | gamingpc |
 |---|---|---|

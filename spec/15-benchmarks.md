@@ -50,12 +50,15 @@ One repository, one command, results as JSON.
 
 Fixed hardware for published numbers: a named x86-64 machine and a named aarch64 machine, with CPU frequency scaling pinned, turbo disabled, processes pinned to cores, and nothing else running. Cloud instances are too noisy for anything but relative trends and are labeled as such when used.
 
-The two reference machines, so that a number in this repository can be attributed to one of them by name:
+The reference machines, so that a number in this repository can be attributed to one of them by name:
 
 | Name | Machine | Notes |
 |---|---|---|
-| `gamingpc` | Intel Core i9-13900K, 32 threads, 32 GB, Ubuntu under WSL2 on Windows 11 | The x86-64 reference. Benchmarks are pinned to a single performance core with `taskset`. It is a desktop that is otherwise idle, and the WSL2 layer is a virtual machine, both of which are stated next to any number taken here. |
+| `gamingpc` | Intel Core i9-13900K, 32 threads, 32 GB, Ubuntu under WSL2 on Windows 11 | The x86-64 Linux reference. Benchmarks are pinned to a single performance core with `taskset`. It is a desktop that is otherwise idle, and the WSL2 layer is a virtual machine, both of which are stated next to any number taken here. |
+| `gamingpc-win` | The same box, running Windows 11 natively rather than through WSL2 | The Windows reference. Benchmarks are pinned with `start /affinity`, which matters more here than anywhere else because a 13900K has performance and efficiency cores and an unpinned run lands on either. An unpinned run measured roughly half the throughput of a pinned one on every microbenchmark, which is the efficiency core and not the code. |
 | `m4` | Apple M4, 10 cores, 24 GB, macOS 15 | The aarch64 reference. A laptop, so thermal behaviour over a long suite is a real effect and long running benchmarks say so. |
+
+Two of those are the same physical machine, which is deliberate. Running the same commit under Windows and under Linux on identical hardware isolates the operating system from everything else, and the first time it was done it found a quadratic commit pattern in the heap that Linux had been hiding. See `spec/07-object-model.md` 7.2.2.
 
 There are three cloud boxes on hand, `server1`, `server2` and `server3`, and none of them are reference machines. They are shared AMD EPYC instances carrying load averages between eight and fourteen while doing other work, which makes them worse than either laptop for a comparison and fine for nothing except checking that something builds and runs on a machine we do not control. A number from one of them is labelled as such or it does not get published.
 

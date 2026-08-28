@@ -9,11 +9,15 @@
 //! with four gigabytes of memory. Committing is what costs pages, and the memory budget in
 //! `spec/02-the-10x-goal.md` counts committed pages, so it is the operation that has to be
 //! explicit and countable.
+//!
+//! Nothing in this file names a system call. The four that exist live in `crate::sys`, once per
+//! operating system, and everything here is bounds checking, page rounding and error shaping, which
+//! is the same on every platform and is where the bugs actually are.
 
 use std::io;
 use std::ptr::NonNull;
 
-use crate::round_up_to_page;
+use crate::{round_up_to_page, sys};
 
 /// What went wrong reserving or committing address space.
 #[derive(Debug, thiserror::Error)]
@@ -82,9 +86,9 @@ impl Reservation {
     /// faults rather than silently reading zeroes, which is the whole reason the cage reserves
     /// guard regions it never intends to use.
     ///
-    /// Alignment is achieved by over reserving and trimming the ends rather than by asking the
-    /// kernel, because the flag that does this is spelled differently on every platform and is
-    /// absent on some.
+    /// How the base comes out aligned is the backend's business. Unix over reserves and trims the
+    /// ends, Windows asks for the alignment directly. Both are asked for the same thing and both
+    /// return a base that is at least as aligned as requested.
     ///
     /// # Errors
     ///
@@ -100,56 +104,10 @@ impl Reservation {
             return Err(ReservationError::Empty);
         }
 
-        // Over reserve by one alignment so that there is always an aligned base inside the
-        // mapping no matter where the kernel puts it, then give back the slack at both ends.
-        let padded = size
-            .checked_add(alignment)
-            .ok_or(ReservationError::BadAlignment(alignment))?;
-
-        // SAFETY: an anonymous private mapping with a null address hint asks the kernel to pick
-        // an address, which is always valid to call. MAP_NORESERVE asks it not to charge the
-        // mapping against commit accounting, which is what makes a reservation this large
-        // reasonable on a machine with far less memory than it.
-        let raw = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                padded,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if raw == libc::MAP_FAILED {
-            return Err(ReservationError::Reserve {
-                size,
-                alignment,
-                source: io::Error::last_os_error(),
-            });
-        }
-
-        let raw = raw.cast::<u8>();
-        let start = raw as usize;
-        let aligned = start.next_multiple_of(alignment);
-        let head = aligned - start;
-        let tail = padded - head - size;
-
-        // SAFETY: `head` and `tail` are the slack at the two ends of a mapping we just made and
-        // still own, so unmapping them cannot unmap anything that belongs to somebody else. A
-        // zero length munmap is skipped because it is an error rather than a no-op.
-        unsafe {
-            if head > 0 {
-                libc::munmap(raw.cast::<libc::c_void>(), head);
-            }
-            if tail > 0 {
-                libc::munmap(raw.add(head + size).cast::<libc::c_void>(), tail);
-            }
-        }
-
-        let base = NonNull::new(aligned as *mut u8).ok_or(ReservationError::Reserve {
+        let base = sys::reserve(size, alignment).map_err(|source| ReservationError::Reserve {
             size,
             alignment,
-            source: io::Error::from(io::ErrorKind::Other),
+            source,
         })?;
         Ok(Reservation { base, size })
     }
@@ -187,7 +145,18 @@ impl Reservation {
     /// [`ReservationError::Protect`] if the kernel refuses.
     pub fn commit(&self, offset: usize, len: usize) -> Result<(), ReservationError> {
         let (offset, len) = self.page_range(offset, len)?;
-        self.protect(offset, len, libc::PROT_READ | libc::PROT_WRITE)
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: the range was checked against the reservation and rounded to whole pages by
+        // `page_range`, and the reservation owns every page in it until it is dropped.
+        unsafe { sys::commit(self.base.as_ptr().add(offset), len) }.map_err(|source| {
+            ReservationError::Protect {
+                offset,
+                len,
+                source,
+            }
+        })
     }
 
     /// Give `len` bytes at `offset` back to the operating system without releasing the address
@@ -198,13 +167,10 @@ impl Reservation {
     /// during startup and never gives it back has failed the memory goal whatever its own heap
     /// accounting says.
     ///
-    /// The implementation maps a fresh anonymous range over the old one rather than using
-    /// `madvise`. The `madvise` route is a hint, and on macOS `MADV_FREE` specifically means "you
-    /// may take these pages when you need them", so the old contents can still be there on the
-    /// next read. A collector that recycles a decommitted block would then see a dead object's
-    /// bytes where it expects zeroes, and it would see them only under memory pressure, which is
-    /// the worst possible shape for a bug. Remapping is one syscall and means the same thing on
-    /// every platform we ship on.
+    /// Whatever the backend does, a page committed again after this reads as zero rather than
+    /// giving back what was in it. That is not free on either platform and the note in each backend
+    /// says what it costs, but a collector that recycles a decommitted block must never see a dead
+    /// object's bytes, so it is not negotiable.
     ///
     /// # Errors
     ///
@@ -215,29 +181,15 @@ impl Reservation {
         if len == 0 {
             return Ok(());
         }
-
-        // SAFETY: the range is page aligned and inside a mapping this reservation owns, so
-        // MAP_FIXED here can only replace pages that already belong to us. Replacing them with a
-        // fresh PROT_NONE anonymous mapping drops the physical pages and restores the state a
-        // reservation starts in, which is exactly what decommitting means.
-        let result = unsafe {
-            libc::mmap(
-                self.base.as_ptr().add(offset).cast::<libc::c_void>(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE | libc::MAP_FIXED,
-                -1,
-                0,
-            )
-        };
-        if result == libc::MAP_FAILED {
-            return Err(ReservationError::Protect {
+        // SAFETY: the range was checked against the reservation and rounded to whole pages by
+        // `page_range`, and the reservation owns every page in it until it is dropped.
+        unsafe { sys::decommit(self.base.as_ptr().add(offset), len) }.map_err(|source| {
+            ReservationError::Protect {
                 offset,
                 len,
-                source: io::Error::last_os_error(),
-            });
-        }
-        Ok(())
+                source,
+            }
+        })
     }
 
     /// Round a range out to whole pages and check that it is inside the reservation.
@@ -261,38 +213,14 @@ impl Reservation {
         let end = round_up_to_page(end).min(self.size);
         Ok((start, end - start))
     }
-
-    fn protect(&self, offset: usize, len: usize, flags: i32) -> Result<(), ReservationError> {
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: the range was checked against the reservation and rounded to whole pages by
-        // `page_range`, and the reservation owns every page in it until it is dropped.
-        let result = unsafe {
-            libc::mprotect(
-                self.base.as_ptr().add(offset).cast::<libc::c_void>(),
-                len,
-                flags,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(ReservationError::Protect {
-                offset,
-                len,
-                source: io::Error::last_os_error(),
-            })
-        }
-    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         // SAFETY: this reservation owns exactly this range, nothing hands out pointers into it
-        // that outlive it, and it is unmapped once because a Reservation cannot be duplicated.
+        // that outlive it, and it is released once because a Reservation cannot be duplicated.
         unsafe {
-            libc::munmap(self.base.as_ptr().cast::<libc::c_void>(), self.size);
+            sys::release(self.base, self.size);
         }
     }
 }

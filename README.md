@@ -69,7 +69,7 @@ cargo run -p xtask -- layers
 cargo run -p katsu -- --build-info
 ```
 
-Benchmarks run on the two reference machines named in [`spec/15-benchmarks.md`](spec/15-benchmarks.md) rather than on whatever laptop is nearest, because a timing without a machine attached to it is not a result. `cargo run -p xtask -- machines` lists them and says which ones are reachable, and `cargo run -p xtask -- bench --machine gamingpc -p katsu-vm` runs a crate's benchmarks on the x86-64 reference by checking out the current commit there, which it refuses to do if that commit has not been pushed.
+Benchmarks run on the reference machines named in [`spec/15-benchmarks.md`](spec/15-benchmarks.md) rather than on whatever laptop is nearest, because a timing without a machine attached to it is not a result. `cargo run -p xtask -- machines` lists them and says which ones are reachable, and `cargo run -p xtask -- bench --machine gamingpc -p katsu-vm` runs a crate's benchmarks on the x86-64 reference by checking out the current commit there, which it refuses to do if that commit has not been pushed.
 
 ## The design, in one screen
 
@@ -93,7 +93,7 @@ Benchmarks run on the two reference machines named in [`spec/15-benchmarks.md`](
 
 **Node-API addons yes, raw V8 API addons not before 1.0.**
 
-**Linux and macOS, x86-64 and aarch64, at parity. Windows after 1.0.**
+**Linux, macOS and Windows, x86-64 and aarch64, at parity.** Every platform is tested on every commit and a failure on any of them blocks a merge, because a platform that is only checked before a release is a platform that is broken most of the time.
 
 ## What this is not
 

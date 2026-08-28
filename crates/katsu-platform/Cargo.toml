@@ -13,6 +13,14 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-libc.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
+
+# The virtual memory calls are the only place the operating systems disagree, and they disagree
+# enough that a portability shim over them would be a lie. Each backend gets its own crate and
+# neither is compiled on the other platform. See src/sys/mod.rs.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

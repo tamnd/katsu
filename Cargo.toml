@@ -58,6 +58,13 @@ syn = { version = "3.0.4", features = ["full"] }
 thiserror = "2.0.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Windows only, and pulled in behind a target cfg so that a Linux or macOS build never sees it.
+# The feature list is the smallest one that covers the virtual memory calls in katsu-platform.
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Memory",
+  "Win32_System_SystemInformation",
+] }
 
 # Tooling only, never in the runtime dependency graph.
 criterion = "0.8.2"

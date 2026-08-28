@@ -102,9 +102,11 @@ Stress modes that run in CI on a schedule rather than per commit: collection at 
 
 ## 14.11 The platform matrix
 
-Tier 1, tested on every commit and blocking a release: Linux and macOS on x86-64 and aarch64.
+Tier 1, tested on every commit and blocking a release: Linux and macOS on x86-64 and aarch64, and Windows on x86-64.
 
-Tier 2, tested per release: Windows on x86-64, Linux with musl, FreeBSD.
+Windows is tier 1 rather than tier 2 because the machines we develop and benchmark on include one, and because the cost of keeping it working is a four function seam in `katsu-platform` rather than a portability layer smeared across the runtime. The thing that makes a platform expensive is discovering it is broken six months later, so it is in the test matrix from the beginning. Windows on aarch64 is tier 2 until there is a runner for it.
+
+Tier 2, tested per release: Windows on aarch64, Linux with musl, FreeBSD.
 
 Tier 3, best effort, no promises: everything else, including 32 bit targets where pointer compression is meaningless and the cage has to be disabled.
 
