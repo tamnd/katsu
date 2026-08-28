@@ -68,7 +68,7 @@ This deserves emphasis: **most JIT bugs in production engines are only detectabl
 
 A second differential runs against Node for behavior test262 does not pin, particularly error messages, stack trace shapes, and loop ordering, feeding the divergence list in document 10.7.
 
-### 14.5.1 The harness as built, and what it found on its first run
+### 14.5.1 The harness as built, and what it found
 
 There is one tier, so tier against tier would compare the interpreter with itself and catch nondeterminism and nothing else. Rather than let the harness wait for M6 to have a second thing to compare against, the second differential above was built first: katsu against node, on generated programs. That is a strictly harder question than tier against tier, it is the question the compatibility goal is actually about, and the machinery is the same machinery. When the tiers arrive they become two more oracles behind the same trait and the generator, the shrinker and the report do not change.
 
@@ -84,7 +84,9 @@ The first run against node found three real bugs in a thousand programs, none of
 
 The third was a code generation bug. Lowering documents a rule that a destination register is never passed down to an operand, because an operand is evaluated before its siblings and writing the destination early clobbers a variable a later operand still reads. The short circuiting operators broke that rule: `v = 1.5 && ('x' + v)` built the left side in `v`'s own slot and then read the new value back, answering `x1.5` where node says `x3`. The compound assignment form of the same operator had a comment saying the result has to end up in a register that is nobody's variable, and was correct. This was the same problem one match arm over, and it is a good example of the class: a bug that no amount of reading finds and that a hand written test only finds if somebody already suspects it.
 
-With those fixed, two thousand generated programs plus the corpus agree with node on every one. CI runs two thousand at a fixed seed on every commit, which is a reproduction rather than a flake, and finding new things is what longer runs on the reference machines are for.
+A longer run of twenty thousand programs then found a fourth, and it is the one that says most about why this is worth running. `9007199254740993 / 10` printed `900719925474099.3` where node prints `900719925474099.2`. Both engines had the length right and the digits right up to the last one. The double is exactly `900719925474099.25`, so the two sixteen digit candidates either side of it are exactly the same distance away, and the standard's step five says that when that happens you take the even one. Rust's shortest formatting takes the larger one. This class of value is about five percent of the doubles a sweep runs into, it is invisible to every test written by hand because writing one means already knowing the rule, and no amount of reading the code finds it because the code was correct about everything it knew it had to be correct about. The fix keeps taking the digits from Rust and corrects the last one, with the tie confirmed by writing the value out exactly, since a double needs at most seven hundred and sixty seven significant digits and that is a bound rather than an estimate.
+
+With those fixed, the generated programs and the corpus agree with node on every one. CI runs two thousand at a fixed seed on every commit, which is a reproduction rather than a flake, and finding new things is what longer runs on the reference machines are for.
 
 ## 14.6 Fuzzing
 

@@ -14,3 +14,12 @@ console.log(5e-324);
 console.log(1.7976931348623157e308);
 console.log(9007199254740993);
 console.log(100 / 3);
+// Ties, where two shortest forms are the same length and the same distance from the value, and the
+// standard says to print the even one. Rust prints the larger one, so each of these was wrong here
+// until the harness found the first of them.
+console.log(9007199254740993 / 10);
+console.log(243635934593564.63);
+console.log(769173474699971.3);
+console.log(2231345704263678.3);
+console.log(1886581632185860.8);
+console.log(-1113339353519017.3);

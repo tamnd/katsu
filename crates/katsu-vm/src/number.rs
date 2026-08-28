@@ -116,17 +116,18 @@ const NEGATIVE_EXPONENT_LIMIT: i32 = -6;
 
 /// The ECMAScript `Number::toString` operation in base ten.
 ///
-/// Rust and JavaScript agree on which digits to print and disagree on where to put them. Both pick
-/// the shortest decimal that reads back as the same double, which is the hard half and the half we
-/// do not have to write. What differs is the formatting rule around those digits: Rust's `Display`
-/// never uses exponential notation, so it prints `1e21` as a one followed by twenty one zeros, and
-/// it prints `1e-7` as `0.0000001`. JavaScript switches to exponential form outside a window that
-/// runs from `1e-7` up to `1e21`, and the boundaries are literals in the standard rather than
-/// anything derivable.
+/// Rust and JavaScript agree on how many digits to print and disagree on where to put them, and in
+/// one case on what the last digit is. Both pick the shortest decimal that reads back as the same
+/// double, which is the hard half and the half we do not have to write. What differs is the
+/// formatting rule around those digits: Rust's `Display` never uses exponential notation, so it
+/// prints `1e21` as a one followed by twenty one zeros, and it prints `1e-7` as `0.0000001`.
+/// JavaScript switches to exponential form outside a window that runs from `1e-7` up to `1e21`, and
+/// the boundaries are literals in the standard rather than anything derivable.
 ///
 /// So the digits come from Rust and the placement comes from here. `{:e}` gives the shortest digits
 /// and the decimal exponent already separated, which is exactly the `s` and the `n` the standard's
-/// step five asks for, and everything after that is the standard's own case analysis.
+/// step five asks for, and everything after that is the standard's own case analysis. The one place
+/// the digits themselves need a correction is the tie in that step, which `even_on_a_tie` handles.
 pub(crate) fn to_string(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();
@@ -150,6 +151,7 @@ pub(crate) fn to_string(value: f64) -> String {
         .expect("`{:e}` always writes an exponent");
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
     let exponent: i32 = exponent.parse().expect("`{:e}` always writes an integer");
+    let digits = even_on_a_tie(value, digits, exponent);
 
     // The standard's names. `k` is how many significant digits there are and `n` is where the
     // decimal point goes relative to the front of them, so the value is `0.digits` times `10^n`.
@@ -180,6 +182,85 @@ pub(crate) fn to_string(value: f64) -> String {
         return format!("{digits}e{sign}{magnitude}");
     }
     format!("{}.{}e{sign}{magnitude}", &digits[..1], &digits[1..])
+}
+
+/// How many significant decimal digits it takes to write any double exactly.
+///
+/// Not an estimate. A double is a whole number times a power of two, so its decimal expansion always
+/// terminates, and the longest one belongs to a subnormal near `1.112536929253602e-308`, which needs
+/// exactly this many. Asking for more only appends zeros and asking for fewer would round, which is
+/// the one thing the check below cannot afford.
+const EXACT_DIGITS: usize = 767;
+
+/// The standard's tie break in step five, which Rust does the other way.
+///
+/// Both the standard and Rust ask for the shortest digit string that reads back as the same double,
+/// and both then ask for the one closest to the value it came from. Sometimes two strings of that
+/// length are exactly the same distance away, and there the two rules part company: the standard
+/// says to take the even one and Rust takes the larger one. `9007199254740993 / 10` is the case the
+/// differential harness found. The double is exactly `900719925474099.25`, so `...99.2` and `...99.3`
+/// are both sixteen digits and both exactly a twentieth away, Rust prints the `3` and Node prints the
+/// `2`, and the standard is on Node's side.
+///
+/// The correction is only ever downward by one in the last digit, because Rust always takes the
+/// larger of the two and the two differ by exactly that. So there is nothing to do when the last
+/// digit is already even, which is half of all numbers and the reason the expensive check below
+/// almost never runs.
+fn even_on_a_tie(value: f64, digits: String, exponent: i32) -> String {
+    let last = *digits.as_bytes().last().expect("`{:e}` writes a digit");
+    if last.is_multiple_of(2) {
+        return digits;
+    }
+
+    // The other candidate, which is this one with the last digit down by one. No borrow is possible
+    // because an odd digit is at least one, and the string cannot lose a digit that way, which would
+    // have meant a shorter representation existed and Rust would have printed that instead.
+    let mut lower = digits.clone().into_bytes();
+    let last_index = lower.len() - 1;
+    lower[last_index] -= 1;
+    let lower = String::from_utf8(lower).expect("digits are ascii");
+
+    // The cheap filter, and also a correctness condition rather than only a filter. If the lower
+    // candidate does not read back as the same double then it is not a candidate at all, and at the
+    // very edge of the rounding interval that really happens, because reading a decimal back has a
+    // tie break of its own and it can send the lower one to the neighbouring double.
+    if !reads_back_as(&lower, exponent, value) {
+        return digits;
+    }
+    if !is_exactly_between(value, digits.len()) {
+        return digits;
+    }
+    lower
+}
+
+/// Whether a digit string with an exponent parses back to exactly this double.
+fn reads_back_as(digits: &str, exponent: i32, value: f64) -> bool {
+    let (head, tail) = digits.split_at(1);
+    let text = if tail.is_empty() {
+        format!("{head}e{exponent}")
+    } else {
+        format!("{head}.{tail}e{exponent}")
+    };
+    text.parse::<f64>().is_ok_and(|parsed| parsed == value)
+}
+
+/// Whether the value sits exactly halfway between the two candidates of length `k`.
+///
+/// Halfway means its own exact expansion is those `k` digits followed by a five and then nothing,
+/// so the test is to write the value out exactly and look. This is the slow path in the file, a
+/// several hundred digit conversion, and it is reached only when the shortest form ends in an odd
+/// digit and the candidate below it also reads back, which is rare enough that the cost never shows
+/// up in a program. It is written this way rather than as exact integer arithmetic because the
+/// arithmetic needs numbers wider than a `u128` and this needs nothing at all.
+fn is_exactly_between(value: f64, k: usize) -> bool {
+    let exact = format!("{value:.*e}", EXACT_DIGITS - 1);
+    let mantissa = exact
+        .split_once('e')
+        .expect("`{:e}` always writes an exponent")
+        .0;
+    let digits: Vec<u8> = mantissa.bytes().filter(|byte| *byte != b'.').collect();
+    // A shortest form is at most seventeen digits, so there is always a digit at `k` to look at.
+    digits[k] == b'5' && digits[k + 1..].iter().all(|byte| *byte == b'0')
 }
 
 /// The ECMAScript `StringToNumber` abstract operation.
@@ -404,6 +485,56 @@ mod tests {
             (1e300, "1e+300"),
             (1.234_567_890_123_456_8e21, "1.2345678901234568e+21"),
             (1.234_567_890_123_456_8e20, "123456789012345680000"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(to_string(value), expected, "{value:?}");
+        }
+    }
+
+    /// The bug the differential harness found on its twenty thousand program run, and the family it
+    /// belongs to. Every expected string came from `String(x)` under Node 26.7.0.
+    #[test]
+    #[expect(
+        clippy::excessive_precision,
+        reason = "the lint compares a literal against the way Rust prints the double it parses to, \
+                  and printing that double the way Rust does is the bug this test is about, so its \
+                  suggestion would replace every value below with the wrong one of the two spellings"
+    )]
+    fn a_tie_between_two_shortest_forms_goes_to_the_even_one() {
+        let cases = [
+            // The one the harness printed, which came out of `9007199254740993 / "10"`. The double
+            // is exactly `900719925474099.25`, so both neighbours are sixteen digits and equally
+            // far away, and Rust picks the larger while the standard picks the even one.
+            (900_719_925_474_099.25, "900719925474099.2"),
+            (243_635_934_593_564.63, "243635934593564.62"),
+            (769_173_474_699_971.3, "769173474699971.2"),
+            (2_231_345_704_263_678.3, "2231345704263678.2"),
+            (1_113_339_353_519_017.3, "1113339353519017.2"),
+            (1_698_740_550_241_089.3, "1698740550241089.2"),
+            // Ties where the larger candidate is already the even one, so nothing is corrected and
+            // Rust and the standard agree. These are here because a correction applied in both
+            // directions would break them and nothing else would notice.
+            (1_886_581_632_185_860.8, "1886581632185860.8"),
+            (1_257_207_345_813_426.8, "1257207345813426.8"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(to_string(value), expected, "{value:?}");
+            assert_eq!(to_string(-value), format!("-{expected}"), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn an_odd_last_digit_that_is_not_a_tie_is_left_alone() {
+        // The guard the exact check is there for. Each of these ends in an odd digit and is the
+        // only shortest form there is, so lowering the last digit would print a different number.
+        let cases = [
+            (0.3, "0.3"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (123.457, "123.457"),
+            (9_007_199_254_740_993.0, "9007199254740992"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (5e-324, "5e-324"),
         ];
         for (value, expected) in cases {
             assert_eq!(to_string(value), expected, "{value:?}");
