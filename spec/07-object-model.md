@@ -16,6 +16,52 @@ The reason not to compress registers is that a compressed double has to be boxed
 
 The consequence is that loading a value from a slot into a register is a decompress (add the cage base, or a shift plus add for a Smi) and storing is a compress with a check. Those are one or two instructions, they are what every V8 property access already pays, and they are the price of the memory goal.
 
+### 7.1.1 The 64 bit register encoding, decided
+
+This is the concrete scheme, implemented in `crates/katsu-vm/src/value.rs`. It is JavaScriptCore's, and the interesting part is why it is not the scheme everybody reaches for first.
+
+The obvious NaN boxing scheme says that a double is anything that is not a NaN, and that every quiet NaN bit pattern is therefore free to carry a payload. That is wrong on the hardware we ship on. x86 SSE produces `0xFFF8_0000_0000_0000` as the result of an invalid operation, which is a *negative* quiet NaN, so the sign bit cannot be used to separate payloads from arithmetic results and the free space is not where the scheme assumes it is. Engines that started with the naive layout ended up carving exceptions into it. Offsetting the doubles avoids the question rather than answering it.
+
+The encoding, on 64 bit platforms:
+
+| Range | Meaning |
+|---|---|
+| `0x0000_0000_0000_0000` | empty, meaning no value at all, distinct from `undefined` |
+| `0x0000_0000_0000_0002` | `null` |
+| `0x0000_0000_0000_0006` | `false` |
+| `0x0000_0000_0000_0007` | `true` |
+| `0x0000_0000_0000_000A` | `undefined` |
+| `0x0000_0000_0000_0000 ..= 0x0000_FFFF_FFFF_FFFF` | pointer, otherwise |
+| `0x0002_0000_0000_0000 ..= 0xFFF2_0000_0000_0000` | double, with `2^49` added |
+| `0xFFFE_0000_0000_0000 ..= 0xFFFE_FFFF_FFFF_FFFF` | 32 bit integer in the low half |
+
+A double is encoded by adding `2^49` to its bit pattern and decoded by subtracting it. Every finite double, every infinity, and the one canonical NaN lands in a band that sits above every representable pointer and below the integer tag, so the three cases are separated by a single unsigned comparison each and no case needs a mask.
+
+Two details that are load bearing. NaN is canonicalised to `0x7FF8_0000_0000_0000` before the offset is added, because without that the largest NaN bit pattern wraps past the integer tag and becomes an integer. JavaScript has exactly one observable NaN, so nothing is lost. And the immediates are laid out so the common predicates are one mask and one compare: `null` is `0b0010` and `undefined` is `0b1010`, differing in one bit, so the nullish test that `??` and `?.` need is a mask and a compare rather than two compares. `false` is `0b0110` and `true` is `0b0111` on the same principle, with the value itself in the low bit.
+
+Integers get the top of the range rather than the bottom because a negative integer sign extends, and putting the tag above the sign extension is what lets the payload be read with a truncation instead of a mask and a shift.
+
+`from_f64` chooses the integer form when the double is exactly an integer in range, which is what a bytecode does when it does not yet know the shape of a number. It deliberately keeps negative zero as a double, because `Object.is(-0, 0)` is false and collapsing it to the integer zero would be an observable bug.
+
+The pointer range asserts rather than masks. Current 64 bit platforms give userspace 48 bits of address and the cage in 7.2 is a 4 GB reservation well inside that, so a real heap pointer always fits. If a future platform hands out wider addresses we want a panic on the first allocation, not silently truncated pointers.
+
+Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. They run on both reference machines from document 15.5, because an encoding whose whole justification is an x86 hardware quirk should not be measured only on ARM. Nanoseconds per value, over batches of 1024:
+
+| Benchmark | Apple M4 | Core i9-13900K |
+|---|---|---|
+| encode `i32` | 0.26 | 0.28 |
+| encode double | 0.27 | 0.38 |
+| encode `f64` with the integer check | 0.52 | 0.94 |
+| decode, numeric dispatch over a mixed batch | 0.46 | 0.27 |
+| decode, `to_boolean` over a mixed batch | 0.55 | 1.01 |
+| decode, the `is_i32` predicate | 0.06 | 0.17 |
+| round trip, `i32` | 0.05 | 0.10 |
+| round trip, double | 0.56 | 0.45 |
+
+The number to take from this is not the speed, it is the shape. Everything here is well under a cycle per value on both machines, which means the compiler is vectorising the encode and decode work, which means the tagging did not introduce a serial dependency or a branch the predictor has to guess at. The day one of these rows becomes a whole cycle per value is the day something in the encoding started costing what it is not supposed to cost.
+
+The two machines disagree in both directions and that is worth keeping rather than smoothing over. x86 is ahead on numeric dispatch and on the double round trip, ARM is ahead on the predicates and the integer round trip. Neither difference is about the encoding, both are about how the two vector units handle a 64 bit compare and select, and a benchmark that reported only the machine that flattered us would have hidden that.
+
 ## 7.2 The cage
 
 All of the JavaScript heap lives in one reserved region of virtual address space per isolate, aligned so that the base can be held in a pinned register and the compression is a masked add.

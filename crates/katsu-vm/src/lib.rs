@@ -4,9 +4,13 @@
 //! See `spec/05-interpreter.md` for dispatch, `spec/07-object-model.md` for values and
 //! shapes, and `spec/03-architecture.md` for why an isolate is `Send` but not `Sync`.
 
+mod value;
+
 use std::fmt;
 
 use katsu_ir::FunctionBlueprint;
+
+pub use value::Value;
 
 /// Why a source file could not be turned into something executable.
 #[derive(Debug, thiserror::Error)]
@@ -28,49 +32,6 @@ pub enum CompileError {
 pub fn compile(path: &str, source: &str) -> Result<FunctionBlueprint, CompileError> {
     let module = katsu_parse::parse(path, source)?;
     Ok(module.top_level)
-}
-
-/// A JavaScript value as the interpreter and the JIT hold it in a register.
-///
-/// Registers hold 64 bits. Object slots on the heap hold 32, because pointer compression
-/// is a day one decision and not an optimization to add later. The two representations
-/// are deliberately different types so that the compiler catches a confusion between them.
-/// See `spec/07-object-model.md`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Value {
-    /// `undefined`.
-    Undefined,
-    /// `null`.
-    Null,
-    /// A boolean.
-    Bool(bool),
-    /// A number. Integers are held as doubles until the object model lands, at which point
-    /// the small integer representation from `spec/07-object-model.md` takes over.
-    Number(f64),
-}
-
-impl Value {
-    /// The ECMAScript `ToBoolean` abstract operation, for the cases we can already do.
-    #[must_use]
-    pub fn to_boolean(self) -> bool {
-        match self {
-            Value::Undefined | Value::Null => false,
-            Value::Bool(b) => b,
-            Value::Number(n) => n != 0.0 && !n.is_nan(),
-        }
-    }
-
-    /// The `typeof` operator.
-    #[must_use]
-    pub const fn type_of(self) -> &'static str {
-        match self {
-            Value::Undefined => "undefined",
-            // typeof null is "object". It is a bug from 1995 and it is in the standard.
-            Value::Null => "object",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-        }
-    }
 }
 
 /// One independent JavaScript heap with its own object graph.
@@ -113,23 +74,7 @@ impl Default for Isolate {
 
 #[cfg(test)]
 mod tests {
-    use super::{Isolate, Value};
-
-    #[test]
-    fn to_boolean_follows_the_specification_including_the_awkward_parts() {
-        assert!(!Value::Undefined.to_boolean());
-        assert!(!Value::Null.to_boolean());
-        assert!(!Value::Number(0.0).to_boolean());
-        assert!(!Value::Number(f64::NAN).to_boolean());
-        assert!(Value::Number(-1.0).to_boolean());
-        assert!(Value::Bool(true).to_boolean());
-    }
-
-    #[test]
-    fn typeof_null_is_object_because_the_standard_says_so() {
-        assert_eq!(Value::Null.type_of(), "object");
-        assert_eq!(Value::Undefined.type_of(), "undefined");
-    }
+    use super::Isolate;
 
     #[test]
     fn an_isolate_can_be_moved_to_another_thread() {
