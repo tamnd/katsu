@@ -787,8 +787,7 @@ impl Interpreter {
                 Op::GetProp { dst, obj, key, .. } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let value =
-                        self.property(object, name, &Self::constant_name(blueprint, key))?;
+                    let value = self.property(object, name, blueprint, key)?;
                     self.stack.set(dst, value);
                 }
 
@@ -832,8 +831,7 @@ impl Interpreter {
                 } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let target =
-                        self.property(object, name, &Self::constant_name(blueprint, key))?;
+                    let target = self.property(object, name, blueprint, key)?;
                     let Some(closure) = self.as_closure(target) else {
                         if let Some(native) = self.as_native(target) {
                             let value = self.call_native(native, args, argc)?;
@@ -1083,12 +1081,20 @@ impl Interpreter {
     /// and prototypes are M1. `undefined` and `null` are the exception, and they throw, because those
     /// two have no prototype to reach for in any milestone and Node's message for it is the single
     /// most read error message in JavaScript.
-    fn property(&self, object: Value, name: StringRef, key: &str) -> Result<Value, RuntimeError> {
+    /// The name is the interned one and the index is only for the message, which is why the message
+    /// is built in a function of its own that a successful read never calls. Reading the constant
+    /// back out of the pool allocates a `String`, and doing that on the way through every property
+    /// read that worked cost more than the lookup itself did.
+    #[inline]
+    fn property(
+        &self,
+        object: Value,
+        name: StringRef,
+        blueprint: &FunctionBlueprint,
+        key: katsu_ir::ConstIndex,
+    ) -> Result<Value, RuntimeError> {
         if object.is_undefined() || object.is_null() {
-            let what = Self::primitive_text(object);
-            return Err(RuntimeError::Type(format!(
-                "Cannot read properties of {what} (reading '{key}')"
-            )));
+            return Err(Self::nothing_to_read(object, blueprint, key));
         }
         let Some(record) = self.as_record(object) else {
             return Ok(Value::UNDEFINED);
@@ -1096,6 +1102,24 @@ impl Interpreter {
         Ok(record
             .get(self.isolate.cage(), name)
             .map_or(Value::UNDEFINED, Value::from_bits))
+    }
+
+    /// What reading a property of `undefined` or `null` says, which is what Node says word for word.
+    ///
+    /// Out of line and cold, so that the formatting and the allocation it costs are not code sitting
+    /// in the middle of an opcode that almost always succeeds.
+    #[cold]
+    #[inline(never)]
+    fn nothing_to_read(
+        object: Value,
+        blueprint: &FunctionBlueprint,
+        key: katsu_ir::ConstIndex,
+    ) -> RuntimeError {
+        let what = Self::primitive_text(object);
+        let key = Self::constant_name(blueprint, key);
+        RuntimeError::Type(format!(
+            "Cannot read properties of {what} (reading '{key}')"
+        ))
     }
 
     /// The text `console.log` prints for an object.
