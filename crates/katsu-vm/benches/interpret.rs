@@ -26,10 +26,17 @@
 //! `pow_chain` is there because exponentiation is the one arithmetic opcode that calls a libm
 //! function rather than compiling to an instruction, and it is worth knowing how far outside the
 //! others it sits.
+//!
+//! The `strings` group measures the same two opcodes with strings in the registers instead of
+//! numbers, because `Add` and `Less` are now two opcodes each. `concat_chain` allocates and
+//! `string_compare_chain` does not, which is the whole difference between them and the reason they
+//! are measured apart. Both of them exist mostly to be read next to `add_chain` and `compare_chain`,
+//! since the question a reader has is not what a concatenation costs in isolation but how much the
+//! string case costs over the number case that was there before it.
 
 use std::hint::black_box;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use katsu_ir::{CacheIndex, CodeOffset, ConstantPool, FunctionBlueprint, Op, Register};
 use katsu_vm::Interpreter;
 
@@ -48,11 +55,16 @@ const IC: CacheIndex = CacheIndex(0);
 /// Wrap a body in a blueprint and check it before handing it to the interpreter, so a mistake in a
 /// benchmark fails as a bad blueprint rather than as a surprising number.
 fn blueprint(code: Vec<Op>) -> FunctionBlueprint {
+    blueprint_with(code, ConstantPool::default())
+}
+
+/// The same, for the bodies that need something in the constant pool to load.
+fn blueprint_with(code: Vec<Op>, constants: ConstantPool) -> FunctionBlueprint {
     let out = FunctionBlueprint {
         frame_size: 8,
         cache_slots: 1,
         code,
-        constants: ConstantPool::default(),
+        constants,
         ..FunctionBlueprint::default()
     };
     out.verify().expect("the benchmark assembled bad bytecode");
@@ -183,5 +195,73 @@ fn loops(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, straight_line, loops);
+/// How many string instructions one measured run performs.
+///
+/// Shorter than `CHAIN` because a concatenation allocates and nothing collects yet, so the length of
+/// this chain is how much heap one measured run consumes. At two hundred it is a few kilobytes,
+/// which a fresh isolate has room for many times over, and it is still long enough that the frame
+/// push either side of it does not show up in the per instruction number.
+const STRING_CHAIN: usize = 200;
+
+/// A chain of one string opcode, with two string constants loaded into registers zero and one.
+fn string_chain(build: impl Fn() -> Op) -> FunctionBlueprint {
+    let mut constants = ConstantPool::default();
+    // Two short Latin-1 strings that differ in their first code unit, so the comparison decides on
+    // the first byte it reads and measures the call rather than the length of the string.
+    let left = constants.string("katsu ");
+    let right = constants.string("runtime");
+
+    let mut code = vec![
+        Op::LoadConst {
+            dst: Register(0),
+            src: left,
+        },
+        Op::LoadConst {
+            dst: Register(1),
+            src: right,
+        },
+    ];
+    code.extend((0..STRING_CHAIN).map(|_| build()));
+    code.push(Op::Return { src: Register(2) });
+    blueprint_with(code, constants)
+}
+
+fn strings(c: &mut Criterion) {
+    let mut group = c.benchmark_group("strings");
+    group.throughput(Throughput::Elements(STRING_CHAIN as u64));
+
+    let concats = string_chain(|| Op::Add {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+        cache: IC,
+    });
+    group.bench_function("concat_chain", |b| {
+        // A fresh isolate per iteration, because every concatenation allocates and there is no
+        // collector to take it back yet. The setup and the drop are outside the timing, so what is
+        // measured is still only the run. This is the one benchmark in the workspace whose shape is
+        // dictated by a milestone that has not landed, and it goes back to a plain `iter` once M4
+        // gives the heap a way to reclaim.
+        b.iter_batched(
+            || Interpreter::new().expect("should reserve a stack"),
+            |mut interpreter| black_box(interpreter.run(black_box(&concats))),
+            BatchSize::PerIteration,
+        );
+    });
+
+    let compares = string_chain(|| Op::Less {
+        dst: Register(2),
+        lhs: Register(0),
+        rhs: Register(1),
+        cache: IC,
+    });
+    group.bench_function("string_compare_chain", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&compares))));
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, straight_line, loops, strings);
 criterion_main!(benches);

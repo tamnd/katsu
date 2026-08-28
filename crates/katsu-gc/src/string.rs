@@ -20,6 +20,7 @@
 //! than by a later optimisation pass.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::fmt;
 use std::slice;
 
@@ -485,6 +486,47 @@ impl StringRef {
         }
     }
 
+    /// Order two strings the way `<` orders them in JavaScript.
+    ///
+    /// Code unit order, which is not the same as code point order and is not any human language's
+    /// idea of alphabetical. A character outside the basic multilingual plane is stored as a
+    /// surrogate pair in the D800 to DFFF range, which sorts below characters in E000 to FFFF that
+    /// have smaller code points, so a supplementary character sorts before a private use one. That
+    /// is what the standard specifies and it is what every engine does, and the sorting anybody
+    /// actually wants is `localeCompare` and the collator in document 12.
+    ///
+    /// Comparing a Latin-1 string against a UTF-16 one goes code unit by code unit rather than by
+    /// byte, because a Latin-1 byte widens to the code unit with the same value and a byte
+    /// comparison would be reading two different things.
+    #[must_use]
+    pub fn compare(self, cage: &Cage, other: StringRef) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
+        match (self.latin1_bytes(cage), other.latin1_bytes(cage)) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(left), None) => {
+                let right = other.utf16_units(cage).unwrap_or(&[]);
+                compare_units(
+                    left.iter().map(|&byte| u16::from(byte)),
+                    right.iter().copied(),
+                )
+            }
+            (None, Some(right)) => {
+                let left = self.utf16_units(cage).unwrap_or(&[]);
+                compare_units(
+                    left.iter().copied(),
+                    right.iter().map(|&byte| u16::from(byte)),
+                )
+            }
+            (None, None) => {
+                let left = self.utf16_units(cage).unwrap_or(&[]);
+                let right = other.utf16_units(cage).unwrap_or(&[]);
+                left.cmp(right)
+            }
+        }
+    }
+
     /// Whether the string holds the same characters as some Rust text.
     ///
     /// Used by the atom table to answer a lookup without allocating a candidate string first.
@@ -654,6 +696,13 @@ fn hash_code_units(units: impl Iterator<Item = u16>) -> u32 {
 #[must_use]
 pub fn hash_str(text: &str) -> u32 {
     hash_code_units(text.encode_utf16())
+}
+
+/// Lexicographic order over two code unit sequences, for the mixed representation case.
+///
+/// The shorter string wins a tie, which is why `"ab" < "abc"`.
+fn compare_units(left: impl Iterator<Item = u16>, right: impl Iterator<Item = u16>) -> Ordering {
+    left.cmp(right)
 }
 
 #[cfg(test)]
@@ -862,5 +911,32 @@ mod tests {
             heap.cursor() > before,
             "the empty string is still an object"
         );
+    }
+
+    #[test]
+    fn strings_order_by_code_unit_and_not_by_anything_a_human_would_call_alphabetical() {
+        use std::cmp::Ordering;
+
+        let mut heap = BumpHeap::new().unwrap();
+        let a = StringRef::from_str(&mut heap, "a").unwrap();
+        let b = StringRef::from_str(&mut heap, "b").unwrap();
+        let ab = StringRef::from_str(&mut heap, "ab").unwrap();
+        let abc = StringRef::from_str(&mut heap, "abc").unwrap();
+        let big_a = StringRef::from_str(&mut heap, "A").unwrap();
+        // Latin-1 on one side and UTF-16 on the other, which is the case a byte comparison gets
+        // wrong because it would be comparing bytes against half of a code unit.
+        let wide = StringRef::from_str(&mut heap, "\u{4e00}").unwrap();
+        let cage = heap.cage();
+
+        assert_eq!(a.compare(cage, b), Ordering::Less);
+        assert_eq!(b.compare(cage, a), Ordering::Greater);
+        assert_eq!(a.compare(cage, a), Ordering::Equal);
+        // A prefix sorts before what it is a prefix of.
+        assert_eq!(ab.compare(cage, abc), Ordering::Less);
+        // Uppercase sorts before lowercase, because `A` is 0x41 and `a` is 0x61.
+        assert_eq!(big_a.compare(cage, a), Ordering::Less);
+        assert!(!wide.is_latin1(cage));
+        assert_eq!(a.compare(cage, wide), Ordering::Less);
+        assert_eq!(wide.compare(cage, a), Ordering::Greater);
     }
 }
