@@ -117,7 +117,10 @@ fn run(command: Command) -> anyhow::Result<()> {
             let path = script.display().to_string();
             let source = std::fs::read_to_string(&script)
                 .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
-            let mut runtime = katsu_runtime::Runtime::new();
+            let mut runtime = katsu_runtime::Runtime::new()?;
+            // The value the top level produces is dropped, because running a file is not the same
+            // as evaluating an expression and Node does not print it either. A program says what it
+            // has to say through what it prints.
             runtime.eval(&path, &source)?;
             Ok(())
         }
