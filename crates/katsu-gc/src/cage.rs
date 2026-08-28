@@ -109,24 +109,32 @@ impl Cage {
         self.base
     }
 
-    /// Make the first `bytes` of the cage readable and writable.
+    /// Make the cage readable and writable from `from` up to `to`.
     ///
     /// Rounded out to whole pages by the reservation. Committing from the bottom rather than in
     /// arbitrary places keeps the committed set one contiguous range, which is what makes the
     /// number reported to the memory budget a single subtraction.
     ///
+    /// The caller passes the range it is adding rather than the new high water mark, so that a
+    /// heap growing one chunk at a time asks for one chunk each time. Asking for the whole
+    /// committed region on every growth is quadratic, and it is quadratic on every platform. Linux
+    /// hides it, because `mprotect` over a range that already has the permissions it is being given
+    /// is close to free, and Windows does not, because `VirtualAlloc` with `MEM_COMMIT` walks every
+    /// page in the range whether or not it is already committed. The Windows number is the honest
+    /// one and it is what turned this up.
+    ///
     /// # Errors
     ///
     /// Returns [`CageError::Reserve`] if the range leaves the cage or the kernel refuses.
-    pub fn commit_to(&self, bytes: usize) -> Result<(), CageError> {
-        if bytes > CAGE_SIZE {
+    pub fn commit_range(&self, from: usize, to: usize) -> Result<(), CageError> {
+        if to > CAGE_SIZE || from > to {
             return Err(CageError::Reserve(ReservationError::OutOfBounds {
-                offset: 0,
-                len: bytes,
+                offset: from,
+                len: to.saturating_sub(from),
                 size: CAGE_SIZE,
             }));
         }
-        self.reservation.commit(0, bytes)?;
+        self.reservation.commit(from, to - from)?;
         Ok(())
     }
 
@@ -352,14 +360,59 @@ mod tests {
         // Committing has to stay inside the cage. If this ever succeeded, the guard would be
         // writable memory rather than a trap, and an out of bounds typed array index would read
         // real data instead of faulting.
-        assert!(cage.commit_to(CAGE_SIZE + 1).is_err());
-        assert!(cage.commit_to(CAGE_SIZE + GUARD_SIZE).is_err());
+        assert!(cage.commit_range(0, CAGE_SIZE + 1).is_err());
+        assert!(cage.commit_range(0, CAGE_SIZE + GUARD_SIZE).is_err());
+    }
+
+    #[test]
+    fn a_commit_range_that_runs_backwards_is_refused() {
+        let cage = Cage::new().unwrap();
+        // A caller that subtracts in the wrong order gets an error rather than a range that
+        // wraps and commits most of the address space, which is the failure this guards.
+        assert!(cage.commit_range(64 * 1024, 0).is_err());
+        assert!(cage.commit_range(128 * 1024, 64 * 1024).is_err());
+        // An empty range at a legal place is not an error, because a heap that has grown to
+        // exactly a chunk boundary asks for nothing and should not have to check first.
+        assert!(cage.commit_range(64 * 1024, 64 * 1024).is_ok());
+    }
+
+    #[test]
+    fn growing_a_chunk_at_a_time_only_commits_the_new_chunk() {
+        let cage = Cage::new().unwrap();
+        // Each call adds one chunk rather than recommitting everything below it. What is being
+        // checked is that the earlier chunks stay committed and keep their contents, because a
+        // range based commit that got its arithmetic wrong would either fault here or zero what
+        // was already written.
+        for chunk in 0..8 {
+            let from = chunk * 64 * 1024;
+            let to = from + 64 * 1024;
+            cage.commit_range(from, to).unwrap();
+
+            // SAFETY: everything up to `to` has been committed by this loop, and this test owns
+            // the cage, so nothing else holds a pointer into it.
+            unsafe {
+                let byte = cage.base().add(from);
+                assert_eq!(byte.read(), 0, "a freshly committed page must read as zero");
+                byte.write(0xC5);
+            }
+        }
+
+        // SAFETY: as above, and every offset touched here was committed and written in the loop.
+        unsafe {
+            for chunk in 0..8 {
+                assert_eq!(
+                    cage.base().add(chunk * 64 * 1024).read(),
+                    0xC5,
+                    "committing a later chunk must not disturb an earlier one"
+                );
+            }
+        }
     }
 
     #[test]
     fn committing_makes_the_bottom_of_the_cage_usable() {
         let cage = Cage::new().unwrap();
-        cage.commit_to(64 * 1024).unwrap();
+        cage.commit_range(0, 64 * 1024).unwrap();
 
         // SAFETY: the first 64 KiB were just committed, so they are mapped readable and writable,
         // and this test owns the cage.

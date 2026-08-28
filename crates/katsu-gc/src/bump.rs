@@ -256,7 +256,7 @@ impl BumpHeap {
 
         if end > self.committed {
             let target = end.next_multiple_of(COMMIT_CHUNK).min(CAGE_SIZE);
-            self.cage.commit_to(target).ok()?;
+            self.cage.commit_range(self.committed, target).ok()?;
             self.census.commit_count += 1;
             self.committed = target;
             self.census.committed_bytes = target;
@@ -299,7 +299,7 @@ impl BumpHeap {
         if target <= self.committed {
             return Ok(());
         }
-        self.cage.commit_to(target)?;
+        self.cage.commit_range(self.committed, target)?;
         self.census.commit_count += 1;
         self.committed = target;
         self.census.committed_bytes = target;
