@@ -4,7 +4,7 @@
 //! their `Cargo.toml`. Its surface is pinned by every binary ever built with `katsu build`,
 //! which is why it is a thin re-export layer rather than a place where logic lives.
 
-pub use katsu_api::{Error, Isolate, Runtime, Value, jit_enabled};
+pub use katsu_api::{Discard, Error, Interrupt, Isolate, Runtime, Value, jit_enabled};
 pub use katsu_macros::export;
 
 #[cfg(feature = "node")]

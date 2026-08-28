@@ -2,7 +2,7 @@
 
 A JavaScript and TypeScript runtime written in Rust. Its own JIT, built from scratch, no V8 and no JavaScriptCore. An ahead of time mode that compiles your program into a Rust binary. Enough Node.js compatibility that unmodified npm packages run. Two way interop with Rust that is pleasant from both sides.
 
-**Status: pre M0.** Nothing executes yet. The workspace, the layer stack and the tooling are real, the engine is not. If you want to know what the finished thing is supposed to be and why, read [`spec/`](spec/). If you want to know what is actually built, read the [milestones](https://github.com/tamnd/katsu/milestones).
+**Status: M0, most of the way through.** `katsu run` executes a program and `console.log` prints, which is the smallest thing a runtime can do that is worth measuring, and the conformance runner reports 6.65% of test262. That number is 5,405 cases of the 81,225 it attempted, and it is small for one specific reason worth knowing before you read anything into it: 75,804 of the cases it could not run stop at the same `switch` statement in the suite's own harness, so most of the suite is not being attempted rather than being failed. There are no objects, no functions, no modules and no event loop yet. If you want to know what the finished thing is supposed to be and why, read [`spec/`](spec/). If you want to know what is actually built, read the [milestones](https://github.com/tamnd/katsu/milestones).
 
 ## The goal
 
@@ -68,6 +68,16 @@ cargo test --workspace
 cargo run -p xtask -- layers
 cargo run -p katsu -- --build-info
 ```
+
+Conformance needs the suite, which is not vendored because it is a gigabyte of somebody else's repository. Clone it and run the ratchet, which compares against the checked in expectations file and fails on any difference in either direction.
+
+```
+git clone --filter=blob:none https://github.com/tc39/test262 vendor/test262
+cargo run --release -p test262-runner
+cargo run --release -p test262-runner -- --filter language/asi --top 30
+```
+
+A run that legitimately changes the result is blessed with `--bless` and the regenerated file goes in the same pull request as the change that caused it. The suite revision is pinned in CI and recorded in the expectations file, because the suite gains and renames tests every week and a run against a different revision produces a diff that looks exactly like a regression.
 
 Benchmarks run on the reference machines named in [`spec/15-benchmarks.md`](spec/15-benchmarks.md) rather than on whatever laptop is nearest, because a timing without a machine attached to it is not a result. `cargo run -p xtask -- machines` lists them and says which ones are reachable, and `cargo run -p xtask -- bench --machine gamingpc -p katsu-vm` runs a crate's benchmarks on the x86-64 reference by checking out the current commit there, which it refuses to do if that commit has not been pushed.
 

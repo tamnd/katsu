@@ -76,6 +76,27 @@ pub enum ParseError {
     },
 }
 
+impl ParseError {
+    /// Whether this is our gap rather than the program's mistake.
+    ///
+    /// The difference matters more than it looks. A conformance suite is full of files that are
+    /// supposed to be rejected, and a runner that cannot tell "this is invalid JavaScript" from
+    /// "this is valid JavaScript we have not built yet" will count every one of our own gaps as a
+    /// pass on a negative test. That inflates the pass rate by exactly the amount of work left to
+    /// do, which is the most misleading direction an error could possibly be wrong in.
+    ///
+    /// The two variants that mean our gap are the two that name a construct: one says the tree has
+    /// no shape for the syntax and the other says the shape exists and there is no bytecode behind
+    /// it. Both shrink to nothing over M1 and this function goes with them.
+    #[must_use]
+    pub const fn is_not_implemented(&self) -> bool {
+        matches!(
+            self,
+            ParseError::Unsupported { .. } | ParseError::NotLowered { .. }
+        )
+    }
+}
+
 /// The result of parsing one source file.
 #[derive(Debug)]
 pub struct ParsedModule {

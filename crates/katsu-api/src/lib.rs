@@ -10,7 +10,7 @@ use std::fmt;
 
 use katsu_vm::{Interpreter, RuntimeError};
 
-pub use katsu_vm::{Discard, Isolate, Output, Recorder, Standard, Stream, Value};
+pub use katsu_vm::{Discard, Interrupt, Isolate, Output, Recorder, Standard, Stream, Value};
 
 /// Anything that went wrong that a caller can act on.
 #[derive(Debug, thiserror::Error)]
@@ -110,8 +110,18 @@ impl Runtime {
     /// Returns [`Error::Syntax`] if the source does not parse, [`Error::Uncaught`] if the program
     /// throws, and [`Error::NotImplemented`] if it reaches a construct this build does not run yet.
     pub fn eval(&mut self, path: &str, source: &str) -> Result<Value, Error> {
-        let blueprint =
-            katsu_vm::compile(path, source).map_err(|e| Error::Syntax(e.to_string()))?;
+        // Two different failures wear the same shape here and they are not the same thing. A file
+        // that is not valid JavaScript is the program's mistake. A file that is valid JavaScript
+        // using something we have not built is ours. Collapsing them was fine while nothing read
+        // the difference, and stopped being fine the moment a conformance runner did: a negative
+        // test expects to be rejected, so every gap of ours would have counted as a pass.
+        let blueprint = katsu_vm::compile(path, source).map_err(|error| {
+            if error.is_not_implemented() {
+                Error::NotImplemented(error.to_string())
+            } else {
+                Error::Syntax(error.to_string())
+            }
+        })?;
         Ok(self.interpreter.run(&blueprint)?)
     }
 
@@ -129,6 +139,21 @@ impl Runtime {
     #[must_use]
     pub const fn isolate(&self) -> &Isolate {
         self.interpreter.isolate()
+    }
+
+    /// A handle another thread can use to stop whatever this runtime is running.
+    ///
+    /// The interpreter checks it on every loop back edge, so a program stuck in a loop stops and a
+    /// program stuck in straight line code does not, there being no back edge to check at. That is
+    /// the trade spec 5.6 makes deliberately, since a check on every instruction would cost every
+    /// instruction and straight line code is finite by construction.
+    ///
+    /// What this is for is a caller running JavaScript it did not write, which in practice means a
+    /// conformance suite and an embedder with untrusted input. Both need to survive a program that
+    /// never returns.
+    #[must_use]
+    pub fn interrupt(&self) -> Interrupt {
+        self.interpreter.interrupt()
     }
 }
 
