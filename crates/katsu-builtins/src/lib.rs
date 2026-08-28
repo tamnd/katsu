@@ -5,6 +5,10 @@
 //! from, and it is more surface area than cleverness. Regular expressions go through
 //! `regress` rather than a hand written engine.
 
+mod console;
+
+pub use console::install as install_console;
+
 /// Whether ECMA-402, the internationalization API, is compiled into this build.
 ///
 /// Reported honestly rather than stubbed. `spec/17-open-questions.md` Q10 is explicit that

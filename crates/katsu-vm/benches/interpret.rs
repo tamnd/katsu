@@ -47,6 +47,13 @@
 //! language that is not free. It is measured per instruction like the dispatch group, and the number
 //! to read it against is `move_chain`, which is the same instruction shape with no lookup in it.
 //!
+//! The `property` group is the operation spec 4 says the whole architecture is judged on, measured
+//! in the form it has before there are shapes to cache against. A record's lookup is a linear scan
+//! over interned addresses, so `prop_load` is what eight four byte compares in one cache line cost,
+//! and it is the number M1's inline caches have to beat rather than a placeholder to be replaced
+//! without checking. `method_call` is the same lookup with a call on the end of it, which is the
+//! most common call shape in real code and is why it is one opcode rather than two.
+//!
 //! The `native` group is a call that leaves the interpreter. It has the same shape as `call_return`
 //! on purpose: the callee is already in a register and the body does nothing, so the difference
 //! between the two is the difference between pushing a frame and making a Rust call. Every builtin
@@ -356,7 +363,17 @@ fn nothing(_: &mut Interpreter, _: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::UNDEFINED)
 }
 
-/// An interpreter with a global to read and a native to call.
+/// How many names the benchmarked object holds.
+///
+/// Eight, because that is about what a real host object has on it and because the lookup is a linear
+/// scan over interned addresses. Eight four byte names is thirty two bytes, so the whole scan is
+/// inside one cache line and the number below is what that is worth.
+const PROPERTIES: usize = 8;
+
+/// An interpreter with a global to read, a native to call and an object to read properties off.
+///
+/// The object's names are `p0` through `p7` and every benchmark below uses `p7`, the last one, which
+/// is the worst case for a scan and therefore the honest number to publish.
 fn realm() -> Interpreter {
     let mut interpreter = Interpreter::new().expect("should reserve a stack");
     interpreter
@@ -364,6 +381,28 @@ fn realm() -> Interpreter {
         .expect("should have room");
     interpreter
         .define_native("nothing", nothing)
+        .expect("should have room");
+
+    let call = interpreter
+        .native_function("nothing", nothing)
+        .expect("should have room");
+    let names: Vec<String> = (0..PROPERTIES).map(|index| format!("p{index}")).collect();
+    let mut entries: Vec<(&str, Value)> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            (
+                name.as_str(),
+                i32::try_from(index).map_or(Value::UNDEFINED, Value::from_i32),
+            )
+        })
+        .collect();
+    // The last name holds the function, so `host.p7` and `host.p7()` walk the same distance and the
+    // difference between the two numbers is the call and nothing else.
+    entries[PROPERTIES - 1].1 = call;
+    let host = interpreter.host_object(&entries).expect("should have room");
+    interpreter
+        .define_global("host", host)
         .expect("should have room");
     interpreter
 }
@@ -401,6 +440,52 @@ fn globals(c: &mut Criterion) {
     group.finish();
 }
 
+fn properties(c: &mut Criterion) {
+    let mut group = c.benchmark_group("property");
+    group.throughput(Throughput::Elements(CHAIN as u64));
+
+    // The operation the whole architecture is judged on, in the form it has before there are shapes.
+    // The number to read it against is `global_load`, because both of them are a name lookup and the
+    // question M1 has to answer is whether a shape and an inline cache beat a scan of eight
+    // addresses in one cache line.
+    let mut source = String::new();
+    for _ in 0..CHAIN {
+        source.push_str("host.p7;\n");
+    }
+    let loads = program(&source);
+    group.bench_function("prop_load", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&loads))));
+    });
+
+    // Two instructions per line, the constant and the store, which is the same shape `global_store`
+    // has and is why the two sit next to each other.
+    let mut source = String::new();
+    for _ in 0..CHAIN {
+        source.push_str("host.p0 = 1;\n");
+    }
+    let stores = program(&source);
+    group.bench_function("prop_store", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&stores))));
+    });
+
+    // A property read and a call in one opcode, which is the most common call shape in real code.
+    // Against `native_call`, the difference is the lookup, and against `prop_load` it is the call.
+    group.throughput(Throughput::Elements(CALLS as u64));
+    let mut source = String::new();
+    for _ in 0..CALLS {
+        source.push_str("host.p7(1);\n");
+    }
+    let calls = program(&source);
+    group.bench_function("method_call", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&calls))));
+    });
+
+    group.finish();
+}
+
 fn natives(c: &mut Criterion) {
     let mut group = c.benchmark_group("native");
     group.throughput(Throughput::Elements(CALLS as u64));
@@ -428,6 +513,7 @@ criterion_group!(
     strings,
     calls,
     globals,
+    properties,
     natives
 );
 criterion_main!(benches);

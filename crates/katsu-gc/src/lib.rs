@@ -9,12 +9,16 @@ mod atom;
 mod bump;
 mod cage;
 mod function;
+mod object;
+mod record;
 mod string;
 
 pub use atom::{Atom, AtomTable};
 pub use bump::{BumpHeap, Census, KindTotals, ObjectKind};
 pub use cage::{CAGE_SIZE, Cage, CageError, GUARD_SIZE, OBJECT_ALIGN, SMI_MAX, SMI_MIN, Slot};
-pub use function::{ClosureRef, ContextRef, HeapKind, NativeRef};
+pub use function::{ClosureRef, ContextRef, NativeRef};
+pub use object::HeapKind;
+pub use record::RecordRef;
 pub use string::{LoneSurrogate, MAX_STRING_LENGTH, STRING_HEADER_SIZE, StringRef, hash_str};
 
 use std::fmt;

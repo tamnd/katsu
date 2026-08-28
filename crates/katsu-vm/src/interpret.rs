@@ -50,7 +50,7 @@ use std::cmp::Ordering as Sorting;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use katsu_gc::{ClosureRef, ContextRef, HeapKind, NativeRef, StringRef};
+use katsu_gc::{ClosureRef, ContextRef, HeapKind, NativeRef, RecordRef, StringRef};
 use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
 
@@ -58,6 +58,13 @@ use crate::number::{exponentiate, from_string, shift_count, to_int32, to_string,
 use crate::stack::{Invocation, Stack, StackError};
 use crate::unit::{Resolved, Unit};
 use crate::{Isolate, Value};
+
+/// How many levels of nested object `console.log` prints before it gives up and writes `[Object]`.
+///
+/// Two, which is what Node's `util.inspect` defaults to. It is a display choice and not a limit on
+/// anything, and it exists because a deeply nested object printed in full is unreadable rather than
+/// informative.
+const RECORD_PRINT_DEPTH: u32 = 2;
 
 /// Why execution stopped somewhere other than a `return`.
 ///
@@ -259,6 +266,42 @@ impl Interpreter {
         self.define_global(name, value)
     }
 
+    /// Make an object with a fixed set of named properties on it.
+    ///
+    /// This is how the runtime installs the things a program expects to already be there, which in
+    /// M0 is `console` and in M2 is most of the standard library. The names are interned, because a
+    /// property name is exactly the kind of string a program mentions over and over and the lookup is
+    /// a compare of two addresses once they are.
+    ///
+    /// The set is fixed because a record is fixed. That is the right shape for a host object anyway,
+    /// since the runtime knows every name it is installing at the moment it installs them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the names or the object.
+    pub fn host_object(&mut self, entries: &[(&str, Value)]) -> Result<Value, RuntimeError> {
+        let mut named = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            let atom = self.isolate.intern(name).ok_or(RuntimeError::OutOfMemory)?;
+            named.push((atom.as_string(), value.to_bits()));
+        }
+        let record =
+            RecordRef::new(self.isolate.heap_mut(), &named).ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(record.slot(), self.isolate.cage()))
+    }
+
+    /// Send everything this interpreter prints somewhere other than the process's own streams.
+    ///
+    /// Returns the sink that was there, so a caller can put it back. See [`Isolate::set_output`].
+    pub fn set_output(&mut self, output: Box<dyn crate::Output>) -> Box<dyn crate::Output> {
+        self.isolate.set_output(output)
+    }
+
+    /// Write to this interpreter's sink, which is what every printing builtin ends up calling.
+    pub fn write_output(&mut self, stream: crate::Stream, text: &str) {
+        self.isolate.write_output(stream, text);
+    }
+
     /// Render a value as text, the way `console.log` prints it at the top level.
     ///
     /// A value on its own means nothing, because a string is an address into this interpreter's
@@ -277,6 +320,9 @@ impl Interpreter {
         }
         if let Some(native) = self.as_native(value) {
             return self.native_text(native);
+        }
+        if let Some(record) = self.as_record(value) {
+            return self.record_text(record, RECORD_PRINT_DEPTH);
         }
         Self::primitive_text(value)
     }
@@ -733,8 +779,97 @@ impl Interpreter {
                     pc = frame.return_pc as usize;
                 }
 
-                // Everything that still needs an object with a shape, which is globals, property
-                // access and method calls. Named rather than silently wrong.
+                // The operation the whole architecture is judged on, in the form it has before there
+                // are shapes to cache against. The cache operand is carried and ignored: an inline
+                // cache needs a shape to compare, and a record has a kind tag where the shape will
+                // be, so there is nothing to record yet and pretending otherwise would mean writing
+                // a cache that M1 has to delete.
+                Op::GetProp { dst, obj, key, .. } => {
+                    let object = self.stack.get(obj);
+                    let name = self.name_at(constants, key);
+                    let value =
+                        self.property(object, name, &Self::constant_name(blueprint, key))?;
+                    self.stack.set(dst, value);
+                }
+
+                // A record is fixed once it exists, so this writes over a name that is already there
+                // and refuses one that is not. That is not what JavaScript does, and the refusal
+                // names the reason rather than silently dropping the write, which is the failure mode
+                // that would be genuinely hard to find. Growing an object is what shapes are for and
+                // it arrives with them in M1.
+                Op::SetProp {
+                    obj, key, value, ..
+                } => {
+                    let object = self.stack.get(obj);
+                    let name = self.name_at(constants, key);
+                    let new = self.stack.get(value);
+                    let Some(record) = self.as_record(object) else {
+                        let what = self.display(object);
+                        return Err(RuntimeError::Type(format!(
+                            "cannot set a property on {what}, which is not an object"
+                        )));
+                    };
+                    if !record.set(self.isolate.heap_mut(), name, new.to_bits()) {
+                        let key = Self::constant_name(blueprint, key);
+                        return Err(RuntimeError::Type(format!(
+                            "cannot add the property '{key}' to an object, because objects cannot grow until katsu has shapes"
+                        )));
+                    }
+                }
+
+                // A property read and a call, kept in one opcode so that the receiver is not lost
+                // between them. The receiver is looked up and then dropped, because neither a closure
+                // nor a native can see `this` yet, and `console.log` does not need to. What that
+                // costs is that a method depending on its receiver would read `undefined`, and the
+                // only methods that exist today are the ones the runtime installs itself.
+                Op::CallMethod {
+                    dst,
+                    obj,
+                    key,
+                    args,
+                    argc,
+                    ..
+                } => {
+                    let object = self.stack.get(obj);
+                    let name = self.name_at(constants, key);
+                    let target =
+                        self.property(object, name, &Self::constant_name(blueprint, key))?;
+                    let Some(closure) = self.as_closure(target) else {
+                        if let Some(native) = self.as_native(target) {
+                            let value = self.call_native(native, args, argc)?;
+                            self.stack.set(dst, value);
+                            continue;
+                        }
+                        // Node names the whole expression here, as `console.nope is not a function`,
+                        // and naming the object half of it needs the same source spans that the plain
+                        // call arm is waiting on. The property is named because that half is a
+                        // constant this opcode is already holding.
+                        let key = Self::constant_name(blueprint, key);
+                        return Err(RuntimeError::Type(format!("{key} is not a function")));
+                    };
+                    let index = closure.function(self.isolate.cage());
+                    let captured = closure.captured(self.isolate.cage());
+                    let callee = unit.function(index).blueprint;
+                    self.stack.push_call(
+                        callee.frame_size,
+                        Invocation {
+                            arity: callee.arity,
+                            first: args,
+                            passed: argc,
+                            function: index,
+                            return_pc: u32::try_from(pc).map_err(|_| Self::code_too_long())?,
+                            return_to: dst,
+                        },
+                    )?;
+                    self.set_frame_context(captured);
+                    function = index;
+                    blueprint = callee;
+                    constants = unit.function(index).constants.as_slice();
+                    pc = 0;
+                }
+
+                // Everything that still needs an object that can grow, which is object literals,
+                // indexed access and `delete`. Named rather than silently wrong.
                 _ => return Err(RuntimeError::NotImplemented(op)),
             }
         }
@@ -832,7 +967,7 @@ impl Interpreter {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
             HeapKind::Closure => ClosureRef::from_slot(slot),
-            HeapKind::String | HeapKind::Context | HeapKind::Native => None,
+            HeapKind::String | HeapKind::Context | HeapKind::Native | HeapKind::Record => None,
         }
     }
 
@@ -845,7 +980,21 @@ impl Interpreter {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
             HeapKind::Native => NativeRef::from_slot(slot),
-            HeapKind::String | HeapKind::Closure | HeapKind::Context => None,
+            HeapKind::String | HeapKind::Closure | HeapKind::Context | HeapKind::Record => None,
+        }
+    }
+
+    /// The one place a value becomes an object with properties on it.
+    ///
+    /// A record is the only thing in M0 that has a property, so this is the whole of what a property
+    /// read has to consider. In M1 it stops being a kind check and becomes a look at the shape, and
+    /// the reason it is one function rather than a check written into three opcode arms is so that
+    /// the change is here and not there.
+    fn as_record(&self, value: Value) -> Option<RecordRef> {
+        let slot = value.to_slot(self.isolate.cage())?;
+        match HeapKind::of(self.isolate.cage(), slot)? {
+            HeapKind::Record => RecordRef::from_slot(slot),
+            HeapKind::String | HeapKind::Closure | HeapKind::Context | HeapKind::Native => None,
         }
     }
 
@@ -926,6 +1075,79 @@ impl Interpreter {
         }
     }
 
+    /// Read one property, which in M0 means read one property of a record.
+    ///
+    /// Three answers and not two. A record either has the name or it does not, and a missing name is
+    /// `undefined` rather than an error, which is the rule the whole language is built on. Anything
+    /// that is not a record is also `undefined`, because a number's properties come off its prototype
+    /// and prototypes are M1. `undefined` and `null` are the exception, and they throw, because those
+    /// two have no prototype to reach for in any milestone and Node's message for it is the single
+    /// most read error message in JavaScript.
+    fn property(&self, object: Value, name: StringRef, key: &str) -> Result<Value, RuntimeError> {
+        if object.is_undefined() || object.is_null() {
+            let what = Self::primitive_text(object);
+            return Err(RuntimeError::Type(format!(
+                "Cannot read properties of {what} (reading '{key}')"
+            )));
+        }
+        let Some(record) = self.as_record(object) else {
+            return Ok(Value::UNDEFINED);
+        };
+        Ok(record
+            .get(self.isolate.cage(), name)
+            .map_or(Value::UNDEFINED, Value::from_bits))
+    }
+
+    /// The text `console.log` prints for an object.
+    ///
+    /// Node prints the contents rather than `[object Object]`, because `console.log` does not convert
+    /// its argument to a string, it inspects it, and somebody printing an object wants to see what is
+    /// in it. Strings inside an object are quoted and a string printed on its own is not, for the same
+    /// reason: inside an object the quotes are what tell a string apart from a name.
+    ///
+    /// Two levels deep and then `[Object]`, which is Node's default depth. A record cannot contain
+    /// itself today, because a record's contents are fixed when it is made, so the limit is here to
+    /// match Node rather than to stop an endless walk. When an object can be mutated after it exists
+    /// it will be both.
+    fn record_text(&self, record: RecordRef, depth: u32) -> String {
+        if depth == 0 {
+            return "[Object]".to_owned();
+        }
+        let cage = self.isolate.cage();
+        let count = record.len(cage);
+        if count == 0 {
+            return "{}".to_owned();
+        }
+        let mut text = String::from("{ ");
+        for index in 0..count {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            let name = record
+                .name_at(cage, index)
+                .expect("an index below the count names an entry");
+            let value = record
+                .value_at(cage, index)
+                .expect("an index below the count names an entry");
+            text.push_str(&name.to_utf8_lossy(cage));
+            text.push_str(": ");
+            text.push_str(&self.inspect(Value::from_bits(value), depth - 1));
+        }
+        text.push_str(" }");
+        text
+    }
+
+    /// What one value looks like inside a printed object.
+    fn inspect(&self, value: Value, depth: u32) -> String {
+        if let Some(string) = self.as_string(value) {
+            return format!("'{}'", string.to_utf8_lossy(self.isolate.cage()));
+        }
+        if let Some(record) = self.as_record(value) {
+            return self.record_text(record, depth);
+        }
+        self.display(value)
+    }
+
     /// The name a constant holds, for an error message.
     fn constant_name(blueprint: &FunctionBlueprint, index: katsu_ir::ConstIndex) -> String {
         match blueprint.constants.get(index) {
@@ -948,7 +1170,7 @@ impl Interpreter {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
             HeapKind::String => StringRef::from_slot(slot),
-            HeapKind::Closure | HeapKind::Context | HeapKind::Native => None,
+            HeapKind::Closure | HeapKind::Context | HeapKind::Native | HeapKind::Record => None,
         }
     }
 
@@ -1026,7 +1248,7 @@ impl Interpreter {
         match kind {
             Some(HeapKind::String) => "string",
             Some(HeapKind::Closure | HeapKind::Native) => "function",
-            Some(HeapKind::Context) | None => "object",
+            Some(HeapKind::Context | HeapKind::Record) | None => "object",
         }
     }
 
@@ -1060,7 +1282,13 @@ impl Interpreter {
         }
         let text = match self.as_closure(value) {
             Some(closure) => self.function_text(closure),
-            None => Self::primitive_text(value),
+            // An object converts to `[object Object]` and not to what `console.log` shows, because
+            // this is `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and
+            // the two differing is a real distinction in the language rather than an inconsistency.
+            None => match self.as_native(value) {
+                Some(native) => self.native_text(native),
+                None => Self::primitive_text(value),
+            },
         };
         self.isolate
             .allocate_string(&text)
@@ -1084,8 +1312,8 @@ impl Interpreter {
         if let Some(number) = value.as_f64() {
             return to_string(number);
         }
-        // Only the callers that already ruled out every heap object get here, so this is the answer
-        // for the objects M1 adds and nothing reaches it today.
+        // Everything else on the heap, which is an object. `ToString` of one really is this text,
+        // and it is why `'' + {}` reads the way it does.
         "[object Object]".to_owned()
     }
 
@@ -3189,6 +3417,160 @@ mod tests {
         interpreter.run(&blueprint).expect("should not throw");
         assert_eq!(interpreter.global("undeclared"), Some(Value::from_i32(3)));
         assert_eq!(interpreter.global("nothing"), None);
+    }
+
+    /// A native that writes its first argument to the interpreter's sink and returns nothing.
+    ///
+    /// A cut down `console.log`, here rather than borrowed from katsu-builtins because this crate
+    /// cannot depend on the crate that depends on it, and because what is being tested is the
+    /// plumbing and not the builtin.
+    #[allow(clippy::unnecessary_wraps)]
+    fn print(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+        let text = interpreter.display(crate::arg(args, 0));
+        interpreter.write_output(crate::Stream::Out, &format!("{text}\n"));
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A realm with a host object in it, which is the arrangement `console` arrives in.
+    fn hosted() -> Interpreter {
+        let mut interpreter = realm();
+        let log = interpreter
+            .native_function("log", print)
+            .expect("should have room");
+        let host = interpreter
+            .host_object(&[("log", log), ("version", Value::from_i32(5))])
+            .expect("should have room");
+        interpreter
+            .define_global("host", host)
+            .expect("should have room");
+        interpreter
+    }
+
+    /// Run a program in that realm and hand back the value of its last expression.
+    fn hosted_display(source: &str) -> String {
+        let blueprint = as_expression(source);
+        let mut interpreter = hosted();
+        let value = interpreter.run(&blueprint).expect("should not throw");
+        interpreter.display(value)
+    }
+
+    #[test]
+    fn a_property_that_is_there_reads_back() {
+        assert_eq!(hosted_display("host.version"), "5");
+    }
+
+    #[test]
+    fn a_property_that_is_not_there_is_undefined_rather_than_an_error() {
+        // The rule the whole language rests on. A missing property is not a missing variable, and
+        // only one of the two is worth stopping the program for.
+        assert_eq!(hosted_display("host.missing"), "undefined");
+    }
+
+    #[test]
+    fn reading_a_property_of_nothing_says_which_property_it_was() {
+        // Node's message word for word, because this is the error a JavaScript programmer reads more
+        // often than any other and the words are the useful part of it.
+        let blueprint = as_expression("host.missing.deeper");
+        assert_eq!(
+            hosted().run(&blueprint),
+            Err(RuntimeError::Type(
+                "Cannot read properties of undefined (reading 'deeper')".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_method_call_reaches_the_function_the_property_holds() {
+        let blueprint = as_expression("host.log(1 + 1)");
+        let mut interpreter = hosted();
+        let recorder = crate::Recorder::new();
+        interpreter.set_output(Box::new(recorder.clone()));
+        interpreter.run(&blueprint).expect("should not throw");
+        assert_eq!(recorder.text(), "2\n");
+    }
+
+    #[test]
+    fn a_method_call_on_a_property_that_is_not_a_function_says_which_one() {
+        let blueprint = as_expression("host.version()");
+        assert_eq!(
+            hosted().run(&blueprint),
+            Err(RuntimeError::Type("version is not a function".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_method_written_in_javascript_is_called_the_same_way_a_native_is() {
+        // The half of `call_method` that goes back into the loop rather than out of it, which is a
+        // different code path from the native call above and is the one that has to get the frame
+        // right.
+        let blueprint = as_expression("function twice(n) { return n * 2; } obj = twice; obj(21)");
+        let mut interpreter = hosted();
+        let value = interpreter.run(&blueprint).expect("should not throw");
+        assert_eq!(value.as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn a_property_that_exists_can_be_written_and_a_new_one_cannot() {
+        let blueprint = as_expression("host.version = 6; host.version");
+        let mut interpreter = hosted();
+        let value = interpreter.run(&blueprint).expect("should not throw");
+        assert_eq!(value.as_f64(), Some(6.0));
+
+        // The limit a record has, reported rather than silently dropped. It goes away in M1.
+        let growing = as_expression("host.brand = 'katsu'");
+        assert!(matches!(hosted().run(&growing), Err(RuntimeError::Type(_))));
+    }
+
+    #[test]
+    fn an_object_is_an_object_to_typeof_and_prints_its_contents() {
+        assert_eq!(hosted_display("typeof host"), "object");
+        assert_eq!(
+            hosted_display("host"),
+            "{ log: [Function: log], version: 5 }"
+        );
+    }
+
+    #[test]
+    fn an_object_converts_to_text_the_way_the_language_says_and_not_the_way_it_prints() {
+        // `console.log` inspects and `+` converts, and the two giving different answers is the
+        // language rather than an inconsistency.
+        assert_eq!(hosted_display("'' + host"), "[object Object]");
+    }
+
+    #[test]
+    fn a_string_inside_an_object_is_quoted_and_a_string_on_its_own_is_not() {
+        let mut interpreter = realm();
+        let text = interpreter.intern("katsu").expect("should have room");
+        let host = interpreter
+            .host_object(&[("name", text)])
+            .expect("should have room");
+        assert_eq!(interpreter.display(text), "katsu");
+        assert_eq!(interpreter.display(host), "{ name: 'katsu' }");
+    }
+
+    #[test]
+    fn a_deeply_nested_object_stops_where_node_stops() {
+        let mut interpreter = realm();
+        let third = interpreter
+            .host_object(&[("deep", Value::from_i32(1))])
+            .expect("should have room");
+        let second = interpreter
+            .host_object(&[("third", third)])
+            .expect("should have room");
+        let first = interpreter
+            .host_object(&[("second", second)])
+            .expect("should have room");
+        assert_eq!(
+            interpreter.display(first),
+            "{ second: { third: [Object] } }"
+        );
+    }
+
+    #[test]
+    fn an_object_with_nothing_in_it_prints_as_nothing() {
+        let mut interpreter = realm();
+        let empty = interpreter.host_object(&[]).expect("should have room");
+        assert_eq!(interpreter.display(empty), "{}");
     }
 
     // The binary operators as functions, so that a table driven test can name one without writing

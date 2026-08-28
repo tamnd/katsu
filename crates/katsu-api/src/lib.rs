@@ -10,7 +10,7 @@ use std::fmt;
 
 use katsu_vm::{Interpreter, RuntimeError};
 
-pub use katsu_vm::{Isolate, Value};
+pub use katsu_vm::{Discard, Isolate, Output, Recorder, Standard, Stream, Value};
 
 /// Anything that went wrong that a caller can act on.
 #[derive(Debug, thiserror::Error)]
@@ -78,9 +78,23 @@ impl Runtime {
     /// than panicking because an embedder that has run out of address space usually wants to fail
     /// the request rather than take the whole host process down with it.
     pub fn new() -> Result<Runtime, Error> {
-        Ok(Runtime {
-            interpreter: Interpreter::new().map_err(|error| Error::Fatal(error.to_string()))?,
-        })
+        let mut interpreter =
+            Interpreter::new().map_err(|error| Error::Fatal(error.to_string()))?;
+        // The globals a program is entitled to assume are there. One call today and a list of them
+        // later, and it is here rather than inside `Interpreter::new` because the interpreter is the
+        // machine and this is the standard library it happens to be started with. An embedder that
+        // wants a bare machine wants the interpreter, not this.
+        katsu_builtins::install_console(&mut interpreter)?;
+        Ok(Runtime { interpreter })
+    }
+
+    /// Send everything this runtime prints somewhere other than the process's own streams.
+    ///
+    /// Returns the sink that was there, so a caller can put it back when it is done. A
+    /// [`Recorder`] reads back what a program printed, which is how a test asserts on output, and
+    /// [`Discard`] throws it away, which is what an embedder running untrusted code wants.
+    pub fn set_output(&mut self, output: Box<dyn Output>) -> Box<dyn Output> {
+        self.interpreter.set_output(output)
     }
 
     /// Evaluate a source string and return the value its top level returns.
@@ -126,7 +140,7 @@ pub const fn jit_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Runtime};
+    use super::{Discard, Error, Recorder, Runtime};
 
     fn runtime() -> Runtime {
         Runtime::new().expect("should start")
@@ -172,28 +186,59 @@ mod tests {
     #[test]
     fn something_this_build_cannot_run_says_so_and_names_it() {
         let mut runtime = runtime();
-        // Globals run now, so the opcode this stops at has moved along again, to reading a property
-        // off a value. It is still the case being checked: something the frontend can lower and the
-        // loop cannot run is named rather than being guessed at or crashed on.
+        // Named property access runs now, so the opcode this stops at has moved along again, to a
+        // key computed at run time. It is still the case being checked: something the frontend can
+        // lower and the loop cannot run is named rather than being guessed at or crashed on.
         let error = runtime
-            .eval("ok.js", "'katsu'.length")
-            .expect_err("property access is not implemented yet");
+            .eval("ok.js", "console['log']")
+            .expect_err("a computed key is not implemented yet");
         assert!(matches!(error, Error::NotImplemented(_)), "got {error:?}");
     }
 
     #[test]
     fn a_name_that_was_never_bound_reads_as_a_reference_error() {
-        // What `console.log(1)` does in this build: the global load in front of the call is a real
-        // instruction now, and nothing has put `console` in the global scope yet, so the program
-        // stops the way Node stops on a name that does not exist rather than the way it stops on a
-        // feature we have not written.
         let mut runtime = runtime();
         let error = runtime
-            .eval("bad.js", "console.log(1)")
-            .expect_err("nothing is bound to console yet");
+            .eval("bad.js", "missing.log(1)")
+            .expect_err("nothing is bound to missing");
         assert_eq!(
             error.to_string(),
-            "uncaught exception: ReferenceError: console is not defined"
+            "uncaught exception: ReferenceError: missing is not defined"
         );
+    }
+
+    #[test]
+    fn a_program_can_print() {
+        // The first release where a program can be observed doing something. Until scripts have
+        // completion values this is the only way to see what one computed, which is why it is the
+        // milestone line it is.
+        let mut runtime = runtime();
+        let recorder = Recorder::new();
+        runtime.set_output(Box::new(recorder.clone()));
+        runtime
+            .eval("hello.js", "console.log('hello ' + 'katsu')")
+            .expect("should run");
+        assert_eq!(recorder.text(), "hello katsu\n");
+    }
+
+    #[test]
+    fn what_a_program_prints_can_be_thrown_away() {
+        let mut runtime = runtime();
+        runtime.set_output(Box::new(Discard));
+        runtime
+            .eval("quiet.js", "console.log('nobody hears this')")
+            .expect("should run");
+    }
+
+    #[test]
+    fn the_sink_that_was_there_comes_back_so_it_can_be_put_back() {
+        let mut runtime = runtime();
+        let recorder = Recorder::new();
+        let standard = runtime.set_output(Box::new(recorder.clone()));
+        runtime.eval("t.js", "console.log(1)").expect("should run");
+        runtime.set_output(standard);
+        runtime.eval("t.js", "console.log(2)").expect("should run");
+        // Only the first line, because the second went back out to the process.
+        assert_eq!(recorder.text(), "1\n");
     }
 }
