@@ -32,3 +32,7 @@ harness = false
 [[bench]]
 name = "stack"
 harness = false
+
+[[bench]]
+name = "interpret"
+harness = false
