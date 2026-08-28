@@ -2,6 +2,50 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.1
+
+The first patch release of M1, three pull requests on from 0.1.0, and between them they replace the two biggest holes in the middle of the language. There is a `switch` and there are objects.
+
+### `switch`, `break` and `continue`
+
+The statement form to implement first was chosen by measurement rather than by taste, in #48. A test262 run showed that 75,804 of the 75,813 cases the runner could not attempt stopped at the same `switch` in the suite's own `harness/assert.js`, so one missing statement was standing in front of five sixths of the suite.
+
+Three things about a switch are the opposite of what the syntax suggests, and all three had to be built rather than assumed. Every clause shares one block scope rather than getting one each, so a `let` written in the last clause is in scope for the first and reading it there is a dead zone error rather than a read of the outer name. That scope is instantiated before the first case test is evaluated rather than when the first clause runs, so a case test can sit in the dead zone of a declaration three clauses below it. And a `default` written in the middle is still compared after every case, so it is a fallback in the comparison order and a position in the layout at the same time.
+
+`break` and `continue` with nothing to leave are early errors rather than runtime ones, so scope analysis counts enclosing loops and enclosing breakables as it walks and refuses with node's exact messages. A `continue` lowers to a jump to the loop's back edge rather than to the loop's top, so an iteration that continues still passes through the instruction that counts iterations, and a loop that is mostly continues still gets hot when there is a tier to get hot for.
+
+A clause not taken costs 9.2 ns and a switch that matches its first clause costs 11.0 ns, which is what a linear scan of `StrictEqual` and `JumpIfTrue` looks like and is the number a jump table would have to beat when there is a reason to build one.
+
+### Objects are objects now
+
+An object in the cage was a record until #49: a fixed set of names decided when it was made, with no prototype, no attributes, no way to delete a name and no way to add one. That was the right thing to build so that `console.log` could exist before there was an object model, and it was the wrong thing to keep, because a JavaScript object grows.
+
+It is a transition tree now. A shape is a node, an edge is one property being added and the root is the empty object, so two objects built by adding the same names in the same order arrive at the same node without anything ever comparing two property lists. Insertion order is part of a shape's identity because the language says string keyed enumeration order is insertion order, and a tree gives that for free. An ordinary object is a sixteen byte header followed by its inline slots, with anything that does not fit going to an array on the side that starts at four slots and doubles.
+
+Kind discrimination stopped needing a tag for the kind there is most of. The first word of every cage object is a slot, a small integer there is a kind tag and a pointer there is a shape, so an ordinary object is exactly the object whose first word is a pointer.
+
+Then #50 added the literal, which is what makes any of it reachable from a program. It lowers to `new_object` and one `set_prop` per property, which is three instructions where one would do and is deliberate: a store is the operation that takes a transition, so a literal and an object grown a property at a time walk the same path and land on the same shape node. Neither needs a code path the other does not have, every property is already an inline cache site for the caches M1 still owes, and a duplicate property name comes out right without anything being written to make it.
+
+Coercion came with it. ToPrimitive is one function with three callers that disagree about when it runs, in ways that are the language rather than an accident. `+` converts both sides and then asks whether either is a string, which is not the same as asking first and converting after, and `{} + 1` is the case that tells them apart because the answer is `[object Object]1` and neither operand was a string on the way in. The relational operators convert before the string test as well, which is why `'9' < {}` is true and is a comparison of code units. Loose equality treats two objects as the identity question and converts an object against a primitive before asking again.
+
+### Two bugs the harness found and reading would not have
+
+A literal writes its destination register before its operands run, because the stores need somewhere to store into. `x = {a: (x = 1)}` was already handled and `x = {a: x}` was not, so the property was handed the half made object instead of the value `x` was holding. Every other expression in the language produces its value before anything is written, which is why an object literal is the only place in the lowerer that has to ask whether an operand so much as reads a variable.
+
+Node prints an object with nothing in it as `{}` however deep it is, because its empty check comes before its depth check. That reads as cosmetic and is not: `[Object]` is six characters longer than `{}`, and it was enough to break a line node keeps whole, so getting the order wrong changed the shape of the output two levels up.
+
+Printing an object that can be reached from inside itself was built in the same pull request, with four rules that were measured against node rather than recalled. The test is whether the walk is currently inside the object and not whether it has ever seen it. The numbers are handed out where the way back is found rather than where the object was first printed, and they start again for each value `console.log` is given. The cycle check runs before the depth check. And the `<ref *1>` prefix counts towards the width arithmetic even though it sits outside the braces.
+
+### Where the numbers stand
+
+Reading the property added last is about one nanosecond at any property count and reading the first of sixteen is fifteen, which is what a linear parent chain walk looks like and is the number an inline cache exists to remove. A store that takes a transition another object already took is 3.2 ns against 37 for one that has to allocate a shape, so the tree is worth about eleven to one. A shape is 24 bytes against the 64 the spec budgeted and an empty object is 16 against 24.
+
+Building an object, per object, with the fresh isolate each iteration needs subtracted rather than hidden inside the answer: an empty literal is 6.5 ns, two properties is 18.6 and four is 32.6, so a property costs about six nanoseconds. The same four property object built out of an empty literal and four separate stores is 41.9, so the room in `new_object` is worth about nine nanoseconds on an object that size.
+
+The differential harness now generates objects, literals with duplicate names, property stores and property reads alongside everything it had before, and 5,006 programs agreed with node with no divergences.
+
+The conformance number does not move, and the reason is the reason to keep reading it as a shape rather than a percentage. The suite's harness has a `try` on the line after the `switch` that used to block it, so 75,804 cases now stop one statement later than they did. Exceptions are next.
+
 ## 0.1.0
 
 The first minor release, because M0 is done. Every box on the milestone is ticked: a parser, a bytecode compiler, an interpreter, a value representation, a heap, a command line, and now the two things that tell us whether any of it is right.
