@@ -5,6 +5,12 @@
 //! This crate exists so that the decision is a swap behind a trait instead of a rewrite.
 //! See `spec/08-gc-and-memory.md`.
 
+mod bump;
+mod cage;
+
+pub use bump::{BumpHeap, Census, KindTotals, ObjectKind};
+pub use cage::{CAGE_SIZE, Cage, CageError, GUARD_SIZE, OBJECT_ALIGN, SMI_MAX, SMI_MIN, Slot};
+
 use std::fmt;
 
 /// Why a collection was triggered.

@@ -14,6 +14,8 @@
 
 use std::fmt;
 
+use katsu_gc::{Cage, Slot};
+
 /// Added to a double's bit pattern on encode and subtracted on decode.
 ///
 /// Two to the forty ninth. After the offset every non NaN double lands in
@@ -307,6 +309,42 @@ impl Value {
             "object"
         }
     }
+
+    /// Widen a thirty two bit heap slot into a register value.
+    ///
+    /// This is the load half of the pair in spec 07.1. A slot is four bytes because that is where
+    /// the memory goal lives, a register is eight because a boxed double in a numeric loop is
+    /// exactly the tax that makes an engine slow, and this function is the seam between them.
+    ///
+    /// Every slot has a value, so this cannot fail.
+    #[must_use]
+    pub fn from_slot(slot: Slot, cage: &Cage) -> Value {
+        match slot.as_smi() {
+            Some(n) => Value::from_i32(n),
+            // The offset is untagged by `as_offset`, and every `u32` names a byte inside the cage,
+            // so the address is inside the cage by construction rather than by checking.
+            None => Value::from_pointer(cage.address_of(slot.as_offset().unwrap_or(0)) as u64),
+        }
+    }
+
+    /// Narrow a register value into a thirty two bit heap slot.
+    ///
+    /// This is the store half, and unlike the load half it can fail, because a register holds
+    /// things a slot has no room for.
+    ///
+    /// A double, or an integer outside the thirty one bit range, needs a heap number, which is an
+    /// allocation and therefore the caller's decision rather than something this function should
+    /// make quietly. `undefined`, `null`, `true` and `false` become pointers to singletons in the
+    /// realm snapshot, which does not exist until M1. Both cases return `None` today, and the
+    /// caller is expected to handle them rather than to assume they cannot happen.
+    #[must_use]
+    pub fn to_slot(self, cage: &Cage) -> Option<Slot> {
+        if let Some(n) = self.as_i32() {
+            return Slot::from_smi(n);
+        }
+        let address = self.as_pointer()? as *const u8;
+        cage.offset_of(address).map(Slot::from_offset)
+    }
 }
 
 impl fmt::Debug for Value {
@@ -558,5 +596,85 @@ mod tests {
         assert_eq!(format!("{:?}", Value::from_double(7.5)), "7.5f64");
         assert_eq!(format!("{:?}", Value::UNDEFINED), "undefined");
         assert_eq!(format!("{:?}", Value::from_pointer(0x20)), "object@0x20");
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use katsu_gc::{BumpHeap, ObjectKind, SMI_MAX, SMI_MIN, Slot};
+
+    use super::Value;
+
+    #[test]
+    fn an_integer_that_fits_a_slot_survives_the_narrowing() {
+        let heap = BumpHeap::new().unwrap();
+        for n in [SMI_MIN, SMI_MIN + 1, -1, 0, 1, 7, SMI_MAX - 1, SMI_MAX] {
+            let value = Value::from_i32(n);
+            let slot = value.to_slot(heap.cage()).unwrap();
+            assert_eq!(slot.as_smi(), Some(n));
+            assert_eq!(Value::from_slot(slot, heap.cage()), value);
+        }
+    }
+
+    #[test]
+    fn an_integer_too_wide_for_a_slot_is_refused_rather_than_truncated() {
+        // These need a heap number, which is an allocation and therefore the caller's decision.
+        // Silently truncating here would be a wrong answer that only shows up above a billion.
+        let heap = BumpHeap::new().unwrap();
+        assert_eq!(Value::from_i32(SMI_MAX + 1).to_slot(heap.cage()), None);
+        assert_eq!(Value::from_i32(SMI_MIN - 1).to_slot(heap.cage()), None);
+        assert_eq!(Value::from_i32(i32::MAX).to_slot(heap.cage()), None);
+    }
+
+    #[test]
+    fn a_real_allocation_round_trips_through_a_slot() {
+        let mut heap = BumpHeap::new().unwrap();
+        let object = heap.allocate(32, ObjectKind::Object).unwrap();
+        let value = Value::from_pointer(object.as_ptr() as u64);
+
+        let slot = value.to_slot(heap.cage()).unwrap();
+        assert!(slot.is_pointer());
+        assert_eq!(Value::from_slot(slot, heap.cage()), value);
+        assert_eq!(
+            Value::from_slot(slot, heap.cage()).as_pointer(),
+            Some(object.as_ptr() as u64)
+        );
+    }
+
+    #[test]
+    fn things_a_slot_has_no_room_for_say_so() {
+        let heap = BumpHeap::new().unwrap();
+        // A double needs a heap number. The immediates need singletons in the realm snapshot,
+        // which arrives at M1. Both are None today and both are the caller's problem, which is
+        // better than either of them becoming a wrong pointer.
+        assert_eq!(Value::from_double(1.5).to_slot(heap.cage()), None);
+        assert_eq!(Value::UNDEFINED.to_slot(heap.cage()), None);
+        assert_eq!(Value::NULL.to_slot(heap.cage()), None);
+        assert_eq!(Value::TRUE.to_slot(heap.cage()), None);
+        assert_eq!(Value::FALSE.to_slot(heap.cage()), None);
+    }
+
+    #[test]
+    fn a_pointer_from_outside_the_cage_does_not_compress() {
+        let heap = BumpHeap::new().unwrap();
+        let on_the_stack = 0u64;
+        let value = Value::from_pointer(std::ptr::from_ref(&on_the_stack) as u64);
+        assert_eq!(
+            value.to_slot(heap.cage()),
+            None,
+            "compressing a pointer from outside the cage would produce an offset that decodes to \
+             an unrelated object, which is the exact failure the cage exists to prevent"
+        );
+    }
+
+    #[test]
+    fn a_zero_slot_widens_to_the_integer_zero() {
+        // Freshly committed heap pages are zero, so this is what an object's uninitialised slots
+        // read as, and it has to be a value rather than a trap.
+        let heap = BumpHeap::new().unwrap();
+        assert_eq!(
+            Value::from_slot(Slot::from_bits(0), heap.cage()),
+            Value::from_i32(0)
+        );
     }
 }
