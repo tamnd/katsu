@@ -459,10 +459,11 @@ fn properties(c: &mut Criterion) {
     });
 
     // Two instructions per line, the constant and the store, which is the same shape `global_store`
-    // has and is why the two sit next to each other.
+    // has and is why the two sit next to each other. The same last name as the read, so the two of
+    // them walk the same distance and the difference between them is the write.
     let mut source = String::new();
     for _ in 0..CHAIN {
-        source.push_str("host.p0 = 1;\n");
+        source.push_str("host.p7 = 1;\n");
     }
     let stores = program(&source);
     group.bench_function("prop_store", |b| {
