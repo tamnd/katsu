@@ -180,6 +180,48 @@ The design:
 
 `regress` handles the regex side, since it offers UTF-16 and UCS-2 input modes where surrogate pairs split freely, which is what strict `RegExp` semantics require and what `regex` cannot do.
 
+### 7.7.1 The flat string layout and the atom table, decided
+
+Implemented in `crates/katsu-gc/src/string.rs` and `crates/katsu-gc/src/atom.rs`. Ropes and slices are not implemented yet, and the paragraph at the end of this section says what that costs.
+
+A flat string is a three word header followed by the characters:
+
+| Word | Contents |
+|---|---|
+| 0 | the shape slot, zero until M1 gives strings a map |
+| 1 | length in UTF-16 code units |
+| 2 | the hash in the top twenty eight bits, four flag bits below it |
+
+The flag bits are two for the representation, which leaves room for ropes and slices, one for interned, and one saying whether the hash has been computed. Packing the hash and the flags into one word is what V8 does and it is what gets the header to twelve bytes rather than sixteen. That matters more than it sounds: it takes a ten character ASCII string from the 26 bytes budgeted in 7.9 down to 22 requested and 24 after alignment.
+
+The representation is canonical. A string is stored as UTF-16 only when it actually contains a code unit above 255, and narrowing happens once, at construction, on every path in. Two things fall out of that. Equal strings always agree on their representation, so equality rejects on the header before it looks at a character, and the memory win over an engine that stores everything wide is taken by construction rather than by an optimisation pass that might not run.
+
+The hash is computed lazily and cached in the header, and it is defined over code units rather than over the stored bytes. Defining it over code units is what lets the atom table hash a Rust `&str` and go looking for it without building a candidate string first, which is the difference between a property lookup that allocates and one that does not. It costs a code unit at a time rather than eight bytes at a time, which is the right trade for names and the wrong one for a megabyte of text used as a key.
+
+The atom table is open addressed with linear probing at a three quarter load factor. An empty bucket is a slot of all zero bits, which is the integer zero by 7.2.1 and therefore never a pointer, so a freshly zeroed table is an empty table and growing one does not need a pass to write sentinels. The table's buckets are a Rust `Vec` outside the cage today, so the heap census does not see them, which is a hole in the accounting rather than a design. M1 moves the table into the realm snapshot where 7.7 says it belongs and where the census sees it for free.
+
+Two gaps are worth naming. Without ropes, `a = a + b` in a loop copies both sides every time and is quadratic, which is the first thing M1 should close. And the hash is not resistant to flooding: a program that picks colliding property names can push the table into long probe runs, which is a real denial of service against a server. The fix is a per process random seed, and it has to arrive with the realm rather than later, because a seed cannot change once a hash has been cached in a string header.
+
+Measured per operation on both reference machines from 15.5:
+
+| Operation | m4 | gamingpc |
+|---|---|---|
+| build an eleven character ASCII string | 16.6 ns | 19.8 ns |
+| build an eleven code unit UTF-16 string | 31.7 ns | 34.2 ns |
+| compare two equal eleven character strings | 3.4 ns | 2.6 ns |
+| hash eleven characters of Rust text | 5.9 ns | 5.3 ns |
+| borrow a fifty nine character ASCII string as `&str` | 3.2 ns | 3.2 ns |
+| copy a twelve character Latin-1 string to UTF-8 | 38.3 ns | 17.7 ns |
+| atom lookup that hits, in a table of five hundred | 10.3 ns | 10.2 ns |
+| atom lookup that misses | 6.3 ns | 5.8 ns |
+| intern a name that is not in the table yet | 34.3 ns | 33.2 ns |
+
+The first line started at 37.6 ns. The obvious way to write the constructor narrows the text into a `Vec<u8>` and hands that to the Latin-1 path, which is a malloc and a free per string, and a parser builds one of these per identifier per file. Writing straight into the cage instead took it to 16.6 ns. The benchmark is the only reason anybody noticed.
+
+The last two lines are the pair worth watching. A lookup that hits does a hash, a probe and a comparison and allocates nothing, which is the property every property access depends on.
+
+The one row where the two machines disagree by more than noise is the copying conversion, where the M4 is twice as slow. That row is dominated by a malloc, so it is measuring the two allocators rather than anything in this engine, and it is a reason to stop allocating a `String` on that path rather than a reason to prefer either machine.
+
 ## 7.8 Snapshot constraints
 
 Because the realm is snapshotted at build time (document 03.8), nothing in the snapshotted heap may contain an absolute address.
@@ -196,7 +238,7 @@ The numbers this design is aiming at, as targets that document 15 measures rathe
 | `{a: 1, b: 2, c: 3}` | 36 |
 | Array of 1000 packed Smis | ~4 KB plus header |
 | Array of 1000 packed doubles | ~8 KB plus header |
-| Short ASCII string, 10 chars | 26 |
+| Short ASCII string, 10 chars | 26 budgeted, 22 measured, 24 after alignment (7.7.1) |
 | Closure with two captured variables | 40 plus the shared blueprint |
 | Shape, shared across all objects with that layout | ~64, amortized to near zero per object |
 
