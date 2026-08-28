@@ -304,6 +304,7 @@ fn highest_register(op: Op) -> Option<Register> {
         | Op::LoadNull { dst }
         | Op::LoadBool { dst, .. }
         | Op::LoadThis { dst }
+        | Op::LoadClosure { dst }
         | Op::LoadUninitialized { dst }
         | Op::LoadUpvalue { dst, .. }
         | Op::LoadGlobal { dst, .. }

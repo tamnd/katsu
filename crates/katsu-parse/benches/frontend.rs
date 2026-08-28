@@ -10,10 +10,10 @@
 //! exists to protect. The number that matters for the startup budget is the total anyway, since a
 //! program pays for both or neither.
 //!
-//! Scope analysis is measured separately as well as inside the `parse` total, because it is the
-//! one pass here that can be handed an already adapted tree without poking a hole in the boundary
-//! the adapter exists to keep. The two numbers together say how much of the frontend budget the
-//! resolution costs, which is the thing to watch as it learns about more of the language.
+//! Scope analysis and lowering are measured separately as well as inside the `parse` total, because
+//! they are the two passes here that can be handed an already adapted tree without poking a hole in
+//! the boundary the adapter exists to keep. The three numbers together say where the frontend budget
+//! goes, which is the thing to watch as each pass learns about more of the language.
 //!
 //! Two shapes are measured because they stress different things. A file of small functions is what
 //! real code looks like and what the per node cost shows up in. A single long function is the
@@ -28,7 +28,7 @@ use std::hint::black_box;
 use std::sync::LazyLock;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use katsu_parse::{parse, scope};
+use katsu_parse::{lower, parse, scope};
 
 /// A file of small functions, roughly the shape of a module a person would write.
 ///
@@ -109,5 +109,28 @@ fn scopes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, frontend, scopes);
+/// Lowering on its own, over a tree that has already been adapted and resolved.
+///
+/// Measured separately for the same reason scope analysis is: it takes the tree and the resolution
+/// and nothing else, so it can be timed without reaching through the adapter boundary. This is the
+/// pass whose output the interpreter runs, so its share of the frontend is what a cold start pays
+/// before the first instruction executes.
+fn lowering(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lower");
+
+    for (name, path, source) in SOURCES {
+        let module = parse(path, source).expect("should parse");
+        group.throughput(Throughput::Bytes(source.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                lower::lower(black_box(&module.ast), black_box(&module.scopes))
+                    .expect("should lower")
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, frontend, scopes, lowering);
 criterion_main!(benches);

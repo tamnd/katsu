@@ -6,6 +6,7 @@
 
 mod adapter;
 pub mod ast;
+pub mod lower;
 pub mod scope;
 
 use katsu_ir::FunctionBlueprint;
@@ -62,10 +63,14 @@ pub enum ParseError {
     ///
     /// This variant exists so that M0 fails loudly and specifically rather than producing
     /// bytecode that is quietly wrong. It shrinks to nothing over M1.
-    #[error("{path}: {construct} is not lowered yet")]
+    #[error("{path}:{line}:{column}: {construct} is not lowered yet")]
     NotLowered {
         /// The file being lowered.
         path: String,
+        /// One based line.
+        line: u32,
+        /// One based column, counted in characters.
+        column: u32,
         /// What we hit.
         construct: &'static str,
     },
@@ -84,7 +89,7 @@ pub struct ParsedModule {
     pub ast: ast::Module,
     /// Every name in the tree, resolved to a slot.
     pub scopes: scope::Scopes,
-    /// The lowered top level code, empty until lowering lands in M0.
+    /// The lowered top level code, with every function written inside it nested under it.
     pub top_level: FunctionBlueprint,
 }
 
@@ -103,6 +108,31 @@ impl ParsedModule {
 /// The source type is inferred from the path, so a `.ts` file is parsed as TypeScript and
 /// a `.mts` file as an ES module, matching what `spec/04-frontend.md` specifies.
 pub fn parse(path: &str, source: &str) -> Result<ParsedModule, ParseError> {
+    let (ast, scopes) = frontend(path, source)?;
+
+    let top_level = lower::lower(&ast, &scopes).map_err(|error| {
+        let (line, column) = adapter::line_and_column(source, error.span.start);
+        ParseError::NotLowered {
+            path: path.to_owned(),
+            line,
+            column,
+            construct: error.construct,
+        }
+    })?;
+
+    Ok(ParsedModule {
+        path: path.to_owned(),
+        ast,
+        scopes,
+        top_level,
+    })
+}
+
+/// Everything before lowering: parse, adapt the tree, and resolve every name in it.
+///
+/// Split out from `parse` so that scope analysis can be exercised on sources lowering has no
+/// bytecode for yet. A test about where a name lives should not fail because of a missing opcode.
+fn frontend(path: &str, source: &str) -> Result<(ast::Module, scope::Scopes), ParseError> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -128,12 +158,7 @@ pub fn parse(path: &str, source: &str) -> Result<ParsedModule, ParseError> {
         }
     })?;
 
-    Ok(ParsedModule {
-        path: path.to_owned(),
-        ast,
-        scopes,
-        top_level: FunctionBlueprint::default(),
-    })
+    Ok((ast, scopes))
 }
 
 #[cfg(test)]
