@@ -4,7 +4,9 @@
 //! See `spec/05-interpreter.md` for dispatch, `spec/07-object-model.md` for values and
 //! shapes, and `spec/03-architecture.md` for why an isolate is `Send` but not `Sync`.
 
+mod global;
 mod interpret;
+mod native;
 mod number;
 mod stack;
 mod unit;
@@ -15,7 +17,9 @@ use std::fmt;
 use katsu_gc::{Atom, AtomTable, BumpHeap, Cage, CageError, StringRef};
 use katsu_ir::FunctionBlueprint;
 
+pub use global::Globals;
 pub use interpret::{Interpreter, Interrupt, RuntimeError};
+pub use native::{NativeFn, Natives, arg};
 pub use stack::{Frame, Invocation, Stack, StackError};
 pub use unit::{Loaded, Resolved, Unit};
 pub use value::Value;
@@ -52,9 +56,22 @@ pub fn compile(path: &str, source: &str) -> Result<FunctionBlueprint, CompileErr
 /// It owns the cage, the bump heap inside it and the atom table that interns strings into it.
 /// Those three are one unit because an atom is a string in this cage and nothing else, so handing
 /// them out separately would let a caller intern into one heap and read from another.
+///
+/// The globals and the table of functions written in Rust are here for the same reason and for one
+/// more. A global is bound to a name that is a string in this cage, and a native is an ordinal that
+/// means nothing except against this table, so both of them are as tied to this heap as an atom is.
+/// The other reason is size: the dispatch loop holds the isolate behind a pointer precisely so that
+/// what it holds inline stays small, and hanging a hash map and a vector off the isolate rather than
+/// off the interpreter keeps the thing the loop touches every instruction exactly the size it was.
+///
+/// Strictly these two are a realm rather than an isolate, and one isolate can hold several realms
+/// once there is a way to make one. There is not, so a second type today would be a type with one
+/// instance.
 pub struct Isolate {
     heap: BumpHeap,
     atoms: AtomTable,
+    globals: Globals,
+    natives: Natives,
 }
 
 impl fmt::Debug for Isolate {
@@ -62,6 +79,8 @@ impl fmt::Debug for Isolate {
         f.debug_struct("Isolate")
             .field("heap_used", &self.heap.cursor())
             .field("atoms", &self.atoms.len())
+            .field("globals", &self.globals.len())
+            .field("natives", &self.natives)
             .finish()
     }
 }
@@ -77,6 +96,8 @@ impl Isolate {
         Ok(Isolate {
             heap: BumpHeap::new()?,
             atoms: AtomTable::new(),
+            globals: Globals::new(),
+            natives: Natives::new(),
         })
     }
 
@@ -101,6 +122,28 @@ impl Isolate {
     #[must_use]
     pub const fn atoms(&self) -> &AtomTable {
         &self.atoms
+    }
+
+    /// The global bindings, for reading.
+    #[must_use]
+    pub const fn globals(&self) -> &Globals {
+        &self.globals
+    }
+
+    /// The global bindings, for binding something.
+    pub const fn globals_mut(&mut self) -> &mut Globals {
+        &mut self.globals
+    }
+
+    /// The table of functions written in Rust.
+    #[must_use]
+    pub const fn natives(&self) -> &Natives {
+        &self.natives
+    }
+
+    /// The table of functions written in Rust, for adding one.
+    pub const fn natives_mut(&mut self) -> &mut Natives {
+        &mut self.natives
     }
 
     /// Allocate a string, without interning it.

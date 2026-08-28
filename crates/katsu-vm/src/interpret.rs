@@ -24,17 +24,23 @@
 //! a return pops one and puts them back. That is enough for recursion, for a function that reads a
 //! variable from the scope it was written in, and for a function that outlives that scope.
 //!
-//! Globals, property access and method calls are not here. All three need an object with a shape,
-//! and a shape is M1. They reach the same arm at the bottom of the match and produce an error that
+//! Globals are here, and so is the other kind of call: a value can be a function whose body is Rust
+//! rather than bytecode, and calling one leaves the loop, runs the Rust and comes back with a value.
+//! That is the whole of how a program reaches anything the runtime implements for it, and it is why
+//! a global load in front of a call is now a program that runs rather than a program that stops.
+//!
+//! Property access and method calls are not here. Both need an object with properties, and the
+//! object model is M1. They reach the same arm at the bottom of the match and produce an error that
 //! names the opcode, which is a refusal rather than a wrong answer.
 //!
 //! # The one assumption about the heap
 //!
-//! There are three kinds of heap object now, strings, closures and contexts, and the first word of
-//! an object says which. A pointer is no longer self describing, so the two functions that turn a
-//! value into an object, [`Interpreter::as_string`] and [`Interpreter::as_closure`], read that word
-//! before they believe anything. Everywhere else in the loop goes through one of them, which is what
-//! keeps the assumption in two places instead of twenty when shapes arrive.
+//! There are four kinds of heap object now, strings, closures, contexts and natives, and the first
+//! word of an object says which. A pointer is no longer self describing, so the three functions that
+//! turn a value into an object, [`Interpreter::as_string`], [`Interpreter::as_closure`] and
+//! [`Interpreter::as_native`], read that word before they believe anything. Everywhere else in the
+//! loop goes through one of them, which is what keeps the assumption in three places instead of
+//! twenty when shapes arrive.
 
 // Same reason as in `number`. JavaScript equality on numbers is exact IEEE equality, so comparing
 // two doubles with `==` is the specified behaviour and not an oversight.
@@ -44,8 +50,9 @@ use std::cmp::Ordering as Sorting;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use katsu_gc::{ClosureRef, ContextRef, HeapKind, StringRef};
+use katsu_gc::{ClosureRef, ContextRef, HeapKind, NativeRef, StringRef};
 use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
+use smallvec::SmallVec;
 
 use crate::number::{exponentiate, from_string, shift_count, to_int32, to_string, to_uint32};
 use crate::stack::{Invocation, Stack, StackError};
@@ -194,6 +201,64 @@ impl Interpreter {
         self.stack.committed_bytes()
     }
 
+    /// Bind a name in the global scope, creating it or replacing what was there.
+    ///
+    /// This is how anything gets into a program that the program did not write: the builtins, and
+    /// whatever an embedder wants its scripts to be able to reach. The name is interned, so a later
+    /// mention of the same text in a source file finds this binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the name cannot be interned.
+    pub fn define_global(&mut self, name: &str, value: Value) -> Result<(), RuntimeError> {
+        let key = self.isolate.intern(name).ok_or(RuntimeError::OutOfMemory)?;
+        self.isolate.globals_mut().set(key.as_string(), value);
+        Ok(())
+    }
+
+    /// What `name` is bound to in the global scope, or `None` if nothing is.
+    ///
+    /// Takes `&mut self` because looking a name up means interning it, and interning allocates. That
+    /// is the price of names being addresses, and it is paid by the caller that asks a question in
+    /// text rather than by every load in the dispatch loop.
+    pub fn global(&mut self, name: &str) -> Option<Value> {
+        let key = self.isolate.intern(name)?;
+        self.isolate.globals().get(key.as_string())
+    }
+
+    /// Make a function value whose body is Rust, without binding it to anything.
+    ///
+    /// For a native that belongs somewhere other than the global scope, which from M0's point of
+    /// view means a method on a host object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap is full or the table is somehow full.
+    pub fn native_function(
+        &mut self,
+        name: &str,
+        call: crate::NativeFn,
+    ) -> Result<Value, RuntimeError> {
+        let ordinal = self
+            .isolate
+            .natives_mut()
+            .add(name, call)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let native =
+            NativeRef::new(self.isolate.heap_mut(), ordinal).ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(native.slot(), self.isolate.cage()))
+    }
+
+    /// Make a function written in Rust and bind it in the global scope under the same name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpreter::native_function`] and [`Interpreter::define_global`].
+    pub fn define_native(&mut self, name: &str, call: crate::NativeFn) -> Result<(), RuntimeError> {
+        let value = self.native_function(name, call)?;
+        self.define_global(name, value)
+    }
+
     /// Render a value as text, the way `console.log` prints it at the top level.
     ///
     /// A value on its own means nothing, because a string is an address into this interpreter's
@@ -209,6 +274,9 @@ impl Interpreter {
         }
         if let Some(closure) = self.as_closure(value) {
             return self.function_text(closure);
+        }
+        if let Some(native) = self.as_native(value) {
+            return self.native_text(native);
         }
         Self::primitive_text(value)
     }
@@ -563,6 +631,38 @@ impl Interpreter {
                     }
                 }
 
+                // A name nothing lexical claimed. The constant is already interned, because the
+                // whole pool was interned when the unit was loaded, so the lookup is a hash of four
+                // bytes rather than of the text.
+                Op::LoadGlobal { dst, name, .. } => {
+                    let key = self.name_at(constants, name);
+                    let Some(value) = self.isolate.globals().get(key) else {
+                        return Err(RuntimeError::Reference(format!(
+                            "{} is not defined",
+                            Self::constant_name(blueprint, name)
+                        )));
+                    };
+                    self.stack.set(dst, value);
+                }
+
+                // The one read in the language that is allowed to miss. `typeof nothing` is
+                // `"undefined"` and not a `ReferenceError`, which is why this cannot be the load
+                // above with a `TypeOf` after it.
+                Op::LoadGlobalForTypeof { dst, name, .. } => {
+                    let key = self.name_at(constants, name);
+                    let value = self.isolate.globals().get(key).unwrap_or(Value::UNDEFINED);
+                    self.stack.set(dst, value);
+                }
+
+                // This creates the binding if there was not one, which is what an assignment to an
+                // undeclared name does in sloppy mode. Strict mode throws instead, and that is a
+                // check for the day lowering tells the interpreter which mode it is in.
+                Op::StoreGlobal { name, src, .. } => {
+                    let key = self.name_at(constants, name);
+                    let value = self.stack.get(src);
+                    self.isolate.globals_mut().set(key, value);
+                }
+
                 Op::Call {
                     dst,
                     callee,
@@ -572,6 +672,16 @@ impl Interpreter {
                 } => {
                     let target = self.stack.get(callee);
                     let Some(closure) = self.as_closure(target) else {
+                        // A call that leaves the loop entirely, which is how anything the runtime
+                        // implements in Rust gets reached. It is here rather than in its own opcode
+                        // because a program cannot tell the two apart: `print` is a value that was
+                        // called, and which language its body is written in is not something the
+                        // call site knows.
+                        if let Some(native) = self.as_native(target) {
+                            let value = self.call_native(native, args, argc)?;
+                            self.stack.set(dst, value);
+                            continue;
+                        }
                         // Node names the expression that was called and this names the value it
                         // produced, so `x()` on a five reports `5 is not a function` where Node
                         // reports `x is not a function`. Naming the expression means keeping the
@@ -688,6 +798,20 @@ impl Interpreter {
         )
     }
 
+    /// The error for a native object pointing at a table entry that is not there.
+    ///
+    /// Not reachable either. The table only grows and the only way to get one of these objects is to
+    /// add an entry first, so this means the value came from another isolate's heap, which the type
+    /// system already works to prevent. It is an error for the same reason as
+    /// [`Interpreter::broken_environment`]: reporting a runtime bug is better than aborting on it.
+    fn broken_native() -> RuntimeError {
+        RuntimeError::Type(
+            "a native function pointed at nothing, which is a bug in katsu rather than in this \
+             program"
+                .to_owned(),
+        )
+    }
+
     /// The error for a function whose code is longer than a return address can name.
     ///
     /// Four billion instructions in one function. Lowering would run out of memory long before a
@@ -708,8 +832,61 @@ impl Interpreter {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
             HeapKind::Closure => ClosureRef::from_slot(slot),
-            HeapKind::String | HeapKind::Context => None,
+            HeapKind::String | HeapKind::Context | HeapKind::Native => None,
         }
+    }
+
+    /// The one place a value becomes a function written in Rust.
+    ///
+    /// Only ever asked after [`Interpreter::as_closure`] has already said no, because a call to a
+    /// function written in JavaScript is the common case by a wide margin and it should not pay for
+    /// a second kind check to find that out.
+    fn as_native(&self, value: Value) -> Option<NativeRef> {
+        let slot = value.to_slot(self.isolate.cage())?;
+        match HeapKind::of(self.isolate.cage(), slot)? {
+            HeapKind::Native => NativeRef::from_slot(slot),
+            HeapKind::String | HeapKind::Closure | HeapKind::Context => None,
+        }
+    }
+
+    /// Leave the dispatch loop and run some Rust.
+    ///
+    /// The arguments are copied out of the caller's registers before the call, because the native
+    /// takes the whole interpreter and cannot be holding a slice of the stack while it does. Eight
+    /// fit without allocating, which is more than any builtin takes, and the copy is what makes the
+    /// difference between a native that can allocate and one that cannot.
+    ///
+    /// No frame is pushed. A native does not use registers and cannot yet call back into
+    /// JavaScript, so a frame would be a push and a pop that nothing reads. What it costs is that a
+    /// native is invisible to `depth` and will be invisible in a stack trace, and the note in
+    /// `native.rs` says so.
+    fn call_native(
+        &mut self,
+        native: NativeRef,
+        first: Register,
+        count: u16,
+    ) -> Result<Value, RuntimeError> {
+        let ordinal = native.ordinal(self.isolate.cage());
+        let Some(call) = self.isolate.natives().get(ordinal) else {
+            return Err(Self::broken_native());
+        };
+        let arguments: SmallVec<[Value; 8]> = SmallVec::from_slice(self.stack.range(first, count));
+        call(self, &arguments)
+    }
+
+    /// The interned name a name operand holds.
+    ///
+    /// Both halves of this are guaranteed by something that already ran. The index is inside the
+    /// pool because the verifier checked every constant index, and the constant is an interned
+    /// string because lowering only puts a name in a name operand and `load` interned every string
+    /// in the pool. Neither is a thing a program can cause, so both are `expect` rather than an
+    /// error a caller would have no way to act on.
+    fn name_at(&self, constants: &[Value], index: katsu_ir::ConstIndex) -> StringRef {
+        let value = *constants
+            .get(index.0 as usize)
+            .expect("verify checked every constant index against the pool");
+        self.as_string(value)
+            .expect("a name operand holds a string, and load interned every string in the pool")
     }
 
     /// The text `console.log` prints for a function, which is what Node prints for one.
@@ -728,6 +905,23 @@ impl Interpreter {
                 "[Function: {}]",
                 name.to_utf8_lossy(self.isolate.cage()).into_owned()
             ),
+            None => "[Function (anonymous)]".to_owned(),
+        }
+    }
+
+    /// The text `console.log` prints for a function written in Rust.
+    ///
+    /// The same shape Node prints, because in Node these are the same thing: `console.log` is
+    /// written in C++ over there and prints as `[Function: log]` all the same. A native whose
+    /// ordinal has no entry prints as anonymous rather than panicking, because a broken print is a
+    /// bad way to find out about a broken table.
+    fn native_text(&self, native: NativeRef) -> String {
+        match self
+            .isolate
+            .natives()
+            .name(native.ordinal(self.isolate.cage()))
+        {
+            Some(name) => format!("[Function: {name}]"),
             None => "[Function (anonymous)]".to_owned(),
         }
     }
@@ -754,7 +948,7 @@ impl Interpreter {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
             HeapKind::String => StringRef::from_slot(slot),
-            HeapKind::Closure | HeapKind::Context => None,
+            HeapKind::Closure | HeapKind::Context | HeapKind::Native => None,
         }
     }
 
@@ -831,7 +1025,7 @@ impl Interpreter {
             .and_then(|slot| HeapKind::of(self.isolate.cage(), slot));
         match kind {
             Some(HeapKind::String) => "string",
-            Some(HeapKind::Closure) => "function",
+            Some(HeapKind::Closure | HeapKind::Native) => "function",
             Some(HeapKind::Context) | None => "object",
         }
     }
@@ -2818,6 +3012,183 @@ mod tests {
             ),
             "a [Function: greet]"
         );
+    }
+
+    /// A native that adds up whatever it was passed.
+    ///
+    /// Variadic on purpose, so that one function can show that the arguments arrive, that they
+    /// arrive in order, and that a call passing none of them is a call and not a crash.
+    ///
+    /// The `Result` is the signature rather than something this one uses, which is true of plenty of
+    /// real builtins as well.
+    #[allow(clippy::unnecessary_wraps)]
+    fn sum(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+        let total: f64 = args.iter().map(|value| interpreter.number(*value)).sum();
+        Ok(Value::from_f64(total))
+    }
+
+    /// A native that prints its first argument and hands the text back as a string.
+    ///
+    /// The one that proves a native can do the two things a native exists to do: look at a value it
+    /// was given, and allocate a new one in the heap it was handed.
+    fn text_of(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+        let text = interpreter.display(crate::arg(args, 0));
+        interpreter.intern(&text)
+    }
+
+    /// A native that throws, because Rust code is allowed to fail the same way an opcode is.
+    fn boom(_: &mut Interpreter, _: &[Value]) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::Type("boom".to_owned()))
+    }
+
+    /// An interpreter with something in its global scope: three natives and one value that is not
+    /// callable, which is what a call to it has to complain about.
+    fn realm() -> Interpreter {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        interpreter
+            .define_global("answer", Value::from_i32(42))
+            .expect("should have room");
+        interpreter
+            .define_native("sum", sum)
+            .expect("should have room");
+        interpreter
+            .define_native("text", text_of)
+            .expect("should have room");
+        interpreter
+            .define_native("boom", boom)
+            .expect("should have room");
+        interpreter
+    }
+
+    /// Run a program in that realm and hand back the value of its last expression.
+    fn in_realm(source: &str) -> Result<Value, RuntimeError> {
+        realm().run(&as_expression(source))
+    }
+
+    #[track_caller]
+    fn in_realm_number(source: &str) -> f64 {
+        in_realm(source)
+            .expect("should not throw")
+            .as_f64()
+            .expect("should produce a number")
+    }
+
+    /// Run a program in that realm and print what its last expression produced.
+    #[track_caller]
+    fn in_realm_display(source: &str) -> String {
+        let blueprint = as_expression(source);
+        let mut interpreter = realm();
+        let value = interpreter.run(&blueprint).expect("should not throw");
+        interpreter.display(value)
+    }
+
+    #[test]
+    fn a_name_the_embedder_bound_is_a_name_the_program_can_read() {
+        assert_eq!(in_realm_number("answer"), 42.0);
+    }
+
+    #[test]
+    fn a_name_nobody_bound_is_a_reference_error_that_says_which_name() {
+        assert_eq!(
+            in_realm("missing"),
+            Err(RuntimeError::Reference("missing is not defined".to_owned()))
+        );
+    }
+
+    #[test]
+    fn typeof_a_name_nobody_bound_is_undefined_rather_than_an_error() {
+        // The one read in the language that is allowed to miss, which is why it is its own opcode
+        // rather than a load with a `typeof` after it. If this ever throws, that opcode has been
+        // merged with the one above it by somebody who did not know why they were separate.
+        assert_eq!(in_realm_display("typeof missing"), "undefined");
+        assert_eq!(in_realm_display("typeof answer"), "number");
+    }
+
+    #[test]
+    fn assigning_to_a_name_nobody_declared_creates_a_global() {
+        // Sloppy mode, which is what a script is until lowering can say otherwise. Strict mode
+        // throws here instead, and that is the check waiting for a strict flag to check.
+        assert_eq!(in_realm_number("undeclared = 7; undeclared"), 7.0);
+    }
+
+    #[test]
+    fn a_global_written_over_reads_back_as_the_new_value() {
+        assert_eq!(in_realm_number("answer = 1; answer"), 1.0);
+    }
+
+    #[test]
+    fn the_same_name_in_two_places_reaches_one_binding() {
+        // What interning buys. The `answer` in the function body and the `answer` at the top level
+        // are two mentions in two constant pools, and they have to be the same address or the
+        // lookup is a text comparison in disguise.
+        assert_eq!(
+            in_realm_number("function get() { return answer; } answer = 9; get()"),
+            9.0
+        );
+    }
+
+    #[test]
+    fn a_native_is_called_with_the_arguments_the_call_site_passed() {
+        assert_eq!(in_realm_number("sum(1, 2, 3)"), 6.0);
+    }
+
+    #[test]
+    fn a_native_called_with_nothing_is_called_with_nothing() {
+        // Not with a slice of `undefined` padding, which is the thing a native that did not check
+        // its own length would rather have. The comment in `native.rs` says why the padding is the
+        // caller's job and this is the test that holds it to it.
+        assert_eq!(in_realm_number("sum()"), 0.0);
+    }
+
+    #[test]
+    fn a_native_can_read_a_value_and_allocate_a_new_one() {
+        assert_eq!(in_realm_display("text(1 + 1)"), "2");
+        assert_eq!(in_realm_display("text('katsu')"), "katsu");
+    }
+
+    #[test]
+    fn a_native_called_from_inside_a_function_reads_that_frame_registers() {
+        // The arguments come out of the running frame, so a native called from the top level and a
+        // native called from three frames down have to see the same thing.
+        assert_eq!(
+            in_realm_number("function twice(n) { return sum(n, n); } twice(4)"),
+            8.0
+        );
+    }
+
+    #[test]
+    fn a_native_that_throws_stops_the_program_the_way_an_opcode_would() {
+        assert_eq!(
+            in_realm("boom()"),
+            Err(RuntimeError::Type("boom".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_native_is_a_function_and_prints_like_one() {
+        // Which is what Node prints for its own natives, because over there `console.log` is C++ and
+        // still prints as `[Function: log]`.
+        assert_eq!(in_realm_display("typeof sum"), "function");
+        assert_eq!(in_realm_display("sum"), "[Function: sum]");
+    }
+
+    #[test]
+    fn calling_a_global_that_is_not_a_function_says_so() {
+        assert_eq!(
+            in_realm("answer()"),
+            Err(RuntimeError::Type("42 is not a function".to_owned()))
+        );
+    }
+
+    #[test]
+    fn what_was_bound_can_be_read_back_by_name() {
+        // The embedder's half of the same table, which is how a test asserts on a global a program
+        // wrote rather than on one it returned.
+        let blueprint = as_expression("undeclared = 3; undeclared");
+        let mut interpreter = realm();
+        interpreter.run(&blueprint).expect("should not throw");
+        assert_eq!(interpreter.global("undeclared"), Some(Value::from_i32(3)));
+        assert_eq!(interpreter.global("nothing"), None);
     }
 
     // The binary operators as functions, so that a table driven test can name one without writing

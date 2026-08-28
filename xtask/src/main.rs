@@ -250,15 +250,17 @@ fn bench(args: &BenchArgs) -> Result<()> {
         );
     }
 
-    let filter_arg = if filter.is_empty() {
-        String::new()
-    } else {
-        format!(" -- {filter}")
-    };
+    // A filter is a regex, so the useful ones contain `|`, and a remote run is a line of shell
+    // rather than an argument vector. Quoting is each script's own job below. What cannot be
+    // quoted safely on both sides is a quote character itself, so that is refused here instead of
+    // being mangled into a filter that silently matches something else.
+    if filter.contains('"') {
+        bail!("a benchmark filter cannot contain a double quote, and {filter} does");
+    }
     let script = if machine.windows {
-        windows_script(machine, &commit, &args.package, &filter_arg)
+        windows_script(machine, &commit, &args.package, filter)
     } else {
-        unix_script(machine, &commit, &args.package, &filter_arg)
+        unix_script(machine, &commit, &args.package, filter)
     };
 
     eprintln!(
@@ -269,10 +271,18 @@ fn bench(args: &BenchArgs) -> Result<()> {
 }
 
 /// The bash side of a remote run.
-fn unix_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
+fn unix_script(machine: &Machine, commit: &str, package: &str, filter: &str) -> String {
     let pin = machine
         .pin
         .map_or(String::new(), |core| format!("taskset -c {core} "));
+    // Single quotes, because a filter is a regex and bash would read the `|` in one as a pipeline.
+    // The escape is the standard one for closing the quote, adding a literal quote and opening
+    // again, which is the only way to get a quote inside single quotes in bash.
+    let filter_arg = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" -- '{}'", filter.replace('\'', "'\\''"))
+    };
     format!(
         "set -e\n\
          export PATH=\"$HOME/.cargo/bin:$PATH\"\n\
@@ -297,12 +307,26 @@ fn unix_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str)
 /// a process from the outside before it starts, and the mask is inherited by the benchmark binary
 /// cargo spawns. `/wait /b` keeps it in this console so its output comes back over ssh instead of
 /// opening a window on somebody's desktop.
-fn windows_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
-    let bench = format!("cargo bench -p {package}{filter_arg}");
-    let pinned = match machine.pin {
-        Some(mask) => format!("cmd /c \"start /wait /b /affinity {mask:x} cmd /c {bench}\""),
-        None => bench,
+///
+/// The cargo line goes into a batch file rather than into that command directly. A filter is a
+/// regex with a `|` in it, the pinned form nests cmd inside cmd inside PowerShell, and cmd's rule
+/// for which layer strips which quotes is not something to rely on three levels deep. Inside a
+/// batch file a double quoted argument is passed through untouched, which is all we need.
+fn windows_script(machine: &Machine, commit: &str, package: &str, filter: &str) -> String {
+    let filter_arg = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" -- \"{filter}\"")
     };
+    // The batch file's one line is built as a PowerShell single quoted string, where the only
+    // character with a meaning is the quote itself, and a doubled quote is a literal one.
+    let path = r"C:\katsu-bench-checkout\bench.cmd";
+    let line = format!("cargo bench -p {package}{filter_arg}").replace('\'', "''");
+    let run = match machine.pin {
+        Some(mask) => format!("cmd /c \"start /wait /b /affinity {mask:x} cmd /c {path}\""),
+        None => format!("cmd /c {path}"),
+    };
+    let pinned = format!("Set-Content -Path {path} -Encoding ASCII -Value '{line}'\n{run}");
     format!(
         // Progress records come back over ssh as raw CLIXML in the middle of the results, so
         // they are turned off rather than filtered out afterwards.
@@ -516,20 +540,50 @@ mod tests {
     #[test]
     fn each_script_pins_the_way_its_platform_pins() {
         let linux = machine("gamingpc").unwrap();
-        let script = unix_script(linux, "abc123", "katsu-gc", " -- allocate");
-        assert!(script.contains("taskset -c 4 cargo bench -p katsu-gc -- allocate"));
+        let script = unix_script(linux, "abc123", "katsu-gc", "allocate");
+        assert!(script.contains("taskset -c 4 cargo bench -p katsu-gc -- 'allocate'"));
         assert!(script.contains("git checkout -q --detach abc123"));
 
         let windows = machine("gamingpc-win").unwrap();
-        let script = windows_script(windows, "abc123", "katsu-gc", " -- allocate");
+        let script = windows_script(windows, "abc123", "katsu-gc", "allocate");
         // The mask is hexadecimal because that is what `start /affinity` reads it as, and 3 is
         // the two threads of the first performance core.
-        assert!(script.contains("start /wait /b /affinity 3 cmd /c cargo bench -p katsu-gc"));
+        assert!(
+            script.contains(r"start /wait /b /affinity 3 cmd /c C:\katsu-bench-checkout\bench.cmd")
+        );
         assert!(script.contains("git checkout -q --detach abc123"));
         assert!(
             !script.contains("taskset"),
             "the windows script should not be reaching for a linux tool"
         );
+    }
+
+    #[test]
+    fn a_filter_reaches_the_remote_as_one_argument_and_not_as_a_pipeline() {
+        // Every useful criterion filter is a regex with a `|` in it, and both remote scripts are
+        // a line of shell rather than an argument vector. An unquoted one was read as a pipeline,
+        // which piped cargo into a program named after the second half of the filter and reported
+        // the result as a broken pipe.
+        let linux = unix_script(machine("gamingpc").unwrap(), "abc123", "katsu-vm", "a|b");
+        assert!(linux.contains("cargo bench -p katsu-vm -- 'a|b'"));
+
+        let windows = windows_script(
+            machine("gamingpc-win").unwrap(),
+            "abc123",
+            "katsu-vm",
+            "a|b",
+        );
+        assert!(windows.contains(r#"-Value 'cargo bench -p katsu-vm -- "a|b"'"#));
+    }
+
+    #[test]
+    fn an_empty_filter_runs_every_benchmark_in_the_package() {
+        let linux = unix_script(machine("gamingpc").unwrap(), "abc123", "katsu-vm", "");
+        assert!(linux.contains("cargo bench -p katsu-vm\n"));
+        assert!(!linux.contains(" -- "));
+
+        let windows = windows_script(machine("gamingpc-win").unwrap(), "abc123", "katsu-vm", "");
+        assert!(windows.contains("-Value 'cargo bench -p katsu-vm'"));
     }
 
     #[test]

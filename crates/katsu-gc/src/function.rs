@@ -1,12 +1,12 @@
-//! The two objects a function call needs: a closure and an environment.
+//! The objects a function call needs: a closure, an environment, and a function written in Rust.
 //!
 //! Until this file existed, every pointer in the cage was a string, and the interpreter said so out
 //! loud in one place so that the day it stopped being true there was one thing to change rather
 //! than twenty. This is that day. A closure and a context are the second and third kinds of object
-//! the heap holds, and the first question anything with a pointer now has to ask is which of the
-//! three it is looking at.
+//! the heap holds, a native is the fourth, and the first question anything with a pointer now has to
+//! ask is which of them it is looking at.
 //!
-//! # How the three are told apart
+//! # How they are told apart
 //!
 //! Every object in the cage starts with the same word, which `spec/07-object-model.md` calls the
 //! shape reference and which is where the map pointer goes when maps exist in M1. It is a [`Slot`],
@@ -44,7 +44,7 @@ const KIND_OFFSET: usize = 0;
 
 /// What kind of object a pointer in the cage points at.
 ///
-/// Three today, and the enum is deliberately not exhaustive over what M1 adds, because the point of
+/// Four today, and the enum is deliberately not exhaustive over what M1 adds, because the point of
 /// it is to answer the question the interpreter actually asks: is this a string, is it callable, or
 /// is it something the caller has no arm for yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,8 @@ pub enum HeapKind {
     Closure,
     /// One level of environment, holding the variables a nested function captured.
     Context,
+    /// A function whose body is Rust rather than bytecode.
+    Native,
 }
 
 impl HeapKind {
@@ -67,6 +69,7 @@ impl HeapKind {
             HeapKind::String => 0,
             HeapKind::Closure => 1,
             HeapKind::Context => 2,
+            HeapKind::Native => 3,
         };
         // `from_smi` cannot fail for a number this small, and `expect` is not const, so the shift is
         // spelled out. It is the same shift `Slot::from_smi` performs.
@@ -88,6 +91,7 @@ impl HeapKind {
             0 => Some(HeapKind::String),
             2 => Some(HeapKind::Closure),
             4 => Some(HeapKind::Context),
+            6 => Some(HeapKind::Native),
             _ => None,
         }
     }
@@ -190,6 +194,81 @@ impl ClosureRef {
     #[must_use]
     pub fn from_slot(slot: Slot) -> Option<ClosureRef> {
         slot.is_pointer().then_some(ClosureRef(slot))
+    }
+
+    fn offset(self) -> u32 {
+        self.0.as_offset().unwrap_or(0)
+    }
+}
+
+/// Bytes in a native: the kind tag and the ordinal.
+///
+/// Eight exactly, which is the smallest an object in this heap can be, and there is nothing else to
+/// put in it. A native has no captured environment because Rust code closes over nothing, and no
+/// name here because the name is in the same table the code is in.
+const NATIVE_SIZE: usize = 8;
+/// Which entry in the isolate's table of Rust functions this native calls.
+const ORDINAL_OFFSET: usize = 4;
+
+/// A function whose body is Rust: an ordinal into the table of them the isolate holds.
+///
+/// The code pointer is not in here, and that is the whole design of this object. A function pointer
+/// is eight bytes and everything in the cage that refers to anything is four, so putting one in
+/// would either widen every reference or need its own encoding. It is also a pointer into the text
+/// segment sitting in a data heap, which every collector, every snapshot and every AOT image would
+/// then have to know about and fix up. An ordinal has none of those properties: it is a small
+/// integer that means the same thing in any process that has the same table, and looking a function
+/// up by it is one bounds checked index on a path that is about to make a Rust call anyway.
+///
+/// The name is in the table for the same reason. A closure keeps its own name because the unit that
+/// compiled it can be dropped while the value lives on, so there would be nothing left to ask. A
+/// native cannot outlive its table: the table is in the isolate that owns the cage the native is
+/// allocated in, so anything holding this reference can reach the name already.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeRef(Slot);
+
+impl std::fmt::Debug for NativeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native@{:?}", self.0)
+    }
+}
+
+impl NativeRef {
+    /// Stamp out a native calling entry `ordinal` of the isolate's table.
+    ///
+    /// Returns `None` if the heap is full.
+    #[must_use]
+    pub fn new(heap: &mut BumpHeap, ordinal: u32) -> Option<NativeRef> {
+        let pointer = heap.allocate(NATIVE_SIZE, ObjectKind::Native)?;
+        let slot = slot_of(heap.cage(), pointer)?;
+        // SAFETY: the allocation is `NATIVE_SIZE` bytes of freshly committed memory that nothing else
+        // holds a reference to, and both writes are inside it.
+        unsafe {
+            write_u32(pointer, KIND_OFFSET, HeapKind::Native.tag());
+            write_u32(pointer, ORDINAL_OFFSET, ordinal);
+        }
+        Some(NativeRef(slot))
+    }
+
+    /// Which entry in the table this native calls.
+    #[must_use]
+    pub fn ordinal(self, cage: &Cage) -> u32 {
+        // SAFETY: the slot points at a native, which is `NATIVE_SIZE` bytes long.
+        unsafe { read_u32(cage, self.offset(), ORDINAL_OFFSET) }
+    }
+
+    /// The slot this native lives at.
+    #[must_use]
+    pub const fn slot(self) -> Slot {
+        self.0
+    }
+
+    /// Read a native back out of a slot, or `None` if the slot is not a pointer.
+    ///
+    /// As with [`ClosureRef::from_slot`], the kind is not rechecked here.
+    #[must_use]
+    pub fn from_slot(slot: Slot) -> Option<NativeRef> {
+        slot.is_pointer().then_some(NativeRef(slot))
     }
 
     fn offset(self) -> u32 {
@@ -395,7 +474,7 @@ unsafe fn read_u64(base: *mut u8, at: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClosureRef, ContextRef, HeapKind};
+    use super::{ClosureRef, ContextRef, HeapKind, NativeRef};
     use crate::bump::BumpHeap;
     use crate::string::StringRef;
 
@@ -419,11 +498,12 @@ mod tests {
     }
 
     #[test]
-    fn the_three_kinds_are_told_apart() {
+    fn the_four_kinds_are_told_apart() {
         let mut heap = heap();
         let string = StringRef::from_str(&mut heap, "katsu").expect("should have room");
         let context = ContextRef::new(&mut heap, None, 2, EMPTY).expect("should have room");
         let closure = ClosureRef::new(&mut heap, 7, Some(context), None).expect("should have room");
+        let native = NativeRef::new(&mut heap, 3).expect("should have room");
         assert_eq!(
             HeapKind::of(heap.cage(), string.slot()),
             Some(HeapKind::String)
@@ -436,6 +516,33 @@ mod tests {
             HeapKind::of(heap.cage(), closure.slot()),
             Some(HeapKind::Closure)
         );
+        assert_eq!(
+            HeapKind::of(heap.cage(), native.slot()),
+            Some(HeapKind::Native)
+        );
+    }
+
+    #[test]
+    fn a_native_remembers_which_entry_it_calls() {
+        let mut heap = heap();
+        let first = NativeRef::new(&mut heap, 0).expect("should have room");
+        let later = NativeRef::new(&mut heap, 41).expect("should have room");
+        assert_eq!(first.ordinal(heap.cage()), 0);
+        assert_eq!(later.ordinal(heap.cage()), 41);
+    }
+
+    #[test]
+    fn a_native_costs_eight_bytes_and_wastes_none_of_them() {
+        // The smallest object this heap can hand out, and the reason the name and the code pointer
+        // are both in the table rather than in here. If this ever needs a third word, the tradeoff
+        // in the doc above has to be made again rather than assumed.
+        use crate::bump::ObjectKind;
+        let mut heap = heap();
+        NativeRef::new(&mut heap, 0).expect("should have room");
+        let totals = heap.census().totals(ObjectKind::Native);
+        assert_eq!(totals.count, 1);
+        assert_eq!(totals.requested_bytes, 8);
+        assert_eq!(totals.reserved_bytes, 8);
     }
 
     #[test]
