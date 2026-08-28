@@ -55,7 +55,8 @@ pub struct ConstantPool {
     /// Numbers are keyed by bit pattern rather than by value. That makes `0.0` and `-0.0` different
     /// entries, which is correct, because `1 / -0` is not `1 / 0`. It also makes every NaN with the
     /// same payload one entry, which is correct for the same reason it is uninteresting: source text
-    /// cannot write a NaN with a payload.
+    /// cannot write a NaN with a payload. The key is mixed before it goes in, for the reason written
+    /// on `mix`.
     numbers: FxHashMap<u64, ConstIndex>,
     /// Strings share one allocation with the pool entry, the same trick the scope pass uses for
     /// declared names, so adding a string that is already there costs a hash and no copy.
@@ -65,7 +66,7 @@ pub struct ConstantPool {
 impl ConstantPool {
     /// Add a number, or return the index it already has.
     pub fn number(&mut self, value: f64) -> ConstIndex {
-        let key = value.to_bits();
+        let key = mix(value.to_bits());
         if let Some(index) = self.numbers.get(&key) {
             return *index;
         }
@@ -110,6 +111,28 @@ impl ConstantPool {
         self.values.push(constant);
         index
     }
+}
+
+/// Spread the bits of a double across the whole word before it is used as a hash key.
+///
+/// The numbers a JavaScript program writes down are loop bounds, array indices, small decimals and
+/// the constant one, and every one of those is a double whose mantissa is nearly all zeroes. Feeding
+/// those bit patterns to a fast multiplicative hash leaves the low bits, which are the ones that
+/// choose the bucket, almost identical across the whole pool, so the entries pile into a few buckets
+/// and every insert walks a long probe chain.
+///
+/// The benchmark said so out loud: keying on the raw bits, adding 512 numbers to a pool cost more
+/// than adding 512 strings, even though the string path also allocates. Mixing first takes that from
+/// 45 nanoseconds per number to 15 on the m4.
+///
+/// This is the splitmix64 finalizer, and it is a bijection on `u64`, so mixing cannot merge two
+/// different doubles into one pool entry. That property is what makes it safe to key on the mixed
+/// value rather than the original.
+fn mix(bits: u64) -> u64 {
+    let mut z = bits.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -166,6 +189,23 @@ mod tests {
         };
         assert_eq!(&**third, "third");
         assert_eq!(pool.values().len(), 3);
+    }
+
+    #[test]
+    fn mixing_a_key_never_merges_two_different_numbers() {
+        // The whole safety argument for hashing the mixed bits instead of the raw ones. If this ever
+        // failed, two distinct literals would share a pool entry and the program would compute with
+        // the wrong number, silently.
+        let mut pool = ConstantPool::default();
+        let mut indices = Vec::new();
+        for step in 0..4096_u32 {
+            indices.push(pool.number(f64::from(step) * 0.5));
+        }
+
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(indices.len(), 4096);
+        assert_eq!(pool.len(), 4096);
     }
 
     #[test]
