@@ -71,6 +71,9 @@ criterion = "0.8.2"
 hdrhistogram = "7.6.0"
 rayon = "1.12.0"
 sysinfo = "0.39.6"
+# Test only. `katsu check` searches upward through directories for a project, and asserting on that
+# search means building a directory tree that goes away again whether the test passes or panics.
+tempfile = "3.24.0"
 tabled = "0.21.0"
 walkdir = "2.5.0"
 
