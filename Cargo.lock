@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "differential"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "katsu"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-aot"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "katsu-ir",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-api"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-builtins",
  "katsu-jit",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-builtins"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-vm",
  "regress",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-gc"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "katsu-platform",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-ir"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "bitflags",
  "criterion",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-jit"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-ir",
  "katsu-platform",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-loop"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-vm",
  "thiserror",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-macros"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-node"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-api",
  "thiserror",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-parse"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "katsu-ir",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-platform"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "libc",
  "memmap2",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-runtime"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-api",
  "katsu-macros",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-stencils"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "katsu-ir",
  "katsu-platform",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "katsu-vm"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "katsu-gc",
@@ -1542,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "test262-runner"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.6"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -2,6 +2,46 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.0
+
+The first minor release, because M0 is done. Every box on the milestone is ticked: a parser, a bytecode compiler, an interpreter, a value representation, a heap, a command line, and now the two things that tell us whether any of it is right.
+
+M0 was never about features. It is the skeleton the rest of the project hangs on, and the question it had to answer is whether the shape is one that can carry a JIT, an ahead of time compiler and a Node compatible surface without being torn up. Three pull requests since 0.0.6 turned that from an opinion into a measurement.
+
+### Conformance has a number
+
+The test262 runner is wired up and reports 6.65%, in #44. That is 5,405 cases of the 81,225 it attempted, and the number is small for a reason that is worth reading before drawing anything from it: 75,804 of the cases it could not run stop at the same `switch` statement in the suite's own `harness/assert.js`, so most of the suite is not being attempted rather than being failed. One missing statement form is standing in front of five sixths of the suite.
+
+The expectations file is checked in, so a case that starts passing and a case that stops passing are both a diff rather than a number moving. That matters more than the percentage does, because the percentage is going to move in jumps as language features land and a jump tells you nothing about what quietly broke on the way.
+
+### The differential harness, and the four bugs it found
+
+The plan in the milestone was to run the interpreter against itself. That would have found nothing, because with one tier the only thing a comparison against yourself can catch is nondeterminism. So the harness in #45 uses node as the oracle instead, which is the thing we have to agree with anyway, and tier against tier goes in when there is a second tier in M6.
+
+It generates seeded programs from a small grammar, runs them under both engines, and compares what came out. Three decisions do most of the work. A construct we have not implemented is a third verdict rather than a disagreement, so the untested count reads as a work list instead of a pile of bugs. Errors compare on the constructor name and not the message, because the standard says which error is thrown and says nothing about what it says. Two engines both refusing to parse is agreement, which was the surprise, because node's syntax error starts with the path of the temporary file it was handed and comparing that text reported a divergence on every program either engine rejected.
+
+On its first thousand programs it found three real bugs, none of which any test in the repository was going to reach.
+
+`undefined` was not a binding at all, and neither were `NaN` and `Infinity`. They are properties of the global object rather than keywords, and the reason nothing noticed is that `typeof` of a name nobody bound returns "undefined" rather than throwing, so the two ways of asking agreed for the wrong reason.
+
+`console.log(-0)` printed `0`. The fix goes in the inspection path and deliberately not in the string coercion path, because `String(-0)` really is `"0"` and only the console is supposed to tell the two zeroes apart.
+
+`v = 1.5 && ("x" + v)` answered `x1.5` instead of `x3`. Lowering passed the destination register down into an operand of a short circuiting operator, which overwrites the variable before the right hand side reads it. The module doc states the rule that forbids exactly this, three comments above the arm that broke it, and the compound assignment form one arm over was correct.
+
+A longer run then found a fourth, in #46, and it is the one that makes the case for the whole exercise. `9007199254740993 / 10` printed `900719925474099.3` where node prints `900719925474099.2`. Both are the shortest form and both read back as the same double, which is exactly `900719925474099.25`, so the two candidates are equally far away. The standard says take the even one in that case and Rust takes the larger one. About five percent of doubles are in that family. Nothing about it is findable by reading, and a hand written test only catches it if whoever wrote the test already knew the rule, in which case they would have implemented it.
+
+Two thousand generated programs run against node on every commit now, as a CI job of its own so a divergence is not buried in a test log. A divergence arrives shrunk to the statements that still reproduce it, with the seed to get it back.
+
+### Where the numbers stand
+
+Nothing in the performance picture changed this release, because nothing this release was about performance. Hello world still starts in 1.55 ms on `m4` against 24.63 ms for node, still in 2.44 MiB against 48.14 MiB, and those figures still mean what 0.0.6 said they mean, which is that we are ahead because we do less rather than because we are better.
+
+What is different is that there is now a floor under the correctness side. Two thousand programs a commit and a checked in expectations file are the two things that make a performance number worth quoting later, because a fast engine that computes the wrong answer is not a data point.
+
+### What is not here
+
+No objects with shapes, no user defined functions, no closures, no modules, no event loop, no `process`. That is M1 and M2 and the honest reading of 0.1.0 is that it is a runtime in the sense that it runs a program, not in the sense that it runs your program.
+
 ## 0.0.6
 
 Two pull requests on. The command line does what its help text says, which means you can point the binary at a file and it behaves the way a runtime is supposed to behave from the outside.
