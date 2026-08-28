@@ -587,6 +587,7 @@ dependencies = [
 name = "katsu-gc"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "katsu-platform",
  "thiserror",
  "tracing",

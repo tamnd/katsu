@@ -72,6 +72,44 @@ The cage is also the security boundary. The threat model from document 01.7 is a
 
 One honest note: because compressed pointers have no spare bits, the whole heap needs a single memory tag, which makes ARM MTE useless for catching corruption between objects inside the heap. That is a real loss and it is why the fuzzing in document 14 matters more for us than for a runtime that could rely on hardware tagging.
 
+### 7.2.1 The cage and the slot encoding, decided
+
+Implemented in `crates/katsu-gc/src/cage.rs` on top of the reservation primitive in `crates/katsu-platform/src/reservation.rs`.
+
+The cage is a four gigabyte region reserved with a four gigabyte alignment, and the alignment is the whole trick. It forces the low thirty two bits of the base to zero, so decompressing an offset is a bitwise or with no carry and no masking, and compressing an address is a truncation. Above the cage sits another four gigabytes of reserved but permanently unmapped address space. Typed array index arithmetic is a thirty two bit offset added to a base inside the cage, so an out of bounds index can land at most four gigabytes past the end, and the guard turns that from a read of whatever the allocator put there into a fault.
+
+The eight gigabyte reservation costs address space and nothing else. It is mapped `PROT_NONE` with `MAP_NORESERVE`, and pages are committed from the bottom as the heap grows. This distinction has to stay visible in every memory number the project publishes: the reserved figure is eight gigabytes on every process and is meaningless, the committed figure is what a container's memory limit counts and is what document 02.3's budget is measured against. The collector interface therefore reports committed bytes from `reserved_bytes`, with a comment saying why, because the alternative is a memory number that is off by three orders of magnitude and looks authoritative.
+
+A heap slot is thirty two bits with the tag in bit zero:
+
+| Bit 0 | The other thirty one bits |
+|---|---|
+| 0 | a thirty one bit signed integer, range −2^30 to 2^30 − 1 |
+| 1 | a byte offset into the cage, with the low three bits zero because objects are eight byte aligned |
+
+The tag is in the low bit rather than the high one so that decoding the integer is an arithmetic shift right, which brings the sign back for free. Objects are eight byte aligned, which leaves three spare low bits and means a real offset never collides with the tag.
+
+One consequence is worth stating because things will depend on it: a slot of all zero bits is the integer zero. Freshly committed pages read as zero, so an object's uninitialised slots are already a valid number and nothing has to walk a new block to fill it in. That is a small win at allocation time and a large one at startup.
+
+Narrowing a register value into a slot can fail, and `Value::to_slot` returns an option rather than making a decision on the caller's behalf. A double, or an integer outside the thirty one bit range, needs a heap number, which is an allocation and therefore not something a compression function should do quietly. `undefined`, `null`, `true` and `false` become pointers to singletons in the realm snapshot, which does not exist before M1. Both cases return nothing today and the caller has to handle them, which is better than either becoming a plausible looking wrong pointer.
+
+Widening in the other direction cannot fail, because every thirty two bit pattern names either an integer or a byte inside the cage.
+
+Measured per operation on both reference machines from document 15.5, over batches of 4096:
+
+| Operation | m4 | gamingpc |
+|---|---|---|
+| decompress an offset to an address | 0.10 ns | 0.10 ns |
+| compress an address back to an offset | 0.25 ns | 0.51 ns |
+| integer round trip through a slot | 0.08 ns | 0.19 ns |
+| bump allocate 24 bytes into committed pages | 2.4 ns | 2.1 ns |
+| bump allocate 37 bytes, so the rounding is on the path | 2.3 ns | 2.1 ns |
+| allocate when the pages have to be committed first | 194 ns | 243 ns |
+
+The allocation figures include the census bookkeeping, because the census is on the allocation path rather than sampled and there is no path that skips it. The committed and uncommitted cases are reported separately on purpose, because their average describes neither of them. The last row is a syscall and belongs to the kernel more than to us, which is the honest reading of the gap between the two machines on that line.
+
+The first run on gamingpc is also where the eight gigabyte reservation first failed, with ENOMEM out of criterion's warmup. The cause was the benchmark and not the cage: criterion's `SmallInput` batching runs the setup for a whole batch before timing any of it, so hundreds of heaps were alive at once and each one holds its own reservation. Linux refuses that and macOS does not, which is the entire argument for having a second reference machine.
+
 ## 7.3 Why not Nova's index based design
 
 Nova represents every heap reference as a type discriminated 32 bit index into a per type vector, which gets pointer compression for free, prevents type confusion by construction because reinterpreting an index changes which arena you read, and lays out objects data oriented so a field read does not drag unused fields into cache. It is a genuinely interesting design and the Web Engines Hackfest slides make a good case.

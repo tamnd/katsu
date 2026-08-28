@@ -4,6 +4,10 @@
 //! the layers above it can stay portable. See `spec/03-architecture.md` for the layer stack
 //! and `spec/06-jit-tiers.md` for the write xor execute rules this crate has to enforce.
 
+mod reservation;
+
+pub use reservation::{Reservation, ReservationError};
+
 /// The page size the running kernel is using.
 ///
 /// The memory budget in `spec/02-the-10x-goal.md` is written in pages rather than bytes,
