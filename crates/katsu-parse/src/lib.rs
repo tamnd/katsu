@@ -4,6 +4,9 @@
 //! test262 stage 4 test, and is maintained under VoidZero with Rolldown and Vite depending
 //! on it. Whether it stays the right choice is open question Q9. See `spec/04-frontend.md`.
 
+mod adapter;
+pub mod ast;
+
 use katsu_ir::FunctionBlueprint;
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
@@ -19,6 +22,23 @@ pub enum ParseError {
         path: String,
         /// The first diagnostic, rendered.
         message: String,
+    },
+    /// The source parsed, but it uses a construct the adapter does not translate yet.
+    ///
+    /// Distinct from `NotLowered` because it comes from a different phase and means a different
+    /// thing. This one says our tree has no shape for the syntax. `NotLowered` says the tree has
+    /// the shape and there is no bytecode behind it. Collapsing the two would make the M1 work
+    /// list harder to read, and the work list is what these variants are for.
+    #[error("{path}:{line}:{column}: {construct} is not supported yet")]
+    Unsupported {
+        /// The file the construct was written in.
+        path: String,
+        /// One based line.
+        line: u32,
+        /// One based column, counted in characters.
+        column: u32,
+        /// What we hit, named the way a JavaScript programmer would name it.
+        construct: &'static str,
     },
     /// Lowering is not implemented for this construct yet.
     ///
@@ -38,14 +58,24 @@ pub enum ParseError {
 pub struct ParsedModule {
     /// The path the source came from, kept for diagnostics and stack traces.
     pub path: String,
-    /// How many top level statements the program has.
+    /// The source, adapted into our own tree.
     ///
-    /// A placeholder for the real lowered output while M0 is in progress. It is here so
-    /// that the seam between parsing and lowering is exercised by a test rather than
-    /// being an empty function nobody calls.
-    pub statement_count: usize,
+    /// The oxc allocator that held the original tree is dropped before `parse` returns, so
+    /// nothing in here borrows from it. That is the cost of owning our own tree and it is the
+    /// price of the parser staying swappable.
+    pub ast: ast::Module,
     /// The lowered top level code, empty until lowering lands in M0.
     pub top_level: FunctionBlueprint,
+}
+
+impl ParsedModule {
+    /// How many top level statements survived adaptation.
+    ///
+    /// Not the same as the number written, because TypeScript that erases to nothing leaves no
+    /// statement behind.
+    pub fn statement_count(&self) -> usize {
+        self.ast.body.len()
+    }
 }
 
 /// Parse one source file and report what came out.
@@ -69,25 +99,26 @@ pub fn parse(path: &str, source: &str) -> Result<ParsedModule, ParseError> {
 
     Ok(ParsedModule {
         path: path.to_owned(),
-        statement_count: parsed.program.body.len(),
+        ast: adapter::adapt(path, &parsed.program)?,
         top_level: FunctionBlueprint::default(),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ast::{DeclKind, ExprKind, StmtKind};
     use super::{ParseError, parse};
 
     #[test]
     fn plain_javascript_parses() {
         let module = parse("hello.js", "const x = 1; console.log(x);").expect("should parse");
-        assert_eq!(module.statement_count, 2);
+        assert_eq!(module.statement_count(), 2);
     }
 
     #[test]
     fn typescript_annotations_parse_because_the_path_says_typescript() {
         let module = parse("hello.ts", "const x: number = 1;").expect("should parse");
-        assert_eq!(module.statement_count, 1);
+        assert_eq!(module.statement_count(), 1);
     }
 
     #[test]
@@ -97,5 +128,42 @@ mod tests {
             panic!("expected a syntax error, got {error:?}");
         };
         assert_eq!(path, "broken.js");
+    }
+
+    #[test]
+    fn the_tree_that_comes_back_is_ours_and_not_the_parsers() {
+        // The oxc allocator is dropped inside `parse`, so if any of this still borrowed from the
+        // arena it would not compile. That is the property this test is really checking, and the
+        // assertions below are just there to make it a test rather than a comment.
+        let module = parse("hello.js", "const answer = 42;").expect("should parse");
+
+        let StmtKind::Declare { kind, bindings } = &module.ast.body[0].kind else {
+            panic!("expected a declaration, got {:?}", module.ast.body[0]);
+        };
+        assert_eq!(*kind, DeclKind::Const);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name.name, "answer");
+
+        let Some(init) = &bindings[0].init else {
+            panic!("expected an initialiser");
+        };
+        assert_eq!(init.kind, ExprKind::Number(42.0));
+    }
+
+    #[test]
+    fn an_unsupported_construct_says_where_it_is() {
+        let error = parse("loop.js", "let i = 0;\nfor (;;) {}").expect_err("should be refused");
+        let ParseError::Unsupported {
+            path,
+            line,
+            column,
+            construct,
+        } = error
+        else {
+            panic!("expected an unsupported construct, got {error:?}");
+        };
+        assert_eq!(path, "loop.js");
+        assert_eq!(construct, "a for loop");
+        assert_eq!((line, column), (2, 1));
     }
 }
