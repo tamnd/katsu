@@ -2,6 +2,48 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.0.5
+
+Two pull requests on, and the thing they add together is that a program can be observed doing something. `console.log` works.
+
+### Globals and functions written in Rust
+
+Globals run, in #38. A name the program did not declare is looked up in a map on the isolate, a name nobody bound is a `ReferenceError` naming the name, `typeof` on a name nobody bound is `undefined` rather than an error, and assigning to a name nobody declared creates it, which is what a sloppy mode script does. The map is a map rather than an object with a shape, and spec 7.4.1 says why that is honest rather than temporary.
+
+A call whose target is a function written in Rust rather than in JavaScript runs too, which is what gives an embedder a way to put something in a realm that a program can call. It holds no code pointer in the cage, only an ordinal into a table the isolate owns, because a function pointer is eight bytes in a four byte world and it points outside the cage entirely.
+
+### Objects and output
+
+An object with properties on it, in #39. A record is a fixed set of names and values with no prototype, no property descriptors, no way to delete a name and no way to add one, because every one of those needs a shape and shapes are M1. That is not what a JavaScript object is and it is exactly what a host object is. The lookup is a linear scan comparing interned addresses, eight compares inside one cache line with no hash and no indirection, and spec 7.4.1 says why that is the right answer at this size rather than a placeholder for a hash table.
+
+Output goes through a sink the isolate owns rather than through `println!`. `Recorder` keeps what a program printed, `Discard` throws it away, and `Standard` is what an isolate nobody has changed has. Replacing one hands back the one that was there, so an embedder can capture output for one call and put the old sink back. Spec 11.4.1 writes it down, since "console.log works" had been a design promise in that document since it was written.
+
+`console` ships with `log`, `error`, `warn`, `info` and `debug` on it. Every argument is inspected and joined with a space, so an object prints its contents rather than `[object Object]`, and a string at the top level prints without quotes while the same string inside an object prints with them. Format specifiers are not written yet and the module doc says so.
+
+`GetProp`, `SetProp` and `CallMethod` run. A missing property is `undefined`, reading a property of `undefined` or `null` throws the message Node throws word for word, and a write that would grow a record is refused with a message naming the reason rather than silently dropped.
+
+### What it costs
+
+Per operation, on the three reference machines from spec 15.5, with the full tables in spec 5.3.5 and 5.3.6.
+
+| Operation | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| Read a global | 2.61 ns | 3.10 ns | 3.44 ns |
+| A statement that writes a global | 5.58 ns | 4.81 ns | 5.61 ns |
+| Call a function written in Rust | 6.51 ns | 6.29 ns | 9.09 ns |
+
+Reading a global costs about two nanoseconds over a register move, and that is a hash of four bytes rather than of the name, because every name is interned when its unit loads. A function written in Rust is a third cheaper to call than one written in JavaScript on the same call site, which it should be: it pushes no frame and never re-enters the dispatch loop.
+
+The property numbers are in spec 5.3.6 rather than here, because all three boxes were under other work the day they were taken and the durable statement is a ratio rather than a figure. A property read is about three times a global read and about six times a register move, and the three machines agree on both. That is the number M1's inline caches have to beat.
+
+### One bug a benchmark found
+
+The property benchmark's first run reported 43 nanoseconds for a read, more than three times what a scan of eight addresses could cost. The cause was not the lookup. The opcode arm was building the text of the property name for the error message it might need, on the way through, whether or not it was going to fail, and reading a constant back out of the pool allocates a `String`. Moving the message into a cold function that a successful read never calls took the same benchmark from 43.0 to 11.8 nanoseconds on the same machine minutes apart. Spec 5.3.2 has three of these written down now and this is the fourth: the cost was in code that was there for the case that does not happen.
+
+### Also
+
+A benchmark filter reaching a reference machine was being pasted into a remote shell line unquoted, so any filter containing a regex alternation ran as a pipeline and failed. It is quoted per shell now, single quotes on the bash side and a batch file on the Windows side, and a filter containing a double quote is refused rather than mangled. Every filtered remote run had been silently broken.
+
 ## 0.0.4
 
 Four pull requests on. Bytecode executes now. A source file goes from text to a value as long as the program stays inside what M0 has, which is numbers, strings, booleans, locals, control flow, functions and closures. Objects, globals and property access are the next thing, and they are what stands between this and `console.log`.
