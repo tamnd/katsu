@@ -598,6 +598,7 @@ name = "katsu-ir"
 version = "0.0.2"
 dependencies = [
  "bitflags",
+ "criterion",
  "rustc-hash",
  "serde",
  "smallvec",

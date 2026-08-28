@@ -33,6 +33,42 @@ Every opcode that can be polymorphic carries an inline cache slot index as an op
 
 The bytecode is versioned and serializable, because it is simultaneously the interpreter's input, the JIT's input, the AOT compiler's input, and the on disk cache format.
 
+### 5.1.1 The bytecode, as built
+
+`crates/katsu-ir` is four modules: the instruction set, the per function constant pool, the source position table, and the blueprint that holds all three. Everything is re-exported at the crate root, because a consumer wants `katsu_ir::Op` and does not care which file it is written in.
+
+What exists is the decoded form, one Rust enum with one variant per opcode. The byte encoding this document specifies, one byte of opcode then operands with a wide prefix past 256 registers, is not built yet, because nothing writes bytecode to disk until the cache lands. The two will exist side by side rather than one replacing the other: the interpreter matches on the decoded form and the encoding is a lowering of it.
+
+Jumps carry an absolute instruction index rather than a signed offset. An offset is smaller and relocatable and is what the encoded form will use. An absolute index is the one that cannot be wrong by a sign, which matters more while the forward reference patch list in lowering is new.
+
+Every opcode in the set has a construct in the M0 subset that lowers to it. The families listed above that M0 has no syntax for, iteration and generators and modules and private names and exception handlers, are deliberately absent. An opcode with no producer is an opcode whose semantics nobody has had to think about, and it sits in the file looking implemented.
+
+Two opcodes exist that the table above does not name, and both are there because a static analysis found something a run time check would otherwise have to find. `LoadUninitialized` writes the hole into a `let` or `const` slot when its scope is entered, and `ThrowIfUninitialized` is the dead zone check, emitted only where scope analysis says a reference can reach one. `ThrowConstAssignment` is the third, and it is an opcode rather than an early error because Node reports assignment to a `const` as a run time TypeError.
+
+A blueprint owns the blueprints of the functions written inside it. Handing one to a realm hands over the whole tree, with no second table to keep in step, which is also what makes the on disk cache format one object rather than an archive.
+
+A blueprint can verify itself, and this is worth more than it sounds. It checks that every jump lands inside the code, every register fits the frame the function sized, every constant and cache slot and nested function index exists, and that the code ends in a terminator. Those are exactly the mistakes a lowering pass makes, and every one of them produces bytecode that runs and is wrong rather than bytecode that fails to load. The check runs in every lowering test rather than only in debug builds.
+
+There is a disassembler, because a test that asserts on a listing says what it means and a test that asserts on a vector of enum variants is unreadable at the moment it fails.
+
+The constant pool deduplicates, and it holds Rust strings rather than atoms. Spec 4.5 says strings are interned isolate wide and they will be, but not here: `katsu-parse` and `katsu-gc` are both at layer 2 and neither can depend on the other, so the pass that fills the pool cannot reach the atom table. The pool is the list of things to intern and the index into it is the operand, so interning costs one walk when a realm loads the blueprint and nothing per execution. Spec 4.1.1 predicted this would happen at lowering because lowering would sit above both crates, and that prediction was wrong: lowering lives next to the tree it reads.
+
+Numbers are keyed in the pool by bit pattern, so `0.0` and `-0.0` stay separate entries, which they have to, because `1 / -0` is not `1 / 0`.
+
+| Operation | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| Add a string the pool has not seen | 37.2 ns | 48.8 ns | 66.4 ns |
+| Add a string the pool already holds | 5.0 ns | 4.9 ns | 5.2 ns |
+| Add a number | 16.6 ns | 13.7 ns | 16.3 ns |
+
+Measured over batches of 512 at one commit on the three reference machines from document 15.5. The second row is the one real code lives on, because a program that reads `.length` reads it in twenty places, and a repeat costs a hash and no allocation. The first row is a fresh pool growing from empty, which is what the first function lowered in a file pays. Windows being half again slower than Linux on the same silicon in the first row and identical in the second says the gap is the allocator and not the pool.
+
+The benchmark paid for itself immediately. Keying numbers on `f64::to_bits` directly made adding 512 numbers cost more than adding 512 strings, even though the string path also allocates, which is backwards. The reason is that the numbers a program writes down are loop bounds and array indices and small decimals, and every one of those is a double whose mantissa is nearly all zeroes, so the low bits that choose the hash bucket were nearly identical across the whole pool and every insert walked a long probe chain. Running the key through the splitmix64 finalizer first took a number from 45 nanoseconds to 15. The finalizer is a bijection, so it cannot merge two different doubles into one entry, and there is a test that says so.
+
+The source position table stores a byte offset rather than a line and a column. Turning an offset into a line costs one scan of the source and happens when a human is about to read it, which is rare, while storing two numbers per entry would cost memory in every function that is ever loaded, which is not. One entry per run of instructions that share a position, found by binary search, so a table for a large function is far smaller than its instruction count. A varint delta encoding would be smaller still and is the obvious thing to do when the memory census in spec 08.7 says this table is worth shrinking.
+
+The format version is 2. Version 1 was the eight opcode sketch that shipped in 0.0.1, nothing ever wrote it to disk, and bumping it costs nothing while pretending the format did not change costs somebody a confusing afternoon.
+
 ## 5.2 One semantic description, three consumers
 
 Each opcode's semantics are written once, in a macro DSL, and three things are generated from it: the interpreter handler, the tier 1 stencil, and the tier 2 IR builder rule.
