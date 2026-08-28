@@ -140,6 +140,38 @@ Register based and three address, specified in document 05. The frontend decisio
 
 **Optional chaining, nullish coalescing, logical assignment, destructuring with defaults and rest, spread, class fields, and `super`** all lower onto existing opcodes. Private `#names` get their own opcode family because the brand check has to be fast and must not be a string property lookup.
 
+### 4.5.1 Lowering, as built
+
+`crates/katsu-parse/src/lower.rs` takes the adapted tree and the resolution from 4.4.1 and produces a `FunctionBlueprint` for the top level and one for every function inside it. `parse` runs it before returning, so a `ParsedModule` either holds bytecode that passes `verify` or does not exist. It is a single walk over the tree, with no separate optimisation pass and nothing in between.
+
+Registers are allocated the way a stack machine pushes and pops, except that what comes back is a register number rather than a stack slot. Temporaries start above the frame's named slots, a mark is taken before an expression's operands are evaluated, and the mark is restored once the result is in hand. Frame size is a watermark that allocation raises and nothing lowers, so a function asks for as many registers as its deepest expression needed and not one more. That is the linear scan 4.5 asks for, and it is about thirty lines rather than a pass.
+
+Operands are released before the destination is allocated. That is what keeps `a * b + c` in three registers instead of five, and it is safe for the reason three address code is worth having in the first place: the op has read every operand before it writes anything. A stack machine cannot make that trade because the operands are gone by the time the result exists.
+
+Reading a local returns the variable's own slot instead of copying it into a temporary, which is the whole reason to prefer registers over a stack. It is also the one hazard in the design. If the other operand of a binary expression assigns to that variable, the value read first has to be pinned into a temporary before the write lands on top of it, so `a + (a = 2)` costs a move and `a + b` does not. The predicate that decides is a syntactic walk looking for anything that writes a name, and it is deliberately conservative: pinning a value that did not need it costs one instruction, and failing to pin one that did is a wrong answer.
+
+The calling convention puts argument `n` in register `n`, so registers `0..arity` are reserved even for a parameter that is captured and therefore lives in a cell. The prologue copies those into their cells and the register is then dead. There is no way around that, because the caller has no idea which of the callee's parameters escape and cannot be made to care.
+
+Jump targets are absolute instruction indices patched after the body they jump over has been emitted. Every forward jump is emitted with `CodeOffset(u32::MAX)` rather than zero, so a target nobody ever patched is not a plausible index that happens to be wrong, it is a number `verify` rejects on sight. The highest target ever emitted is tracked too, which is what tells the epilogue whether a function whose last statement is a `return` still needs one more instruction for some jump to land on.
+
+Stores go through a three way enumeration rather than a pair of booleans, because a declaration, an assignment and the write half of `x += 1` check different things: a declaration initialises through the dead zone, an assignment has to check the dead zone and refuse a `const`, and the write half of a compound assignment has already read the variable and so cannot still be in its dead zone. Naming the three cases is what stops the fourth combination, which is meaningless, from being expressible.
+
+Two constructs in the M0 grammar have no bytecode behind them yet. `arguments` needs frames the interpreter does not have, and `new` needs the object model from document 07. Both are refused by name with a source position rather than lowered into something that would have to be unpicked later, and the error reads like every other frontend error because it carries a line and a column.
+
+| Source | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| 200 small functions | 65.0 us, 20% of the frontend | 65.2 us, 20% | 81.7 us, 15% |
+| One 600 statement function | 34.6 us, 15% | 32.9 us, 11% | 41.2 us, 13% |
+| 200 functions with TypeScript types | 64.9 us, 16% | 64.2 us, 14% | 90.4 us, 17% |
+
+Measured at one commit on the three reference machines from document 15.5, with the pass timed on its own over a tree that was already adapted and resolved, and the percentage taken against the full `parse` on the same source and the same machine. Lowering is a seventh to a fifth of the frontend, which puts it in the same bracket as scope analysis and leaves the parser and the adapter holding roughly two thirds of the budget on every machine. The two passes we wrote are not where the frontend time goes.
+
+The M4 and the pinned Linux core land within three percent of each other on all three sources, which is a pleasant surprise for a laptop against a 13900K and says the pass is bound by memory traffic and branch prediction rather than by clock. The same commit under native Windows is 20 to 40 percent slower on the same silicon. Some of that is the allocator, since `parse/many_functions` is 554 us there against 323 us under WSL2 on the same box, and that gap is far too large to be code generation.
+
+The TypeScript row costs the same as the plain one again, for the same reason it did in 4.4.1: erasure happens in the adapter, so by the time lowering runs there are no annotations left to lower. That is worth restating rather than assuming, because it is the property that makes TypeScript free rather than cheap, and it would stop being true the moment any pass after the adapter had to look at a type.
+
+Scope analysis reads a few percent above the figures recorded in 4.4.1 on two of the three machines and a few percent below on the third. Lowering needs to find the scope belonging to a function it is walking, which is a span keyed map the pass did not build before, and that is the honest explanation for most of it. Removing the fold over every identifier that used to compute the dead zone flags, by setting each flag on the binding during the walk instead, did not measurably pay for it. The change is kept because one pass over the identifiers is better than two, and no speedup is claimed for it anywhere.
+
 ## 4.6 Laziness is the startup story
 
 Parsing a 5 MB bundle eagerly and lowering every function costs hundreds of milliseconds, and most of it is wasted because a typical program calls a small fraction of the functions in its dependency tree.
