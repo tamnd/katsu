@@ -93,7 +93,7 @@ Benchmarks run on the two reference machines named in [`spec/15-benchmarks.md`](
 
 **Node-API addons yes, raw V8 API addons not before 1.0.**
 
-**Linux and macOS, x86-64 and aarch64, at parity. Windows after 1.0.**
+**Linux, macOS and Windows, x86-64 and aarch64, at parity.** Every platform is tested on every commit and a failure on any of them blocks a merge, because a platform that is only checked before a release is a platform that is broken most of the time.
 
 ## What this is not
 

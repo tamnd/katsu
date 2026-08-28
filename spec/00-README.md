@@ -81,7 +81,7 @@ Read 02 first. It is the document that decides whether this project is honest.
 
 **Node-API addons yes, V8 API addons not before 1.0.** Document 10.
 
-**Linux and macOS, x86-64 and aarch64, at parity. Windows after 1.0.**
+**Linux, macOS and Windows, x86-64 and aarch64, at parity.** Every platform is tested on every commit and a failure on any of them blocks a merge. Document 14.
 
 ## What this is not
 

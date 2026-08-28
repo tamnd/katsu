@@ -19,18 +19,25 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # The tier 1 platforms from spec/14-quality-bar.md. Linux and macOS on both
-      # architectures at parity. Windows is after 1.0 and is not pretended at here.
+      # The tier 1 platforms from spec/14-quality-bar.md. Linux, macOS and Windows, on
+      # both architectures where both exist, at parity.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
+            archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-13
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
     steps:
       - uses: actions/checkout@v7.0.1
       - run: rustup target add ${{ matrix.target }}
@@ -38,7 +45,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }} -p katsu
+      # Two packaging steps rather than one, because a tarball is what a Unix user expects
+      # to download and a zip is what a Windows user expects, and faking either one is a
+      # worse experience than writing the six lines twice.
       - name: Package
+        if: runner.os != 'Windows'
         run: |
           name=katsu-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "dist/$name"
@@ -46,13 +57,24 @@ jobs:
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           shasum -a 256 "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+      - name: Package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "katsu-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/katsu.exe" "dist/$name/"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Encoding ascii -Path "dist/$name.zip.sha256" -Value "$hash  $name.zip"
       - uses: actions/attest-build-provenance@v4.2.2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: dist/*.${{ matrix.archive }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: dist/*.${{ matrix.archive }}*
 
   publish:
     name: Publish

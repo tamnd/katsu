@@ -58,6 +58,8 @@ jobs:
             os: ubuntu-24.04-arm
           - name: macos aarch64
             os: macos-latest
+          - name: windows x86-64
+            os: windows-latest
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: Swatinem/rust-cache@v2.9.2
@@ -65,7 +67,9 @@ jobs:
           key: ${{ matrix.os }}
       - run: cargo test --workspace --all-features
       - run: cargo build --release
-      - run: ./target/release/katsu --build-info
+      # Through cargo rather than by path, because the file is katsu on two of these
+      # platforms and katsu.exe on the third and there is no reason to care which.
+      - run: cargo run --release -p katsu -- --build-info
 
   features:
     name: Feature set ${{ matrix.name }}

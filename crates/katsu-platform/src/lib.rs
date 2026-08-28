@@ -5,6 +5,7 @@
 //! and `spec/06-jit-tiers.md` for the write xor execute rules this crate has to enforce.
 
 mod reservation;
+mod sys;
 
 pub use reservation::{Reservation, ReservationError};
 
@@ -14,14 +15,7 @@ pub use reservation::{Reservation, ReservationError};
 /// because a 4 KiB budget on a 16 KiB page machine is not a budget, it is a rounding error.
 #[must_use]
 pub fn page_size() -> usize {
-    // SAFETY: `sysconf` takes an integer name and returns a long, with no pointer arguments
-    // and no memory effects. `_SC_PAGESIZE` is always supported.
-    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if raw > 0 {
-        usize::try_from(raw).unwrap_or(4096)
-    } else {
-        4096
-    }
+    sys::page_size()
 }
 
 /// Round `bytes` up to a whole number of pages.
