@@ -6,8 +6,10 @@
 //! `regress` rather than a hand written engine.
 
 mod console;
+mod globals;
 
 pub use console::install as install_console;
+pub use globals::install as install_globals;
 
 /// Whether ECMA-402, the internationalization API, is compiled into this build.
 ///

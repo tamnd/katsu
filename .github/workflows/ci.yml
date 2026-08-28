@@ -136,6 +136,26 @@ jobs:
           git -C vendor/test262 checkout "$SUITE"
       - run: cargo run --release -p test262-runner
 
+  # Katsu against node on generated programs. Separate from the conformance job because it answers a
+  # different question: test262 asks whether we follow the standard, and this asks whether we behave
+  # like the implementation everybody's code was actually written against, which is what the
+  # compatibility goal in the README means in practice.
+  #
+  # The count is small enough to finish in a couple of minutes on a shared runner and the seed is
+  # fixed, so a red run here is a red run everybody else can reproduce with one command rather than
+  # a flake somebody reruns until it passes. Finding new things is what a longer run on real
+  # hardware is for.
+  differential:
+    name: Differential against node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
+      - run: cargo run --release -p differential -- --count 2000 --seed 0
+
   supply-chain:
     name: Supply chain
     runs-on: ubuntu-latest

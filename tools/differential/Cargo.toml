@@ -1,6 +1,6 @@
 [package]
 name = "differential"
-description = "Differential testing between the katsu interpreter and the compilation tiers, with the interpreter as oracle."
+description = "Differential testing of katsu against node on generated programs, and against its own tiers once there is more than one."
 publish = false
 version.workspace = true
 edition.workspace = true

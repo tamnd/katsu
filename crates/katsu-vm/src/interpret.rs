@@ -324,6 +324,18 @@ impl Interpreter {
         if let Some(record) = self.as_record(value) {
             return self.record_text(record, RECORD_PRINT_DEPTH);
         }
+        // Negative zero is the one number that inspection and `ToString` spell differently. The
+        // specification says `ToString` of it is "0", and Node's console prints "-0", because a
+        // console that cannot tell you which zero you have is hiding the thing you turned the
+        // console on to see. So the case lives here, in the inspection path, and deliberately not
+        // in `primitive_text`, which `coerce_to_string` calls and which has to keep saying "0" for
+        // `'' + -0`. The differential harness found this on its first run against node.
+        if let Some(number) = value.as_f64()
+            && number == 0.0
+            && number.is_sign_negative()
+        {
+            return "-0".to_owned();
+        }
         Self::primitive_text(value)
     }
 
@@ -3223,6 +3235,18 @@ mod tests {
             ))
             .expect("should not throw");
         assert_eq!(again.as_f64(), Some(8.0));
+    }
+
+    #[test]
+    fn the_console_tells_the_two_zeroes_apart_and_string_coercion_does_not() {
+        // Found by the differential harness on its first run against node, which is the entire
+        // argument for having one. Both halves are asserted together because fixing the first by
+        // changing `ToString` would break the second, and the second is the one the specification
+        // is explicit about.
+        assert_eq!(evaluate_display("-0;"), "-0");
+        assert_eq!(evaluate_display("'' + -0;"), "0");
+        assert_eq!(evaluate_display("0;"), "0");
+        assert_eq!(evaluate_display("0 * -1;"), "-0");
     }
 
     #[test]

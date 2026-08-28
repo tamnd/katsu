@@ -68,6 +68,24 @@ This deserves emphasis: **most JIT bugs in production engines are only detectabl
 
 A second differential runs against Node for behavior test262 does not pin, particularly error messages, stack trace shapes, and loop ordering, feeding the divergence list in document 10.7.
 
+### 14.5.1 The harness as built, and what it found on its first run
+
+There is one tier, so tier against tier would compare the interpreter with itself and catch nondeterminism and nothing else. Rather than let the harness wait for M6 to have a second thing to compare against, the second differential above was built first: katsu against node, on generated programs. That is a strictly harder question than tier against tier, it is the question the compatibility goal is actually about, and the machinery is the same machinery. When the tiers arrive they become two more oracles behind the same trait and the generator, the shrinker and the report do not change.
+
+The generator emits only the subset the interpreter runs today, because a program that stops at the first unimplemented construct tests nothing. Its literal tables are not random digits. Every value in them is a known place where two implementations of ECMAScript stop agreeing: `1e21` and `1e-7` are the two ends of where number to string switches to exponential notation, `2147483648` is one past what the bitwise operators truncate to, `9007199254740993` is the first integer a double cannot hold, and `"10"` against `"9"` is the comparison that catches an implementation comparing strings numerically. Random digits find none of these, because the interesting inputs are a vanishingly small part of the space.
+
+Three decisions carry most of the value. Unimplemented constructs are their own verdict rather than a disagreement, because katsu not having an opinion is not katsu and node disagreeing, and without that separation the report becomes the work list wearing the word "divergence" and nobody keeps reading it. Thrown errors are compared on the constructor name and not the message, because the standard specifies which error is thrown and says nothing at all about what it says. Two engines both refusing to parse a program is agreement for the same reason, which cost five false reports before it was fixed. Every divergence is shrunk by removing statements until nothing more can go, so a finding arrives as three lines rather than as forty.
+
+The first run against node found three real bugs in a thousand programs, none of which any test in the repository was going to find:
+
+`undefined` was not a binding. It is not a keyword, it is an ordinary property of the global object, and `typeof` of an unresolvable reference is defined to return the string "undefined" rather than to throw. So `typeof undefined` answered correctly in an engine that had never heard of the name while `let x = undefined` threw a `ReferenceError`, and that asymmetry is exactly why every obvious test passed. `NaN` and `Infinity` were missing for the same reason and went in with it.
+
+`console.log(-0)` printed `0`. Negative zero is the one number whose inspected form and whose `ToString` differ, and the fix had to go in the inspection path only, because `'' + -0` is required to be `"0"` and a console that cannot tell you which zero you are holding is hiding the thing you turned it on to see.
+
+The third was a code generation bug. Lowering documents a rule that a destination register is never passed down to an operand, because an operand is evaluated before its siblings and writing the destination early clobbers a variable a later operand still reads. The short circuiting operators broke that rule: `v = 1.5 && ('x' + v)` built the left side in `v`'s own slot and then read the new value back, answering `x1.5` where node says `x3`. The compound assignment form of the same operator had a comment saying the result has to end up in a register that is nobody's variable, and was correct. This was the same problem one match arm over, and it is a good example of the class: a bug that no amount of reading finds and that a hand written test only finds if somebody already suspects it.
+
+With those fixed, two thousand generated programs plus the corpus agree with node on every one. CI runs two thousand at a fixed seed on every commit, which is a reproduction rather than a flake, and finding new things is what longer runs on the reference machines are for.
+
 ## 14.6 Fuzzing
 
 The field has converged on structure aware, coverage guided fuzzing of JavaScript engines and the tooling is public.
