@@ -2,6 +2,66 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.0.4
+
+Four pull requests on. Bytecode executes now. A source file goes from text to a value as long as the program stays inside what M0 has, which is numbers, strings, booleans, locals, control flow, functions and closures. Objects, globals and property access are the next thing, and they are what stands between this and `console.log`.
+
+### The stack
+
+The interpreter got its own stack, in #33. Eight megabytes of address space reserved at startup and sixty four kilobytes committed, growing a chunk at a time and never shrinking, because a program that recursed once usually recurses again and the syscall to hand a page back costs more than the page. The depth limit is ten thousand frames, which is roughly where Node raises `RangeError`, and hitting it is an ordinary error a program could catch rather than a crash.
+
+The frame header is not inline in the region, which is a deliberate deviation from the drawing in spec 5.4. Values live in the region and headers live in a vector beside it, so the root set is a slice with nothing to skip and nothing to get wrong. The cost is a second allocation and a second cache line per call, which is measured in the benchmarks rather than asserted.
+
+### Dispatch
+
+The `loop { match }` dispatch loop, in #34. Every opcode is one arm, the arm does the work, and nothing hides behind a generic helper that takes a closure. Arithmetic, the bitwise operators, comparisons, the unary operators, the temporal dead zone checks, jumps, back edges and `return` all run. The numeric conversions live in their own module because each one is a place where the obvious Rust expression is subtly not what JavaScript says: `ToInt32` is a modulo and a fold rather than a cast, a shift count is taken modulo thirty two, and exponentiation disagrees with IEEE `pow` in exactly two places.
+
+Back edges check one shared atomic word, so an endless loop can be stopped from another thread, and a test proves it.
+
+### Strings
+
+Strings in the interpreter, in #35. A literal reaches a register, two of them concatenate, they compare by code unit, and they convert to numbers and booleans by the rules the standard gives. The interpreter owns an isolate to allocate them in.
+
+Three things about that work were worth writing down in spec 5.3.2, because none of them was in the arm being measured and all three will come back. A conversion inlined into the switch dragged a string decoder into the dispatch loop and made arithmetic 167 percent slower. A heap path marked out of line but not cold cost 32 percent of the counting loop on Windows while Linux on the same silicon was flat. And holding the isolate inline rather than behind a `Box` made the interpreter three hundred and forty four bytes instead of seventy two, which a register move could feel.
+
+### Calls, closures and environments
+
+Calls run, in #36. A call pushes a frame, copies its arguments out of a run of the caller's own registers, runs the callee and writes what it returned into the register the call names. A function written inside another one closes over the environment it was written in, and a captured variable moves out of a register into a context, which is a heap object holding one cell per captured variable and a pointer to the context outside it.
+
+The heap has three kinds of object where it had one. A closure and a context join the string, and they are told apart by the word every object already starts with, the one that holds a shape from M1 onward. That word is a slot, so a shape is a pointer and a kind tag is a small integer, and a tag written there today can never be mistaken for a shape. Zero is a string, which costs nothing to record because pages come back zeroed and the string allocator never wrote that word.
+
+### What it costs
+
+Per call, on the three reference machines from spec 15.5, with the full tables in spec 5.3.4.
+
+| Operation, per call | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| A call and a return | 7.01 ns | 9.46 ns | 9.90 ns |
+| The same through a closure that reads one captured variable | 14.71 ns | 15.49 ns | 15.87 ns |
+| A call inside `fib(20)` | 20.42 ns | 23.24 ns | 23.50 ns |
+
+The first Node comparison this project can make honestly, on the same `fib(20)`, the same machines and the same pinning. Node with `--jitless` is V8's interpreter with the optimizing tiers turned off, which is the fair comparison for what we have today.
+
+| `fib(20)`, per call | m4 | gamingpc-win |
+|---|---|---|
+| katsu, interpreter only | 20.42 ns | 23.50 ns |
+| Node 26 with `--jitless` | 14.13 ns | 17.78 ns |
+| Node 26 as it ships | 1.62 ns | 1.60 ns |
+
+Our tier 0 is within about a third to a half of V8's tier 0. Node as it ships is twelve to fifteen times faster than either interpreter, because TurboFan compiled `fib` and unboxed its arithmetic. Nothing in M0 closes that gap and nothing in M0 claims to.
+
+### Known gaps
+
+Pushing and popping a frame got 24 percent slower on the pinned Linux machine, from 6.40 ns to 7.99 ns, when the frame header grew from sixteen bytes to twenty four to hold the function index and the context. That is the whole cause, isolated by applying only those two fields to the previous commit, and the route back down is written into spec 5.4.1 as a trade rather than a win.
+
+A context cell is eight bytes where everything else in the cage is four, because a captured variable can be a double or `undefined` and there is no heap number and no realm singleton to point at yet. It goes back to four in M1.
+
+`Stack::roots` is no longer the whole root set, because a frame's context is a heap pointer that lives in the header rather than in a register. Nothing collects yet, so this is a note for M1 rather than a bug.
+
+A function joined to a string prints as `[Function: name]` where Node prints the source text, because carrying source spans on a function is a later piece of work.
+
+The gaps from 0.0.3 are unchanged: no ropes so concatenation is quadratic, no hash flooding resistance until the realm can carry a per process seed, the atom table's buckets sit outside the cage and miss the heap census, the four in the scope pass, `arguments` and `new` refused by name, and the native Windows frontend running 20 to 40 percent slower than WSL2 on the same silicon.
+
 ## 0.0.3
 
 Three pull requests on. The frontend section of M0 is finished, so a source file now goes all the way to verified bytecode. Nothing executes that bytecode yet, and the interpreter is the next thing.
