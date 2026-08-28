@@ -12,6 +12,10 @@ updates:
         patterns: ["oxc*"]
       tracing:
         patterns: ["tracing*"]
+      # These three move as a set. syn 3 arrived on its own and needed proc-macro2 and quote
+      # alongside it, so grouping them saves doing that reconciliation by hand next time.
+      proc-macro:
+        patterns: ["syn", "quote", "proc-macro2"]
       minor-and-patch:
         update-types: ["minor", "patch"]
 
