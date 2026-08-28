@@ -24,6 +24,10 @@ criterion.workspace = true
 name = "heap"
 harness = false
 
+[[bench]]
+name = "strings"
+harness = false
+
 [features]
 # The collector choice is open question Q3 and is decided by measurement at M4.
 default = []
