@@ -70,22 +70,24 @@ Everything is versioned, so a number from six months ago can be recomputed again
 
 ## 15.5.1 The first cold start and memory measurement, and what it does not mean
 
-The moment `katsu run` could execute a file end to end and print from it, the first of the axes in 15.3 became measurable. This is that measurement, taken on `m4`, at the commit that finished the command line interface. Hello world is one `console.log`. A hundred runs per runtime with no warmup, since this is startup, plus fifteen runs under `/usr/bin/time -l` for peak resident set size.
+The moment `katsu run` could execute a file end to end and print from it, the first of the axes in 15.3 became measurable. This is that measurement, taken on `m4`, at the commit that finished the command line interface. Hello world is one `console.log`. The numbers come from the harness in `katsu-bench` rather than from anything written for the occasion, 25 runs per runtime with no warmup since this is startup, plus a separate pass under `/usr/bin/time -l` for peak resident set size. The command is `katsu-bench run --runs 25` and the full table with interquartile ranges is in that repository under `results/baselines/`.
 
-| Runtime | Version | Median wall | p95 | Peak RSS | Binary |
+| Runtime | Version | Median wall | IQR | Peak RSS | Binary |
 |---|---|---|---|---|---|
-| katsu | 0.0.5 | 1.97 ms | 2.35 ms | 2.44 MiB | 1.7 MiB |
-| bun | 1.4.0 | 6.09 ms | 7.37 ms | 10.92 MiB | 60.6 MiB |
-| deno | 2.9.6 | 12.13 ms | 13.96 ms | 31.09 MiB | 118.9 MiB |
-| node | 26.8.1 | 24.67 ms | 27.80 ms | 48.14 MiB | 139.0 MiB |
+| katsu | 0.0.5 | 1.55 ms | 0.09 | 2.44 MiB | 1.7 MiB |
+| bun | 1.4.0 | 4.97 ms | 0.82 | 10.92 MiB | 60.6 MiB |
+| deno | 2.9.6 | 12.49 ms | 0.73 | 31.09 MiB | 118.9 MiB |
+| node | 26.8.1 | 24.63 ms | 1.98 | 48.14 MiB | 139.0 MiB |
 
-Against Node that is 12.5 times faster to start, 19.7 times less memory and an artifact 80 times smaller. Against Bun, the runtime that actually competes on this axis, it is 3.1 times faster and 4.5 times less memory.
+Against Node that is 15.9 times faster to start, 19.7 times less memory and an artifact 80 times smaller. Against Bun, the runtime that actually competes on this axis, it is 3.2 times faster and 4.5 times less memory.
 
-Now the part that matters more than the table. **We are ahead here because we do less, not because we are better.** There is no module system, no `process`, no event loop, no filesystem, no `Buffer` and no standard library beyond `console.log`. Every one of those costs startup time and resident memory, and Node is carrying all of them in the 24.67 ms above. A fair reading of this table is not that the 10x goal is met, it is that we start from a position where the goal is reachable, and the real test is whether these numbers survive M1 through M8 landing on top of them.
+Now the part that matters more than the table. **We are ahead here because we do less, not because we are better.** There is no module system, no `process`, no event loop, no filesystem, no `Buffer` and no standard library beyond `console.log`. Every one of those costs startup time and resident memory, and Node is carrying all of them in the 24.63 ms above. A fair reading of this table is not that the 10x goal is met, it is that we start from a position where the goal is reachable, and the real test is whether these numbers survive M1 through M8 landing on top of them.
 
 That is exactly why this is recorded now rather than when the runtime is finished. The 4 MiB idle budget in document 02.3 is a budget, and a budget is only useful if you know what you were spending before you started. 2.44 MiB with nothing implemented means the whole Node compatible surface has to fit in the 1.5 MiB that is left, which is a much more demanding statement than the budget looked like in the abstract, and it is better to know that at M0 than at M8.
 
-The usual caveats apply and are worth restating rather than pointing at. `m4` is a laptop with turbo enabled and frequency scaling on, so these are indicative rather than published numbers per 15.5. Wall clock here is measured from outside with `subprocess` around the whole process lifetime, which includes fork and exec and the dynamic loader, and that is the right thing to measure for a cold start even though it is not the runtime's own time. Peak RSS from `/usr/bin/time -l` is what the operating system saw, not what any of these four runtimes would report about themselves.
+The usual caveats apply and are worth restating rather than pointing at. `m4` is a laptop with turbo enabled and frequency scaling on, so these are indicative rather than published numbers per 15.5. Wall clock is measured from outside around the whole process lifetime, which includes fork and exec and the dynamic loader, and that is the right thing to measure for a cold start even though it is not the runtime's own time. Peak RSS from `/usr/bin/time -l` is what the operating system saw, not what any of these four runtimes would report about themselves.
+
+The first version of this table was half a millisecond slower on every row, because it came from a throwaway Python script that timed `subprocess.run` and therefore charged each runtime for the Python interpreter's own cost of spawning it. It is a small error and it landed in the same direction for everyone, so the ratios barely moved, but it is worth naming for the reason 15.5 exists at all: a number is only as trustworthy as the thing that produced it, and a measurement tool written for one table is a measurement tool nobody has checked. The harness is the answer to that, and the rule this leaves behind is that a figure published here comes from `katsu-bench` or it does not get published.
 
 ## 15.6 What benchmarks lie about, and where we say so
 
