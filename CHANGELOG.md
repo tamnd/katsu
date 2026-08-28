@@ -2,6 +2,47 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.0.6
+
+Two pull requests on. The command line does what its help text says, which means you can point the binary at a file and it behaves the way a runtime is supposed to behave from the outside.
+
+### The three commands
+
+`katsu run`, `katsu check` and `katsu --build-info`, in #41. Running a file already worked once `console.log` landed, so most of this is the parts around it: which stream a message goes to, which code the process exits with, and a `katsu check` that runs a compiler rather than telling you to go and run one yourself.
+
+The rule for messages is whether a Node process given the same file would have failed the same way. A program that throws prints its error and message bare on standard error and exits 1, because that is the line Node ends with and it is the line scripts grep for. A file that will not open, or a command that is not built yet, wears a `katsu:` prefix so nobody goes looking for a bug in their own source. There is no stack trace under the error yet, because a frame needs a source span and a function name and those arrive with the work that makes `x is not a function` name `x`.
+
+`katsu check` looks for a compiler in `KATSU_TSC`, then in a `node_modules/.bin` walking up from the entry, then on the path, and names all three when there is none. The project one beats the global one on purpose: a project pins its TypeScript version in its `package.json` and its types only check against that version, so a globally installed compiler of a different version is a different answer rather than a substitute. A `tsconfig.json` at or above the entry means the project is checked rather than the single file. The compiler's exit code is forwarded and nothing of ours is printed over the top of it. Spec 4.2.1 writes the search down. Checked end to end against TypeScript 7.0.2.
+
+### Two things that were wrong
+
+`--build-info`, `--heap-census` and `--tier` were global flags, so `katsu run app.js --build-info` printed our build information instead of handing the flag to the program. A program could never be given a flag we happen to share a name with. They are top level flags now.
+
+`--build-info` printed `target: aarch64`, which is half a target and useless in a bug report. It prints the architecture and the operating system now.
+
+Arguments after the script are warned about rather than dropped, since they cannot be delivered until there is a `process` object in M2 and a program seeing an empty argument list with no explanation is a worse way to find that out.
+
+The tests on that crate went from 3 to 25, and 13 of them run the real binary. Which stream something goes to and what code it exits with are exactly what a unit test cannot see and what a refactor can break silently.
+
+### The first cold start number
+
+This is the release where the cold start axis becomes measurable, so spec 15.5.1 records it. Hello world on `m4`, from the harness in `katsu-bench`, 25 runs with no warmup.
+
+| Runtime | Version | Median | Peak RSS | Binary |
+|---|---|---|---|---|
+| katsu | 0.0.5 | 1.55 ms | 2.44 MiB | 1.7 MiB |
+| bun | 1.4.0 | 4.97 ms | 10.92 MiB | 60.6 MiB |
+| deno | 2.9.6 | 12.49 ms | 31.09 MiB | 118.9 MiB |
+| node | 26.8.1 | 24.63 ms | 48.14 MiB | 139.0 MiB |
+
+15.9 times faster to start than Node, 19.7 times less memory, an artifact 80 times smaller. Against Bun, which is the runtime that actually competes on this axis, 3.2 times and 4.5 times.
+
+The spec says the uncomfortable half next to the table. We are ahead because we do less, not because we are better, and Node is carrying a module system, a process object, an event loop and a filesystem inside that 24.63 ms. The reason to record it now is the 4 MiB idle budget in spec 02.3: spending 2.44 MiB with nothing implemented means the whole Node compatible surface has to fit in the 1.5 MiB left, which is a more demanding statement than the budget looked like in the abstract.
+
+### Also
+
+The first version of that table, published in #41 and corrected in #42, was half a millisecond slow on every row, because it came from a throwaway script that timed a Python `subprocess.run` and charged every runtime for the Python interpreter's own spawning cost. No conclusion changed, which is why it is named in the spec rather than quietly fixed. The rule it leaves behind is that a figure we publish comes from `katsu-bench` or it does not get published.
+
 ## 0.0.5
 
 Two pull requests on, and the thing they add together is that a program can be observed doing something. `console.log` works.
