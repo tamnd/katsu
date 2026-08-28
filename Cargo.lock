@@ -648,6 +648,7 @@ dependencies = [
 name = "katsu-parse"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "katsu-ir",
  "oxc_allocator",
  "oxc_ast",
