@@ -771,6 +771,14 @@ impl Analyser {
                     self.expression(argument)?;
                 }
             }
+            ExprKind::Object { properties } => {
+                // The names are not references. `{x: 1}` mentions `x` and does not read it, which
+                // is the difference between a property name and a variable and is why only the
+                // value is walked here.
+                for property in properties {
+                    self.expression(&property.value)?;
+                }
+            }
             ExprKind::Function(func) => self.function(func, true)?,
         }
         Ok(())
@@ -1137,6 +1145,13 @@ mod tests {
                 expression_idents(callee, out);
                 for argument in arguments {
                     expression_idents(argument, out);
+                }
+            }
+            ExprKind::Object { properties } => {
+                // The property names are not identifiers the scope pass resolves, so only the
+                // values go in, and this helper has to agree with the pass it is checking.
+                for property in properties {
+                    expression_idents(&property.value, out);
                 }
             }
             ExprKind::Function(func) => {

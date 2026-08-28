@@ -85,23 +85,46 @@ pub(crate) fn quote(text: &str) -> String {
     out
 }
 
+/// What goes in front of an object that something inside it points back at.
+///
+/// The number is what ties the two halves of a cycle together, so `<ref *1>` on the object and
+/// `[Circular *1]` where the walk found its way back to it are the same number by construction.
+pub(crate) fn reference(number: usize) -> String {
+    format!("<ref *{number}>")
+}
+
+/// What is printed where the walk arrives back at an object it is already inside.
+pub(crate) fn circular(number: usize) -> String {
+    format!("[Circular *{number}]")
+}
+
 /// Wrap the printed properties of one object in braces, on one line if they fit.
 ///
 /// Node's width rule is not "is the line under eighty characters", it is a count with a constant of
 /// ten in it and the number of entries added twice, which means an object with many short properties
 /// breaks earlier than its printed width suggests. The arithmetic is reproduced rather than
 /// approximated, because an approximation is a diff against Node on some object nobody thought of.
-pub(crate) fn braces(entries: &[String], indent: usize) -> String {
+///
+/// `base` is the `<ref *1>` an object in a cycle carries, and empty for everything else. It is not
+/// only pasted on the front: its length counts towards the width, so an object with a back reference
+/// to it breaks eight characters earlier than the same object without one, and that was measured
+/// rather than assumed.
+pub(crate) fn braces(entries: &[String], indent: usize, base: &str) -> String {
+    let prefix = if base.is_empty() {
+        String::new()
+    } else {
+        format!("{base} ")
+    };
     if entries.is_empty() {
-        return "{}".to_owned();
+        return format!("{prefix}{{}}");
     }
-    if fits(entries, indent) && !entries.iter().any(|entry| entry.contains('\n')) {
-        return format!("{{ {} }}", entries.join(", "));
+    if fits(entries, indent, base.len()) && !entries.iter().any(|entry| entry.contains('\n')) {
+        return format!("{prefix}{{ {} }}", entries.join(", "));
     }
     let pad = " ".repeat(indent + INDENT);
     let separator = format!(",\n{pad}");
     format!(
-        "{{\n{pad}{}\n{}}}",
+        "{prefix}{{\n{pad}{}\n{}}}",
         entries.join(&separator),
         " ".repeat(indent)
     )
@@ -116,8 +139,8 @@ pub(crate) const fn nested(indent: usize) -> usize {
 ///
 /// The lengths are counted in UTF-16 code units and not in characters or bytes, because Node is
 /// counting the length of a JavaScript string, and an emoji is two of those.
-fn fits(entries: &[String], indent: usize) -> bool {
-    let start = entries.len() + indent + "{".len() + 10;
+fn fits(entries: &[String], indent: usize, base: usize) -> bool {
+    let start = entries.len() + indent + "{".len() + base + 10;
     let mut total = entries.len() + start;
     if total + entries.len() > BREAK_LENGTH {
         return false;
@@ -176,13 +199,13 @@ mod tests {
 
     #[test]
     fn an_object_with_nothing_in_it_has_no_space_between_its_braces() {
-        assert_eq!(braces(&[], 0), "{}");
+        assert_eq!(braces(&[], 0, ""), "{}");
     }
 
     #[test]
     fn a_short_object_goes_on_one_line() {
         assert_eq!(
-            braces(&["a: 1".to_owned(), "b: 2".to_owned()], 0),
+            braces(&["a: 1".to_owned(), "b: 2".to_owned()], 0, ""),
             "{ a: 1, b: 2 }"
         );
     }
@@ -193,11 +216,11 @@ mod tests {
         // of these counts flips, and one character narrower still fits.
         for (count, width) in [(1, 63), (2, 28), (3, 17), (4, 11), (5, 7), (6, 5), (7, 3)] {
             assert!(
-                braces(&entries(count, width), 0).contains('\n'),
+                braces(&entries(count, width), 0, "").contains('\n'),
                 "{count} entries {width} wide should have broken"
             );
             assert!(
-                !braces(&entries(count, width - 1), 0).contains('\n'),
+                !braces(&entries(count, width - 1), 0, "").contains('\n'),
                 "{count} entries {} wide should have fitted",
                 width - 1
             );
@@ -205,8 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_goes_in_front_of_the_braces_and_counts_towards_the_width() {
+        let entry = |width: usize| {
+            vec![
+                format!("{}: 1", "k".repeat(width)),
+                "s: [Circular *1]".to_owned(),
+            ]
+        };
+        assert_eq!(
+            braces(&["s: [Circular *1]".to_owned()], 0, "<ref *1>"),
+            "<ref *1> { s: [Circular *1] }"
+        );
+        // Measured against Node: the same object breaks at a name of thirty nine characters with the
+        // reference on it and would fit to forty seven without, so the eight characters of
+        // `<ref *1>` are being charged even though they are not inside the braces.
+        assert!(braces(&entry(39), 0, "<ref *1>").contains('\n'));
+        assert!(!braces(&entry(38), 0, "<ref *1>").contains('\n'));
+        assert!(braces(&entry(47), 0, "").contains('\n'));
+        assert!(!braces(&entry(46), 0, "").contains('\n'));
+    }
+
+    #[test]
     fn a_broken_object_indents_by_two_and_puts_the_closing_brace_back_at_the_start() {
-        let text = braces(&entries(7, 3), 0);
+        let text = braces(&entries(7, 3), 0, "");
         assert_eq!(
             text,
             "{\n  k0xxx: 1,\n  k1xxx: 1,\n  k2xxx: 1,\n  k3xxx: 1,\n  k4xxx: 1,\n  k5xxx: 1,\n  k6xxx: 1\n}"
@@ -217,7 +261,7 @@ mod tests {
     fn an_entry_that_is_already_broken_breaks_the_object_around_it() {
         // One long property is enough to put every other property on its own line, which is why the
         // newline test is separate from the width test rather than folded into it.
-        let inner = braces(&entries(7, 3), nested(0));
-        assert!(braces(&[format!("a: {inner}")], 0).starts_with("{\n  a: {\n    k0xxx"));
+        let inner = braces(&entries(7, 3), nested(0), "");
+        assert!(braces(&[format!("a: {inner}")], 0, "").starts_with("{\n  a: {\n    k0xxx"));
     }
 }

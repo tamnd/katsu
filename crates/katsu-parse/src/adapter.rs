@@ -30,7 +30,7 @@ use oxc_ast::ast as oxc;
 use crate::ParseError;
 use crate::ast::{
     AssignOp, BinaryOp, Binding, Case, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module,
-    Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 
 /// Turn one parsed program into our tree.
@@ -449,6 +449,8 @@ impl Adapter<'_> {
 
             oxc::Expression::CallExpression(node) => self.call(node, strict)?,
 
+            oxc::Expression::ObjectExpression(node) => self.object(node, strict)?,
+
             oxc::Expression::FunctionExpression(node) => {
                 // A function expression without a body is a TypeScript overload signature in a
                 // position where there is nothing to fall through to, so unlike the declaration
@@ -463,6 +465,62 @@ impl Adapter<'_> {
         };
 
         Ok(adapted)
+    }
+
+    /// Adapt an object literal whose property names are all known at compile time.
+    ///
+    /// That is the subset the object model can build today. Everything else in the grammar is
+    /// refused by name rather than approximated, and each refusal says which construct it was, so a
+    /// program that uses a getter gets told about the getter instead of being told that object
+    /// literals are unsupported.
+    ///
+    /// Shorthand needs no work here. `{x}` arrives with an identifier key and an identifier value,
+    /// which is exactly the shape `{x: x}` arrives in, and the two lower identically because they
+    /// mean the same thing.
+    fn object(&self, node: &oxc::ObjectExpression<'_>, strict: bool) -> Result<Expr, ParseError> {
+        use oxc_span::GetSpan;
+
+        let mut properties = Vec::with_capacity(node.properties.len());
+        for property in &node.properties {
+            let oxc::ObjectPropertyKind::ObjectProperty(property) = property else {
+                return self.refuse("spread in an object literal", property.span());
+            };
+            match property.kind {
+                oxc::PropertyKind::Init => {}
+                oxc::PropertyKind::Get => return self.refuse("a getter", property.span),
+                oxc::PropertyKind::Set => return self.refuse("a setter", property.span),
+            }
+            if property.method {
+                return self.refuse("a method in an object literal", property.span);
+            }
+            if property.computed {
+                return self.refuse("a computed property name", property.key.span());
+            }
+            let name = match &property.key {
+                oxc::PropertyKey::StaticIdentifier(key) => {
+                    Ident::new(span(key.span), key.name.as_str())
+                }
+                // A string key is a name known at compile time just as much as an identifier is,
+                // and `{'a-b': 1}` is ordinary code rather than an edge case.
+                oxc::PropertyKey::StringLiteral(key) => {
+                    Ident::new(span(key.span), key.value.as_str())
+                }
+                // A numeric key is an array index by another name, and an array index is not a
+                // string key. Until there are elements this is refused rather than stored under the
+                // text of the number, which would put it in the wrong place and enumerate it in the
+                // wrong order.
+                oxc::PropertyKey::NumericLiteral(key) => {
+                    return self.refuse("a numeric property name", key.span);
+                }
+                other => return self.refuse("a property name of this kind", other.span()),
+            };
+            properties.push(Property {
+                span: span(property.span),
+                name,
+                value: self.expression(&property.value, strict)?,
+            });
+        }
+        Ok(Expr::new(span(node.span), ExprKind::Object { properties }))
     }
 
     /// Adapt a property read with a name known at compile time, as in `o.x`.
@@ -1059,6 +1117,94 @@ mod tests {
     }
 
     #[test]
+    fn an_object_literal_keeps_its_properties_in_source_order() {
+        let Expr {
+            kind: ExprKind::Object { properties },
+            ..
+        } = init("let o = { b: 1, a: 2 };")
+        else {
+            panic!("expected an object literal");
+        };
+        let names: Vec<&str> = properties
+            .iter()
+            .map(|property| property.name.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["b", "a"],
+            "source order is enumeration order, so the adapter must not sort"
+        );
+    }
+
+    #[test]
+    fn a_string_key_and_an_identifier_key_arrive_the_same_way() {
+        // `{'a-b': 1}` has a name that is not an identifier and is still a name known at compile
+        // time, which is the only distinction the object model cares about.
+        for source in ["let o = { 'a-b': 1 };", "let o = { \"a-b\": 1 };"] {
+            let Expr {
+                kind: ExprKind::Object { properties },
+                ..
+            } = init(source)
+            else {
+                panic!("expected an object literal");
+            };
+            assert_eq!(properties[0].name.name, "a-b");
+        }
+    }
+
+    #[test]
+    fn shorthand_is_the_same_node_as_writing_the_name_twice() {
+        // Nothing in the adapter handles shorthand, and this test is what says that is deliberate
+        // rather than an oversight.
+        let ExprKind::Object {
+            properties: shorthand,
+        } = init("let o = { x };").kind
+        else {
+            panic!("expected an object literal");
+        };
+        let ExprKind::Object { properties: long } = init("let o = { x: x };").kind else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(shorthand[0].name.name, long[0].name.name);
+        // The spans differ because the two were written differently, and everything else about the
+        // value is the same node reading the same variable.
+        let (ExprKind::Ident(short), ExprKind::Ident(long)) =
+            (&shorthand[0].value.kind, &long[0].value.kind)
+        else {
+            panic!("expected the value of each to be a name being read");
+        };
+        assert_eq!(short.name, long.name);
+    }
+
+    #[test]
+    fn every_part_of_an_object_literal_we_cannot_build_yet_is_refused_by_its_own_name() {
+        // One message per construct rather than one for object literals as a whole, because a
+        // program that used a getter should be told about the getter.
+        assert_eq!(
+            refused("t.js", "let o = { ...rest };"),
+            "spread in an object literal"
+        );
+        assert_eq!(
+            refused("t.js", "let o = { get a() { return 1; } };"),
+            "a getter"
+        );
+        assert_eq!(refused("t.js", "let o = { set a(v) {} };"), "a setter");
+        assert_eq!(
+            refused("t.js", "let o = { m() {} };"),
+            "a method in an object literal"
+        );
+        assert_eq!(
+            refused("t.js", "let o = { [k]: 1 };"),
+            "a computed property name"
+        );
+        // A numeric key is an array index by another name, and there are no elements yet.
+        assert_eq!(
+            refused("t.js", "let o = { 1: 'a' };"),
+            "a numeric property name"
+        );
+    }
+
+    #[test]
     fn what_m0_does_not_cover_is_refused_by_name() {
         // This list is the M1 work list read backwards, and every line of it should disappear.
         assert_eq!(refused("t.js", "for (;;) {}"), "a for loop");
@@ -1067,7 +1213,6 @@ mod tests {
         assert_eq!(refused("t.js", "throw new Error();"), "throw");
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
-        assert_eq!(refused("t.js", "let x = { a: 1 };"), "an object literal");
         assert_eq!(refused("t.js", "let f = () => 1;"), "an arrow function");
         assert_eq!(refused("t.js", "let x = `hi ${y}`;"), "a template literal");
         assert_eq!(refused("t.js", "let x = /re/;"), "a regular expression");

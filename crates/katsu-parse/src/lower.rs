@@ -1198,6 +1198,54 @@ impl<'a> Lowerer<'a> {
                 Ok(register)
             }
             ExprKind::Call { callee, arguments } => self.call(at, callee, arguments, dst),
+            ExprKind::Object { properties } => {
+                // An object literal is the one expression that writes its destination before its
+                // operands run, because the stores that fill it need somewhere to store into. That
+                // makes the `dst` hint unsafe in a way no other expression is, and unsafe for
+                // reads and not only for writes. `x = {a: (x = 1)}` would build into `x`, let the
+                // inner assignment overwrite it with a number and then store into that number, and
+                // `x = {a: x}` would show the property the half made object rather than the value
+                // `x` had before the line. The second one is why this asks the stronger question,
+                // and the differential harness is what found it.
+                let threatened = properties
+                    .iter()
+                    .any(|property| touches_a_variable(&property.value));
+                let register = match dst {
+                    Some(wanted) if threatened && wanted.0 < self.first_temp => self.alloc(),
+                    _ => self.destination(dst),
+                };
+
+                let slots = u16::try_from(properties.len()).unwrap_or(u16::MAX);
+                self.emit(
+                    at,
+                    Op::NewObject {
+                        dst: register,
+                        slots,
+                    },
+                );
+
+                // One store per property, in source order, which is the order they enumerate in.
+                // A duplicate name stores twice and the second value wins, which is what the
+                // language says and what falls out of doing this with stores rather than with a
+                // single instruction that takes a list.
+                for property in properties {
+                    let mark = self.next_temp;
+                    let value = self.expr(&property.value)?;
+                    self.release(mark);
+                    let key = self.constant(&property.name.name);
+                    let cache = self.cache();
+                    self.emit(
+                        property.span.start,
+                        Op::SetProp {
+                            obj: register,
+                            key,
+                            value,
+                            cache,
+                        },
+                    );
+                }
+                Ok(register)
+            }
             ExprKind::Function(func) => {
                 let blueprint = self.nested(func)?;
                 let register = self.destination(dst);
@@ -1597,6 +1645,60 @@ fn writes_a_variable(expr: &Expr) -> bool {
         ExprKind::Call { callee, arguments } => {
             writes_a_variable(callee) || arguments.iter().any(writes_a_variable)
         }
+        ExprKind::Object { properties } => properties
+            .iter()
+            .any(|property| writes_a_variable(&property.value)),
+    }
+}
+
+/// Whether evaluating this expression can read or write a variable's own register.
+///
+/// The stronger form of the question above, and the one an object literal has to ask, because a
+/// literal writes its destination before its values run. Reading is a hazard there and is not one
+/// anywhere else: every other expression produces its value before anything is written, so an
+/// operand that reads a variable reads what was in it.
+///
+/// Conservative in the same way, and deliberately not narrowed to "reads the variable this is being
+/// assigned to". Lowering has a register here and not a name, so telling the two apart would mean
+/// threading the assignment target down through every expression, and what it would buy is one
+/// move instruction on `let o = { a: somethingElse }`. A move is worth a great deal less than the
+/// machinery to avoid it.
+///
+/// A function expression is not a hazard even though it can capture, because a captured variable
+/// lives in a cell rather than in a register, so making a closure never reads the register a
+/// literal would be building into.
+fn touches_a_variable(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::Null
+        | ExprKind::This
+        | ExprKind::Function(_) => false,
+        ExprKind::Ident(_) | ExprKind::Assign { .. } | ExprKind::Update { .. } => true,
+        ExprKind::Unary { operand, .. } => touches_a_variable(operand),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            touches_a_variable(left) || touches_a_variable(right)
+        }
+        ExprKind::Conditional {
+            test,
+            consequent,
+            alternate,
+        } => {
+            touches_a_variable(test)
+                || touches_a_variable(consequent)
+                || touches_a_variable(alternate)
+        }
+        ExprKind::Field { object, .. } => touches_a_variable(object),
+        ExprKind::Index { object, index } => {
+            touches_a_variable(object) || touches_a_variable(index)
+        }
+        ExprKind::Call { callee, arguments } => {
+            touches_a_variable(callee) || arguments.iter().any(touches_a_variable)
+        }
+        ExprKind::Object { properties } => properties
+            .iter()
+            .any(|property| touches_a_variable(&property.value)),
     }
 }
 
@@ -1843,6 +1945,85 @@ mod tests {
         lower(&ast, &scopes)
             .expect_err("should be refused")
             .construct
+    }
+
+    #[test]
+    fn an_object_literal_is_one_new_object_and_one_store_per_property() {
+        // Three instructions where one would do, on purpose. A store is what takes the shape
+        // transition, so building a literal out of stores means a literal and an object grown a
+        // property at a time reach the same shape and neither needs its own code path.
+        let blueprint = lowered("let o = { a: 1, b: 2 };");
+        assert_code(
+            &code(&blueprint),
+            "
+            new_object r0, 2
+            load_int r1, 1
+            set_prop r0, k0, r1, ic0
+            load_int r1, 2
+            set_prop r0, k1, r1, ic1
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn an_empty_object_literal_is_one_instruction() {
+        let blueprint = lowered("f({});");
+        assert!(
+            code(&blueprint).contains("new_object r1, 0"),
+            "{}",
+            code(&blueprint)
+        );
+    }
+
+    #[test]
+    fn a_property_value_that_writes_a_variable_does_not_build_into_that_variable() {
+        // `x = {a: (x = 1)}` would otherwise build the object in `x`, let the inner assignment
+        // overwrite it with a number, and then store a property on the number. The temporary and
+        // the move at the end are what stop that, and they only appear when a value could write.
+        let hazard = code(&lowered("var x = 0; x = { a: (x = 1) };"));
+        assert!(
+            hazard.contains("new_object r1, 1"),
+            "the object should be built in a temporary, not in r0, {hazard}"
+        );
+        let safe = code(&lowered("var x = 0; x = { a: 1 };"));
+        assert!(
+            safe.contains("new_object r0, 1"),
+            "with nothing that can write, the object goes straight into the variable, {safe}"
+        );
+    }
+
+    #[test]
+    fn a_property_value_that_only_reads_a_variable_does_not_build_into_that_variable_either() {
+        // `x = {a: x}` is the case a test for writes alone lets through. Building into `x` would
+        // hand the property the half made object rather than the value the line started with, and
+        // the differential harness found it as a false circular reference in the printed output.
+        let hazard = code(&lowered("var x = 0; x = { a: x };"));
+        assert!(
+            hazard.contains("new_object r1, 1"),
+            "the object should be built in a temporary, not in r0, {hazard}"
+        );
+        // A read through a property is the same hazard, since the object it reads through is the
+        // variable being built into.
+        let field = code(&lowered("var x = 0; x = { a: x.b };"));
+        assert!(
+            field.contains("new_object r1, 1"),
+            "a field read is a read, {field}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_name_is_two_stores_and_the_second_one_wins() {
+        // Falls out of lowering to stores rather than to an instruction that takes a list, and it
+        // is the behaviour the language specifies, so it is worth a test rather than a comment.
+        let blueprint = lowered("let o = { a: 1, a: 2 };");
+        let text = code(&blueprint);
+        assert_eq!(
+            text.matches("set_prop").count(),
+            2,
+            "both stores are emitted, {text}"
+        );
     }
 
     #[test]
