@@ -119,6 +119,13 @@ struct Machine {
     /// `gamingpc` is a Windows box, so ssh arrives at cmd.exe and the Linux side is one hop
     /// further in.
     shell: Option<&'static str>,
+    /// Whether the benchmark runs against Windows itself rather than a Linux shell on it.
+    ///
+    /// This changes everything about the remote side: the script is PowerShell rather than bash,
+    /// the checkout lives on a drive letter, and pinning is `start /affinity` rather than
+    /// `taskset`. It is a separate field rather than a guess from the host name because
+    /// `gamingpc` and `gamingpc-win` are the same host and only one of them is Windows.
+    windows: bool,
     /// The core benchmarks are pinned to, where pinning is available.
     pin: Option<u8>,
     /// What goes next to a number taken here.
@@ -136,6 +143,7 @@ const MACHINES: &[Machine] = &[
         name: "m4",
         host: None,
         shell: None,
+        windows: false,
         pin: None,
         caveat: "a laptop, so a long suite will thermally throttle and the tail of it is not \
                  comparable with the head",
@@ -144,8 +152,23 @@ const MACHINES: &[Machine] = &[
         name: "gamingpc",
         host: Some("gamingpc"),
         shell: Some("wsl -d Ubuntu -- bash -c"),
+        windows: false,
         pin: Some(4),
         caveat: "WSL2, which is a virtual machine, and turbo is not pinned yet",
+    },
+    // The same physical box as `gamingpc`, running Windows itself. Having both means a number
+    // can be attributed to an operating system rather than to hardware, which is how the
+    // quadratic commit pattern in the heap was found.
+    Machine {
+        name: "gamingpc-win",
+        host: Some("gamingpc"),
+        shell: None,
+        windows: true,
+        // Mask rather than core number: 3 is the two threads of the first performance core.
+        // A 13900K has efficiency cores too and an unpinned run lands on one about half the
+        // time, which halves every number and looks like a regression.
+        pin: Some(3),
+        caveat: "Windows with Defender live scanning on, and turbo is not pinned yet",
     },
 ];
 
@@ -182,7 +205,7 @@ fn list_machines() {
                 }
             }
         };
-        println!("{:<10} {:<28} {}", machine.name, reachable, machine.caveat);
+        println!("{:<14} {:<28} {}", machine.name, reachable, machine.caveat);
     }
 }
 
@@ -227,15 +250,30 @@ fn bench(args: &BenchArgs) -> Result<()> {
         );
     }
 
-    let pin = machine
-        .pin
-        .map_or(String::new(), |core| format!("taskset -c {core} "));
     let filter_arg = if filter.is_empty() {
         String::new()
     } else {
         format!(" -- {filter}")
     };
-    let script = format!(
+    let script = if machine.windows {
+        windows_script(machine, &commit, &args.package, &filter_arg)
+    } else {
+        unix_script(machine, &commit, &args.package, &filter_arg)
+    };
+
+    eprintln!(
+        "bench: running on {} at {commit}, {}",
+        machine.name, machine.caveat
+    );
+    run_remote(host, machine.shell, &script, machine.windows)
+}
+
+/// The bash side of a remote run.
+fn unix_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
+    let pin = machine
+        .pin
+        .map_or(String::new(), |core| format!("taskset -c {core} "));
+    format!(
         "set -e\n\
          export PATH=\"$HOME/.cargo/bin:$PATH\"\n\
          mkdir -p ~/katsu-bench-checkout\n\
@@ -249,29 +287,63 @@ fn bench(args: &BenchArgs) -> Result<()> {
          echo \"load: $(cut -d' ' -f1-3 /proc/loadavg)\"\n\
          echo \"toolchain: $(rustc --version)\"\n\
          echo \"commit: $(git log --oneline -1)\"\n\
-         {pin}cargo bench -p {package}{filter_arg}\n",
-        package = args.package,
-    );
+         {pin}cargo bench -p {package}{filter_arg}\n"
+    )
+}
 
-    eprintln!(
-        "bench: running on {} at {commit}, {}",
-        machine.name, machine.caveat
-    );
-    run_remote(host, machine.shell, &script)
+/// The PowerShell side of a remote run.
+///
+/// Pinning goes through `cmd /c start /affinity`, because that is the only way to set affinity on
+/// a process from the outside before it starts, and the mask is inherited by the benchmark binary
+/// cargo spawns. `/wait /b` keeps it in this console so its output comes back over ssh instead of
+/// opening a window on somebody's desktop.
+fn windows_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
+    let bench = format!("cargo bench -p {package}{filter_arg}");
+    let pinned = match machine.pin {
+        Some(mask) => format!("cmd /c \"start /wait /b /affinity {mask:x} cmd /c {bench}\""),
+        None => bench,
+    };
+    format!(
+        // Progress records come back over ssh as raw CLIXML in the middle of the results, so
+        // they are turned off rather than filtered out afterwards.
+        "$ErrorActionPreference = 'Stop'\n\
+         $ProgressPreference = 'SilentlyContinue'\n\
+         $env:PATH = \"$env:USERPROFILE\\.cargo\\bin;$env:PATH\"\n\
+         New-Item -ItemType Directory -Force -Path C:\\katsu-bench-checkout | Out-Null\n\
+         Set-Location C:\\katsu-bench-checkout\n\
+         if (-not (Test-Path katsu)) {{ git clone -q https://github.com/tamnd/katsu.git }}\n\
+         Set-Location katsu\n\
+         git fetch -q origin\n\
+         git checkout -q --detach {commit}\n\
+         Write-Output \"machine: $((Get-CimInstance Win32_Processor).Name), \
+         $env:NUMBER_OF_PROCESSORS threads\"\n\
+         Write-Output \"toolchain: $(rustc --version)\"\n\
+         Write-Output \"commit: $(git log --oneline -1)\"\n\
+         {pinned}\n"
+    )
 }
 
 /// Ship a script to a remote host and run it.
 ///
 /// The script is base64 encoded rather than quoted because `gamingpc` routes through cmd.exe on
 /// the way to a Linux shell, and getting a multi line script with quotes and pipes through two
-/// layers of unrelated quoting rules intact is not a problem worth solving twice.
-fn run_remote(host: &str, shell: Option<&str>, script: &str) -> Result<()> {
-    let encoded = base64(script.as_bytes());
-    let inner =
-        format!("echo {encoded} | base64 -d > /tmp/xtask-bench.sh; bash /tmp/xtask-bench.sh");
-    let remote = match shell {
-        Some(shell) => format!("{shell} \"{inner}\""),
-        None => inner,
+/// layers of unrelated quoting rules intact is not a problem worth solving twice. PowerShell has
+/// the same encoding built in as `-EncodedCommand`, which wants UTF-16 rather than UTF-8.
+fn run_remote(host: &str, shell: Option<&str>, script: &str, windows: bool) -> Result<()> {
+    let remote = if windows {
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        format!(
+            "powershell -NoProfile -NonInteractive -EncodedCommand {}",
+            base64(&utf16)
+        )
+    } else {
+        let encoded = base64(script.as_bytes());
+        let inner =
+            format!("echo {encoded} | base64 -d > /tmp/xtask-bench.sh; bash /tmp/xtask-bench.sh");
+        match shell {
+            Some(shell) => format!("{shell} \"{inner}\""),
+            None => inner,
+        }
     };
 
     let status = Command::new("ssh")
@@ -392,7 +464,7 @@ fn check_layers() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MACHINES, base64, machine};
+    use super::{MACHINES, base64, machine, unix_script, windows_script};
 
     #[test]
     fn base64_matches_the_reference_vectors() {
@@ -427,5 +499,48 @@ mod tests {
             machine("server3").is_err(),
             "cloud boxes are not reference machines"
         );
+    }
+
+    #[test]
+    fn the_two_faces_of_one_box_are_separate_entries_on_the_same_host() {
+        // Same hardware, different operating system. Keeping them as two names is what lets a
+        // published number say which one it came from, which is the only reason the pair is
+        // useful at all.
+        let linux = machine("gamingpc").unwrap();
+        let windows = machine("gamingpc-win").unwrap();
+        assert_eq!(linux.host, windows.host);
+        assert!(!linux.windows);
+        assert!(windows.windows);
+    }
+
+    #[test]
+    fn each_script_pins_the_way_its_platform_pins() {
+        let linux = machine("gamingpc").unwrap();
+        let script = unix_script(linux, "abc123", "katsu-gc", " -- allocate");
+        assert!(script.contains("taskset -c 4 cargo bench -p katsu-gc -- allocate"));
+        assert!(script.contains("git checkout -q --detach abc123"));
+
+        let windows = machine("gamingpc-win").unwrap();
+        let script = windows_script(windows, "abc123", "katsu-gc", " -- allocate");
+        // The mask is hexadecimal because that is what `start /affinity` reads it as, and 3 is
+        // the two threads of the first performance core.
+        assert!(script.contains("start /wait /b /affinity 3 cmd /c cargo bench -p katsu-gc"));
+        assert!(script.contains("git checkout -q --detach abc123"));
+        assert!(
+            !script.contains("taskset"),
+            "the windows script should not be reaching for a linux tool"
+        );
+    }
+
+    #[test]
+    fn a_powershell_payload_is_utf16_before_it_is_base64() {
+        // PowerShell's -EncodedCommand reads UTF-16LE, so encoding the UTF-8 bytes instead
+        // produces a script that decodes to something that looks like it was chopped in half.
+        // This is the vector for "Set-Location", which is enough to catch a byte order slip.
+        let utf16: Vec<u8> = "Set-Location"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(base64(&utf16), "UwBlAHQALQBMAG8AYwBhAHQAaQBvAG4A");
     }
 }
