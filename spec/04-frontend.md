@@ -12,6 +12,34 @@ The cost is an AST we do not control and somebody else's release cadence. The mi
 
 What we do write is the scope analysis, the lowering, and the bytecode. That is where the engine actually lives.
 
+### 4.1.1 The adapter, as built
+
+The mitigation above is only worth anything if it is enforced, so it is. `crates/katsu-parse/src/adapter.rs` is the only file in the workspace that names an oxc type, and `crates/katsu-parse/src/ast.rs` holds the tree everything above it sees. The lowering pass named in 4.1 does not consume the oxc AST after all, it consumes ours, which is a stronger version of the same promise: the surface we depend on is one file and it is small enough to read in a sitting.
+
+Two decisions in the tree are worth writing down because they are cheap now and expensive later.
+
+Every node carries a span from the moment it is built. Source positions retrofitted into a tree are always wrong somewhere, usually in the nodes nobody thought about, and stack traces are a Node compatibility requirement rather than a nicety, so the cost of carrying eight bytes per node is paid up front.
+
+Assignment targets are a separate type from expressions. The grammar allows only a name, a fixed property or a computed property on the left of an equals sign, and encoding that in the type means lowering pattern matches on three cases with no arm for the impossible ones. Every pass that would otherwise have to re-check gets the guarantee for free.
+
+Identifiers are owned strings rather than atoms interned into the heap. `katsu-parse` and `katsu-gc` are both at layer 2 and neither can depend on the other, so interning happens at lowering, which sits above both. That is one allocation per identifier occurrence, and it is a real cost of the layering rather than an oversight. If it ever shows up in a profile the fix is a name table local to the parse, not a layering violation.
+
+Strictness is decided in the adapter and not left for a later pass. A module is strict without saying so, a script is strict only if it opens with the directive, and a function inherits from the code around it and can turn strictness on but never off. The adapter is the only place that still has the nesting in hand while it walks, and strictness changes what `this` is in a plain call and whether an assignment to an undeclared name throws, so it is not a detail that can be filled in afterwards.
+
+The M0 subset is literals, identifiers, `this`, the unary, binary, logical, update, assignment and conditional operators, member access, calls, functions, `var`, `let`, `const`, `if`, `while`, blocks, `return` and expression statements. Everything else is refused with the construct named the way a JavaScript programmer would name it, and a line and a column. The refusal list is the M1 and M2 work list read backwards and it should shrink to nothing. The alternative, quietly producing bytecode for syntax the frontend does not understand, is worse than admitting the gap.
+
+TypeScript erasure lives here too, and it splits in two. The syntax listed as erasable in 4.2 leaves nothing behind: annotations, interfaces, type aliases, `declare`, overload signatures, and `as`, `satisfies`, type assertions and non null assertions all unwrap to the expression underneath. The syntax listed in the 4.2 transform table is refused by name at M0 rather than dropped, because an enum, a namespace and a parameter property all mean something at run time, and dropping one would leave every reference to it broken in a way that looks like a bug in the runtime rather than a gap in the frontend.
+
+The frontend benchmark measures parsing and adapting together and does not try to separate them. Splitting them would mean making the adapter reachable from outside the crate, which gives up the exact property the module boundary exists to protect, and a program pays for both or neither anyway. Sources are synthetic and every construct in them is inside the M0 subset, so the number is the adapter working rather than the adapter refusing on the first line.
+
+| Source | Size | m4 | gamingpc |
+|---|---|---|---|
+| 200 small functions | 24.8 KiB | 192 us, 126 MiB/s | 195 us, 124 MiB/s |
+| One 600 statement function | 18.1 KiB | 167 us, 106 MiB/s | 231 us, 77 MiB/s |
+| 200 functions with TypeScript types | 41.9 KiB | 277 us, 147 MiB/s | 332 us, 123 MiB/s |
+
+The TypeScript row being the fastest per byte is not a surprise once you look at what is in it, since a type annotation is bytes the parser skims and the adapter never allocates for. The one place the two machines genuinely disagree is the long function, where the m4 is 38 percent faster per byte than the i9 while the two are within a couple of percent on the other two shapes. A single 600 statement body is one long vector growing under a deep recursion and nothing else, so that row is closer to a memory subsystem measurement than a frontend one. It is recorded rather than explained away, and it is worth a second look if the gap survives the real lowering pass landing on top of it.
+
 ## 4.2 TypeScript: erase, transform, never check
 
 `katsu run` treats TypeScript as JavaScript with extra syntax. No type checking at runtime, ever. Node, Deno and Bun all behave this way and users expect it.
