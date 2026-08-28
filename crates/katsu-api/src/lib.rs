@@ -43,8 +43,10 @@ impl From<RuntimeError> for Error {
             RuntimeError::OutOfMemory | RuntimeError::Interrupted => {
                 Error::Fatal(error.to_string())
             }
-            // The three JavaScript exceptions, which carry the message Node prints and which a
-            // `try` will catch once there is one.
+            // Everything a `try` in the program could have caught and nothing did. An error the
+            // engine raised says what Node says word for word, and a value the program threw has
+            // already been rendered by the interpreter that owned it, because a value cannot be
+            // read once it is outside the heap it lives in.
             other => Error::Uncaught(other.to_string()),
         }
     }
@@ -245,6 +247,56 @@ mod tests {
             .eval("hello.js", "console.log('hello ' + 'katsu')")
             .expect("should run");
         assert_eq!(recorder.text(), "hello katsu\n");
+    }
+
+    #[test]
+    fn an_exception_unwinds_out_of_the_calls_it_was_thrown_in() {
+        // The reason a handler table is searched across frames rather than inside one. Node prints
+        // exactly this, and the frames in between are gone by the time the handler runs.
+        let mut runtime = runtime();
+        let recorder = Recorder::new();
+        runtime.set_output(Box::new(recorder.clone()));
+        runtime
+            .eval(
+                "deep.js",
+                "function bottom() { throw 'from the bottom'; }
+                 function middle() { bottom(); return 'not reached'; }
+                 try { middle(); } catch (e) { console.log(e); }",
+            )
+            .expect("the handler catches it");
+        assert_eq!(recorder.text(), "from the bottom\n");
+    }
+
+    #[test]
+    fn a_caught_engine_error_carries_the_name_and_the_message_node_uses() {
+        // The message is word for word what Node prints, because the whole point of matching it is
+        // that somebody searching the web for their error finds an answer that applies.
+        let mut runtime = runtime();
+        let recorder = Recorder::new();
+        runtime.set_output(Box::new(recorder.clone()));
+        runtime
+            .eval(
+                "err.js",
+                "try { null.x; } catch (e) { console.log(e.name, e.message); }",
+            )
+            .expect("the handler catches it");
+        assert_eq!(
+            recorder.text(),
+            "TypeError Cannot read properties of null (reading 'x')\n"
+        );
+    }
+
+    #[test]
+    fn an_uncaught_throw_reports_the_value_and_not_a_message_about_it() {
+        // Node's last line for `throw 'boom'` is the word on its own, and the CLI prints an
+        // uncaught exception bare for exactly that reason, so a script grepping our output finds
+        // what it would have found from Node.
+        let mut runtime = runtime();
+        let error = runtime
+            .eval("bad.js", "throw 'boom';")
+            .expect_err("nothing catches it");
+        assert!(matches!(error, Error::Uncaught(_)), "got {error:?}");
+        assert_eq!(error.to_string(), "uncaught exception: boom");
     }
 
     #[test]

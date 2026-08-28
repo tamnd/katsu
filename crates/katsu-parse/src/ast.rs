@@ -418,6 +418,40 @@ pub struct Case {
     pub body: Vec<Stmt>,
 }
 
+/// A braced block of statements, and where it was written.
+///
+/// A block is a scope, and a scope needs a span, because the check that catches a `var` hoisted
+/// out of a block and past a `let` of the same name works by asking which spans contain which. A
+/// `try` has two or three of these next to each other and they are genuinely separate scopes, so
+/// `try { let q; } catch (e) { var q; }` is legal and would not be if they shared a span.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    /// Where the block was written, braces included.
+    pub span: Span,
+    /// The statements inside it.
+    pub body: Vec<Stmt>,
+}
+
+/// The `catch` clause of a `try`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Catch {
+    /// The whole clause, from `catch` to the closing brace of its body.
+    pub span: Span,
+    /// The name the thrown value is bound to, absent for `catch {}`.
+    ///
+    /// A name rather than a pattern, because destructuring is not in the subset yet and a
+    /// destructuring catch parameter is refused by name in the adapter.
+    pub param: Option<Ident>,
+    /// The body, which runs with `param` bound in the same scope the body's own names go in.
+    ///
+    /// One scope rather than the two the specification describes, and it gives the same answers.
+    /// The standard puts the parameter in an environment of its own around the body's, and then
+    /// adds an early error saying the body must not lexically declare the parameter's name, which
+    /// is exactly what one scope already says. `catch (e) { let e; }` is a redeclaration either
+    /// way and `catch (e) { var e; }` is legal either way.
+    pub body: Block,
+}
+
 /// A statement.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stmt {
@@ -473,6 +507,21 @@ pub enum StmtKind {
         /// The clauses, `default` among them and in its written position, because where it sits
         /// decides where control lands when nothing matched and also what falls through into it.
         cases: Vec<Case>,
+    },
+    /// `throw`, which always has a value, because `throw` on its own is a syntax error.
+    Throw(Expr),
+    /// `try`, with a `catch` clause, a `finally` clause, or both.
+    ///
+    /// One of the two clauses is always present, because `try` on its own is a syntax error, and
+    /// this is not modelled in the type: the adapter refuses a tree without either rather than
+    /// making every reader of this node handle a case the grammar cannot produce.
+    Try {
+        /// The protected block.
+        block: Block,
+        /// The handler, if one was written.
+        catch: Option<Catch>,
+        /// The block that runs however the protected block finished, if one was written.
+        finally: Option<Block>,
     },
     /// `break`, which leaves the nearest enclosing loop or switch.
     ///

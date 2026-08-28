@@ -199,7 +199,7 @@ impl Builder<'_> {
         let choice = if depth >= 2 {
             self.random.below(4)
         } else {
-            self.random.below(8)
+            self.random.below(9)
         };
         match choice {
             0 | 1 => self.declaration(),
@@ -208,6 +208,7 @@ impl Builder<'_> {
             4 => self.assignment(),
             5 => self.branch(depth),
             6 => self.switch_statement(depth),
+            7 => self.try_statement(depth),
             _ => self.loop_statement(depth),
         }
     }
@@ -361,6 +362,47 @@ impl Builder<'_> {
             clauses.insert(at, format!("default: {body}"));
         }
         format!("switch ({subject}) {{ {} }}", clauses.join(" "))
+    }
+
+    /// `let c3 = 0; try { ... throw <expr>; } catch (e3) { c3 = e3; ... }`.
+    ///
+    /// The extra binding is what makes the whole thing observable. A generated handler mentions the
+    /// caught name only by accident, so without somewhere to put it the program would run both
+    /// paths and print the same thing either way, and a difference in where a throw landed would
+    /// never reach the output the harness compares.
+    ///
+    /// The throw is drawn rather than always emitted, because a `try` that always fires never runs
+    /// the path where the protected block finishes, and that is the path almost every real `try`
+    /// takes. The name goes out of scope at the closing brace like any other block binding, which
+    /// is why it is pushed and truncated by hand here instead of going through `block`.
+    fn try_statement(&mut self, depth: usize) -> String {
+        let held = format!("c{}", self.next);
+        let caught = format!("e{}", self.next);
+        self.next += 1;
+        self.live.push(held.clone());
+        self.mutable.push(held.clone());
+
+        let protected = self.block(depth + 1);
+        let throw = if self.random.chance(2) {
+            let value = self.expression(0);
+            format!(" throw {value};")
+        } else {
+            String::new()
+        };
+
+        let live = self.live.len();
+        let mutable = self.mutable.len();
+        let objects = self.objects.len();
+        self.live.push(caught.clone());
+        let handler = self.statement(depth + 1);
+        self.live.truncate(live);
+        self.mutable.truncate(mutable);
+        self.objects.truncate(objects);
+
+        format!(
+            "let {held} = 0; try {{ {protected}{throw} }} catch ({caught}) {{ {held} = {caught}; \
+             {handler} }}"
+        )
     }
 
     /// What to write after `case`.

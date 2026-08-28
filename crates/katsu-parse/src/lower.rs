@@ -43,12 +43,12 @@
 //! functions with many blocks rather than anything incorrect.
 
 use katsu_ir::{
-    BlueprintIndex, CacheIndex, CodeOffset, ConstIndex, FunctionBlueprint, Op, Register,
+    BlueprintIndex, CacheIndex, CodeOffset, ConstIndex, FunctionBlueprint, Handler, Op, Register,
 };
 
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, Case, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module,
-    Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident,
+    LogicalOp, Module, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 use crate::scope::{BindingKind, FunctionId, Reference, Resolution, Scopes};
 
@@ -849,9 +849,95 @@ impl<'a> Lowerer<'a> {
                     .continues
                     .push(jump);
             }
+            StmtKind::Throw(value) => {
+                let mark = self.next_temp;
+                let src = self.expr(value)?;
+                self.emit(at, Op::Throw { src });
+                self.release(mark);
+            }
+            StmtKind::Try {
+                block,
+                catch,
+                finally,
+            } => self.try_statement(at, block, catch.as_ref(), finally.as_ref())?,
             StmtKind::Block(body) => self.body(body)?,
         }
         Ok(())
+    }
+
+    /// Lower a `try` and its `catch`.
+    ///
+    /// Nothing is emitted for entering the protected block, which is the point of a handler table:
+    /// the range is recorded once at lowering time and a `try` that never throws costs exactly what
+    /// the same statements would cost without it. The only instruction the shape adds is the jump
+    /// over the handler, and that one is on the path a program actually takes.
+    ///
+    /// The entry goes into the table after the block it protects has been lowered, which is what
+    /// puts a nested `try` in front of the one around it and makes first match the same thing as
+    /// innermost match.
+    fn try_statement(
+        &mut self,
+        at: u32,
+        block: &Block,
+        catch: Option<&Catch>,
+        finally: Option<&Block>,
+    ) -> Result<(), LowerError> {
+        debug_assert!(
+            finally.is_none(),
+            "the adapter refuses a finally clause by name"
+        );
+        let _ = finally;
+
+        let start = self.here();
+        self.body(&block.body)?;
+        let end = self.here();
+        let over = self.emit(at, Op::Jump { target: UNPATCHED });
+
+        if let Some(catch) = catch {
+            let target = self.here();
+            let register = self.catch_clause(catch)?;
+            // An empty protected block cannot throw, so it gets no entry rather than an entry that
+            // could never fire. `verify` rejects an empty range for the same reason.
+            if start < end {
+                self.blueprint.handlers.push(Handler {
+                    start,
+                    end,
+                    target,
+                    register,
+                });
+            }
+        }
+        self.patch(over);
+        Ok(())
+    }
+
+    /// Lower the body of a `catch`, and say which register the thrown value has to arrive in.
+    ///
+    /// A parameter that nothing captures is a frame slot, so the value is written straight into it
+    /// and the clause starts with no instructions at all. A captured one lives in a cell, so the
+    /// value arrives in a temporary and the first instruction copies it across, which is the same
+    /// two cases a function parameter has and for the same reason.
+    fn catch_clause(&mut self, catch: &Catch) -> Result<Register, LowerError> {
+        let mark = self.next_temp;
+        let register = match &catch.param {
+            Some(param) => {
+                let place = self.ident_place(param);
+                if let Some(slot) = direct_register(place, StoreKind::Initialise) {
+                    slot
+                } else {
+                    let temp = self.alloc();
+                    self.store(param.span.start, place, temp, StoreKind::Initialise);
+                    temp
+                }
+            }
+            // `catch {}` still needs somewhere for the value to land, because the search stores it
+            // before it knows whether anybody wanted it. A register nothing reads is cheaper than
+            // a second kind of table entry saying the value is not wanted.
+            None => self.alloc(),
+        };
+        self.body(&catch.body.body)?;
+        self.release(mark);
+        Ok(register)
     }
 
     /// Lower a `while`.
@@ -2632,6 +2718,126 @@ mod tests {
         assert_eq!(
             refused("let x = 1; delete x;"),
             "delete of anything other than a property"
+        );
+    }
+
+    #[test]
+    fn entering_a_try_costs_nothing() {
+        // The claim the whole design rests on. There is no instruction for entering the protected
+        // block and none for leaving it, so a `try` around a hot loop runs at the speed of the loop.
+        // The only instruction the shape adds is the jump over the handler, and a program that does
+        // not throw is going to run that jump exactly once.
+        let blueprint = lowered("try { f(); } catch (e) { g(); }");
+        assert_code(
+            &code(&blueprint),
+            "
+            load_global r1, k0, ic0
+            call r1, r1, r2, 0, ic1
+            jump @5
+            load_global r1, k1, ic2
+            call r1, r1, r2, 0, ic3
+            load_undefined r1
+            return r1
+            ",
+        );
+        assert_eq!(blueprint.handlers.len(), 1);
+        let handler = blueprint.handlers[0];
+        assert_eq!(
+            (handler.start.0, handler.end.0, handler.target.0),
+            (0, 2, 3),
+            "the range covers the protected block and stops before the jump over the handler"
+        );
+    }
+
+    #[test]
+    fn the_handler_range_stops_before_the_handler() {
+        // Which is what stops a throw inside a `catch` from being caught by the `catch` it is in.
+        // The handler's own instructions are outside every range that names it.
+        let blueprint = lowered("try { f(); } catch (e) { throw e; }");
+        let handler = blueprint.handlers[0];
+        assert!(
+            handler.target.0 >= handler.end.0,
+            "the handler starts at or after the end of the range it handles, {handler:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_try_lands_earlier_in_the_table_than_the_one_around_it() {
+        // Order is the whole of the search rule, so this is the test that says innermost wins. The
+        // entry goes in when the block it protects has been lowered, and the inner block finishes
+        // first, which is what puts it first without anything comparing two ranges.
+        let blueprint = lowered("try { try { f(); } catch (a) { g(); } } catch (b) { h(); }");
+        assert_eq!(blueprint.handlers.len(), 2);
+        let [inner, outer] = [blueprint.handlers[0], blueprint.handlers[1]];
+        assert!(
+            outer.start <= inner.start && inner.end <= outer.end,
+            "the inner range is inside the outer one, {inner:?} and {outer:?}"
+        );
+    }
+
+    #[test]
+    fn a_try_with_nothing_in_it_gets_no_entry() {
+        // An empty protected block cannot throw, so an entry for it could never fire. `verify`
+        // rejects an empty range for the same reason, which is why this is not merely tidiness.
+        assert!(lowered("try {} catch (e) { f(); }").handlers.is_empty());
+    }
+
+    #[test]
+    fn a_catch_with_no_binding_still_names_a_register() {
+        // The search stores the thrown value before it knows whether anybody wanted it, so there
+        // has to be somewhere for it to land. A register nothing reads is cheaper than a second
+        // kind of table entry that says the value is not wanted.
+        let blueprint = lowered("try { f(); } catch { g(); }");
+        assert_eq!(blueprint.handlers.len(), 1);
+        assert!(blueprint.handlers[0].register.0 < blueprint.frame_size);
+    }
+
+    #[test]
+    fn a_caught_value_goes_straight_into_the_slot_it_is_bound_to() {
+        // No copy at the top of the clause, because a parameter nothing captures is an ordinary
+        // frame slot and the search can write into it. The first instruction of the handler is the
+        // first instruction of the body.
+        let blueprint = lowered("try { f(); } catch (e) { g(e); }");
+        let handler = blueprint.handlers[0];
+        assert_eq!(
+            handler.register,
+            katsu_ir::Register(0),
+            "the slot the binding got, {}",
+            code(&blueprint)
+        );
+        let at = handler.target.0 as usize;
+        assert!(
+            format!("{}", blueprint.code[at]).starts_with("load_global"),
+            "the clause starts with its body, {}",
+            code(&blueprint)
+        );
+    }
+
+    #[test]
+    fn a_captured_catch_parameter_arrives_in_a_temporary_and_is_copied_into_its_cell() {
+        // The other of the two cases, and the same two a function parameter has. A captured name
+        // lives in a cell rather than a slot, and the search cannot write into a cell, so the value
+        // lands in a register and the first instruction of the handler moves it across.
+        let blueprint = lowered("try { f(); } catch (e) { function g() { return e; } }");
+        let handler = blueprint.handlers[0];
+        let at = handler.target.0 as usize;
+        assert!(
+            format!("{}", blueprint.code[at]).starts_with("store_upvalue"),
+            "the clause starts by putting the caught value in its cell, {}",
+            code(&blueprint)
+        );
+    }
+
+    #[test]
+    fn throw_is_one_instruction_and_ends_the_code_it_is_last_in() {
+        // No implicit return after it, because `throw` is a terminator and the block is over.
+        let blueprint = lowered("throw 1;");
+        assert_code(
+            &code(&blueprint),
+            "
+            load_int r0, 1
+            throw r0
+            ",
         );
     }
 

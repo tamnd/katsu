@@ -29,18 +29,26 @@
 //! That is the whole of how a program reaches anything the runtime implements for it, and it is why
 //! a global load in front of a call is now a program that runs rather than a program that stops.
 //!
-//! Property access and method calls are not here. Both need an object with properties, and the
-//! object model is M1. They reach the same arm at the bottom of the match and produce an error that
-//! names the opcode, which is a refusal rather than a wrong answer.
+//! Objects are here, with shapes behind them, which means a literal, a named property read, a named
+//! property write and a method call all run. A key computed at run time does not: it reaches the arm
+//! at the bottom of the match and produces an error that names the opcode, which is a refusal rather
+//! than a wrong answer. Prototypes are not here either, so a property nothing wrote is `undefined`
+//! rather than something inherited.
+//!
+//! Exceptions are here. `throw` is one instruction, a `try` is no instructions at all, and where a
+//! throw goes is decided by [`Interpreter::handle`] reading the handler table the frontend wrote.
+//! The search crosses frames, so a throw deep inside a call finds a handler above it, and the frames
+//! in between are popped on the way. `finally` is not here yet, and neither are prototypes, so a
+//! caught engine error is an object with `name` and `message` rather than an instance of `Error`.
 //!
 //! # The one assumption about the heap
 //!
-//! There are four kinds of heap object now, strings, closures, contexts and natives, and the first
-//! word of an object says which. A pointer is no longer self describing, so the three functions that
-//! turn a value into an object, [`Interpreter::as_string`], [`Interpreter::as_closure`] and
-//! [`Interpreter::as_native`], read that word before they believe anything. Everywhere else in the
-//! loop goes through one of them, which is what keeps the assumption in three places instead of
-//! twenty when shapes arrive.
+//! There are several kinds of heap object now, strings, closures, contexts, natives, objects, shapes
+//! and overflow property blocks, and the first word says which. A pointer is not self describing, so
+//! the functions that turn a value into an object, [`Interpreter::as_string`],
+//! [`Interpreter::as_closure`], [`Interpreter::as_native`] and [`Interpreter::as_object`], read that
+//! word before they believe anything. Everywhere else in the loop goes through one of them, which is
+//! what keeps the assumption in four places instead of twenty.
 
 // Same reason as in `number`. JavaScript equality on numbers is exact IEEE equality, so comparing
 // two doubles with `==` is the specified behaviour and not an oversight.
@@ -62,9 +70,15 @@ use crate::{Isolate, Value};
 
 /// Why execution stopped somewhere other than a `return`.
 ///
-/// The first three are JavaScript exceptions, which a program is allowed to catch, and they carry
-/// the message Node prints for the same situation. They are Rust errors here because M0 has no `try`
-/// to catch them with, and when it does the interpreter will catch them rather than propagating.
+/// Some of these are exceptions and some of them are not, and the difference is not a flag on the
+/// variant. It is the list the unwinder checks before it starts looking for a handler:
+/// running out of memory, being asked to stop, and reaching an opcode nobody has written yet are
+/// things that happened to a program rather than things a program did, and Node cannot catch its
+/// equivalents either.
+///
+/// The three that carry a message stay a message until something catches one. Turning one into an
+/// object costs an allocation and a shape transition, and almost none of them are ever caught, so
+/// that is paid for at the `catch` rather than at the throw.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
     /// A `ReferenceError`, which today means a dead zone check fired.
@@ -76,6 +90,19 @@ pub enum RuntimeError {
     /// A `RangeError`, which today means the stack ran out.
     #[error("RangeError: {0}")]
     Range(String),
+    /// A value the program threw, on its way up the stack.
+    ///
+    /// The only variant holding a value rather than a message, because `throw` takes an expression
+    /// and an expression can produce anything. It never leaves [`Interpreter::run`]: a value is an
+    /// address in one interpreter's heap and means nothing outside it, so the top of the stack
+    /// turns one into [`RuntimeError::Uncaught`] while it still holds both. The message here is the
+    /// same sentence whatever the value is, and it is written because the type needs one rather
+    /// than because anything reads it.
+    #[error("an exception reached the top of the stack")]
+    Thrown(Value),
+    /// A thrown value nothing caught, printed the way `console.log` would have printed it.
+    #[error("{0}")]
+    Uncaught(String),
     /// An opcode that lowering can emit and the interpreter cannot run yet.
     ///
     /// Not a panic, because the point of it is that a program using a construct we have not finished
@@ -108,6 +135,18 @@ impl From<StackError> for RuntimeError {
             StackError::Reserve(inner) => RuntimeError::Range(inner.to_string()),
         }
     }
+}
+
+/// Where an unwind ended up: which function is running now, and where in it.
+///
+/// Two numbers rather than the four variables the loop keeps, because the other two are derived
+/// from the function index and looking them up is what the loop does after a call as well. This is
+/// what [`Interpreter::handle`] hands back, and it is a struct so that a caller cannot get the pair
+/// the wrong way round.
+#[derive(Clone, Copy, Debug)]
+struct Landing {
+    function: u32,
+    pc: usize,
 }
 
 /// The word every back edge checks, in the isolate rather than in the frame.
@@ -376,7 +415,12 @@ impl Interpreter {
         // is left with an empty stack and is usable again, rather than carrying dead frames the next
         // call would trip over.
         self.stack.unwind();
-        outcome
+        match outcome {
+            // The last point at which a thrown value and the heap it lives in are both in reach.
+            // Past here the value is an address nobody can read, so it becomes text on the way out.
+            Err(RuntimeError::Thrown(value)) => Err(RuntimeError::Uncaught(self.display(value))),
+            other => other,
+        }
     }
 
     /// Flatten a blueprint tree into a unit, resolving every function's constant pool on the way.
@@ -435,12 +479,52 @@ impl Interpreter {
     /// function is running, its code and its constants. They are locals rather than reads through
     /// the frame because every instruction touches at least one of them, and a call is the only
     /// thing that moves them.
-    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
+    ///
+    /// `needless_continue` is off because the `continue` it points at is the one inside `raise!`,
+    /// and that `continue` is what makes the macro diverge so that it can be written in expression
+    /// position and in a `let ... else`. It is redundant only at the arms where the raise happens to
+    /// be the last thing in the loop body, and removing it there would mean two spellings of the
+    /// same macro chosen by where it is called from.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::match_same_arms,
+        clippy::needless_continue
+    )]
     fn execute(&mut self, unit: &Unit<'_>) -> Result<Value, RuntimeError> {
         let mut function = 0_u32;
         let mut blueprint = unit.function(function).blueprint;
         let mut constants = unit.function(function).constants.as_slice();
         let mut pc = 0_usize;
+
+        // `?` is the wrong thing to do with an exception, because it leaves the function and every
+        // handler in the program with it. These two put it back: `raise!` hands the error to the
+        // unwinder and carries on running wherever that lands, and `guard!` is the same thing
+        // spelled for a call that returns a `Result`. The `?` inside `raise!` is then exactly the
+        // uncaught path, which is the one case where leaving is right.
+        //
+        // Macros rather than a method because the four variables above the loop are what an unwind
+        // changes, and a method cannot assign to them. They are defined here rather than at the top
+        // of the file so that they can name those variables, which is what makes every call site
+        // one word instead of five lines, and the `continue` in `raise!` belongs to the loop it is
+        // written inside rather than to anything in the macro.
+        macro_rules! raise {
+            ($error:expr) => {{
+                let landing = self.handle(unit, $error, function, pc)?;
+                function = landing.function;
+                blueprint = unit.function(function).blueprint;
+                constants = unit.function(function).constants.as_slice();
+                pc = landing.pc;
+                continue;
+            }};
+        }
+        macro_rules! guard {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => raise!(error),
+                }
+            };
+        }
 
         loop {
             // A verified blueprint ends in a terminator and has no jump target past its end, so
@@ -475,13 +559,13 @@ impl Interpreter {
                 Op::ThrowIfUninitialized { src, name } => {
                     if self.stack.get(src).is_empty() {
                         let name = Self::constant_name(blueprint, name);
-                        return Err(RuntimeError::Reference(format!(
+                        raise!(RuntimeError::Reference(format!(
                             "Cannot access '{name}' before initialization"
                         )));
                     }
                 }
                 Op::ThrowConstAssignment => {
-                    return Err(RuntimeError::Type(
+                    raise!(RuntimeError::Type(
                         "Assignment to constant variable.".to_owned(),
                     ));
                 }
@@ -505,7 +589,7 @@ impl Interpreter {
                     // program, which measured at more than twice the cost of the addition itself.
                     let value = match (left.as_f64(), right.as_f64()) {
                         (Some(left), Some(right)) => Value::from_f64(left + right),
-                        _ => self.add_slowly(left, right)?,
+                        _ => guard!(self.add_slowly(left, right)),
                     };
                     self.stack.set(dst, value);
                 }
@@ -570,11 +654,11 @@ impl Interpreter {
                 }
 
                 Op::Equal { dst, lhs, rhs, .. } => {
-                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs))?;
+                    let equal = guard!(self.loose_equal(self.stack.get(lhs), self.stack.get(rhs)));
                     self.stack.set(dst, Value::from_bool(equal));
                 }
                 Op::NotEqual { dst, lhs, rhs, .. } => {
-                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs))?;
+                    let equal = guard!(self.loose_equal(self.stack.get(lhs), self.stack.get(rhs)));
                     self.stack.set(dst, Value::from_bool(!equal));
                 }
                 Op::StrictEqual { dst, lhs, rhs, .. } => {
@@ -594,21 +678,21 @@ impl Interpreter {
                 // them as its own float comparison agrees on numbers and disagrees on strings, where
                 // `"a" <= "b"` is not `!("a" > "b")` by accident but by definition.
                 Op::Less { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs))?;
+                    let less = guard!(self.less_than(self.stack.get(lhs), self.stack.get(rhs)));
                     self.stack.set(dst, Value::from_bool(less.unwrap_or(false)));
                 }
                 Op::Greater { dst, lhs, rhs, .. } => {
                     // The operands go in the other way round, which is what makes `>` a `<` with its
                     // arguments swapped rather than a comparison of its own.
-                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs))?;
+                    let less = guard!(self.less_than(self.stack.get(rhs), self.stack.get(lhs)));
                     self.stack.set(dst, Value::from_bool(less.unwrap_or(false)));
                 }
                 Op::LessEqual { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs))?;
+                    let less = guard!(self.less_than(self.stack.get(rhs), self.stack.get(lhs)));
                     self.stack.set(dst, Value::from_bool(!less.unwrap_or(true)));
                 }
                 Op::GreaterEqual { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs))?;
+                    let less = guard!(self.less_than(self.stack.get(lhs), self.stack.get(rhs)));
                     self.stack.set(dst, Value::from_bool(!less.unwrap_or(true)));
                 }
 
@@ -637,7 +721,7 @@ impl Interpreter {
                     self.stack.set(dst, Value::from_bool(!truthy));
                 }
                 Op::TypeOf { dst, src } => {
-                    let value = self.type_of_value(self.stack.get(src))?;
+                    let value = guard!(self.type_of_value(self.stack.get(src)));
                     self.stack.set(dst, value);
                 }
 
@@ -706,15 +790,15 @@ impl Interpreter {
                 }
 
                 Op::LoadUpvalue { dst, hops, slot } => {
-                    let value = self.upvalue(hops, slot)?;
+                    let value = guard!(self.upvalue(hops, slot));
                     self.stack.set(dst, value);
                 }
                 Op::StoreUpvalue { hops, slot, src } => {
                     let value = self.stack.get(src);
-                    let context = self.context_at(hops)?;
+                    let context = guard!(self.context_at(hops));
                     if !context.set_cell(self.isolate.heap_mut(), u32::from(slot), value.to_bits())
                     {
-                        return Err(Self::broken_environment());
+                        raise!(Self::broken_environment());
                     }
                 }
 
@@ -724,7 +808,7 @@ impl Interpreter {
                 Op::LoadGlobal { dst, name, .. } => {
                     let key = self.name_at(constants, name);
                     let Some(value) = self.isolate.globals().get(key) else {
-                        return Err(RuntimeError::Reference(format!(
+                        raise!(RuntimeError::Reference(format!(
                             "{} is not defined",
                             Self::constant_name(blueprint, name)
                         )));
@@ -765,7 +849,7 @@ impl Interpreter {
                         // called, and which language its body is written in is not something the
                         // call site knows.
                         if let Some(native) = self.as_native(target) {
-                            let value = self.call_native(native, args, argc)?;
+                            let value = guard!(self.call_native(native, args, argc));
                             self.stack.set(dst, value);
                             continue;
                         }
@@ -775,7 +859,7 @@ impl Interpreter {
                         // source span of every call site, which is the same work that makes a
                         // function stringify as its source, and both land together.
                         let text = self.display(target);
-                        return Err(RuntimeError::Type(format!("{text} is not a function")));
+                        raise!(RuntimeError::Type(format!("{text} is not a function")));
                     };
                     let index = closure.function(self.isolate.cage());
                     let captured = closure.captured(self.isolate.cage());
@@ -784,17 +868,27 @@ impl Interpreter {
                     // there because it was advanced before the match. It is recorded on the frame
                     // being pushed rather than the one being left, so a return is one pop and a
                     // read rather than a search back through the stack.
-                    self.stack.push_call(
-                        callee.frame_size,
-                        Invocation {
-                            arity: callee.arity,
-                            first: args,
-                            passed: argc,
-                            function: index,
-                            return_pc: u32::try_from(pc).map_err(|_| Self::code_too_long())?,
-                            return_to: dst,
-                        },
-                    )?;
+                    //
+                    // A push that fails is a stack overflow, and that is an exception like any
+                    // other: node catches `RangeError: Maximum call stack size exceeded` in a
+                    // `try` and so does this. The frame was not pushed, so the search starts in
+                    // the frame that made the call, which is where the error happened.
+                    let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                    guard!(
+                        self.stack
+                            .push_call(
+                                callee.frame_size,
+                                Invocation {
+                                    arity: callee.arity,
+                                    first: args,
+                                    passed: argc,
+                                    function: index,
+                                    return_pc,
+                                    return_to: dst,
+                                },
+                            )
+                            .map_err(RuntimeError::from)
+                    );
                     self.set_frame_context(captured);
                     function = index;
                     blueprint = callee;
@@ -829,7 +923,7 @@ impl Interpreter {
                 Op::GetProp { dst, obj, key, .. } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let value = self.property(object, name, blueprint, key)?;
+                    let value = guard!(self.property(object, name, blueprint, key));
                     self.stack.set(dst, value);
                 }
 
@@ -849,7 +943,7 @@ impl Interpreter {
                     let name = self.name_at(constants, key);
                     let new = self.stack.get(value);
                     if object.is_nullish() {
-                        return Err(Self::nothing_to_write(object, blueprint, key));
+                        raise!(Self::nothing_to_write(object, blueprint, key));
                     }
                     match self.as_object(object) {
                         Some(target) => {
@@ -858,7 +952,7 @@ impl Interpreter {
                                 .ok_or(RuntimeError::OutOfMemory)?;
                         }
                         None if blueprint.strict => {
-                            return Err(self.nowhere_to_write(object, blueprint, key));
+                            raise!(self.nowhere_to_write(object, blueprint, key));
                         }
                         None => {}
                     }
@@ -879,10 +973,10 @@ impl Interpreter {
                 } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let target = self.property(object, name, blueprint, key)?;
+                    let target = guard!(self.property(object, name, blueprint, key));
                     let Some(closure) = self.as_closure(target) else {
                         if let Some(native) = self.as_native(target) {
-                            let value = self.call_native(native, args, argc)?;
+                            let value = guard!(self.call_native(native, args, argc));
                             self.stack.set(dst, value);
                             continue;
                         }
@@ -891,22 +985,27 @@ impl Interpreter {
                         // call arm is waiting on. The property is named because that half is a
                         // constant this opcode is already holding.
                         let key = Self::constant_name(blueprint, key);
-                        return Err(RuntimeError::Type(format!("{key} is not a function")));
+                        raise!(RuntimeError::Type(format!("{key} is not a function")));
                     };
                     let index = closure.function(self.isolate.cage());
                     let captured = closure.captured(self.isolate.cage());
                     let callee = unit.function(index).blueprint;
-                    self.stack.push_call(
-                        callee.frame_size,
-                        Invocation {
-                            arity: callee.arity,
-                            first: args,
-                            passed: argc,
-                            function: index,
-                            return_pc: u32::try_from(pc).map_err(|_| Self::code_too_long())?,
-                            return_to: dst,
-                        },
-                    )?;
+                    let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                    guard!(
+                        self.stack
+                            .push_call(
+                                callee.frame_size,
+                                Invocation {
+                                    arity: callee.arity,
+                                    first: args,
+                                    passed: argc,
+                                    function: index,
+                                    return_pc,
+                                    return_to: dst,
+                                },
+                            )
+                            .map_err(RuntimeError::from)
+                    );
                     self.set_frame_context(captured);
                     function = index;
                     blueprint = callee;
@@ -914,11 +1013,125 @@ impl Interpreter {
                     pc = 0;
                 }
 
+                // The instruction that hands a value to the unwinder. Where it goes is not written
+                // here and could not be: entering the `try` emitted nothing at all, so the handler
+                // table is the only thing that knows, and it is read now or never.
+                Op::Throw { src } => {
+                    let value = self.stack.get(src);
+                    raise!(RuntimeError::Thrown(value));
+                }
+
                 // Everything that still needs an object that can grow, which is object literals,
                 // indexed access and `delete`. Named rather than silently wrong.
                 _ => return Err(RuntimeError::NotImplemented(op)),
             }
         }
+    }
+
+    /// Find the handler for an error and put the machine where that handler starts.
+    ///
+    /// The search is the price of the design. Entering a `try` costs nothing, because there is
+    /// nothing to enter: the ranges were written into the function when it was lowered, and this
+    /// walks them when something actually throws. `spec/04-frontend.md` took that trade the way the
+    /// JVM took it, on the grounds that a `try` inside a hot loop is common and a throw inside one
+    /// is not.
+    ///
+    /// It searches across frames and not only inside one, which is the whole reason a `throw` deep
+    /// in a call is any use. Every frame with no handler for the instruction it stopped at is
+    /// popped, and the frame underneath resumes at the call that got it into this, which is exactly
+    /// the instruction that needs looking up next.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error unchanged if nothing catches it, and also if nothing could have: out of
+    /// memory, an interrupt and an unimplemented opcode are things that happened to the program
+    /// rather than things the program did, and none of them is catchable in Node either.
+    fn handle(
+        &mut self,
+        unit: &Unit<'_>,
+        error: RuntimeError,
+        function: u32,
+        pc: usize,
+    ) -> Result<Landing, RuntimeError> {
+        if !Self::catchable(&error) {
+            return Err(error);
+        }
+        let mut function = function;
+        let mut pc = pc;
+        loop {
+            // `pc` was moved past the instruction before the match ran, and a frame unwound into
+            // resumes after the call it made, so in both cases the instruction that threw is the
+            // one before `pc` and `pc` is at least one.
+            let at = katsu_ir::CodeOffset(
+                u32::try_from(pc - 1).expect("a pc came from a code offset, which is a u32"),
+            );
+            if let Some(handler) = unit.function(function).blueprint.handler_for(at).copied() {
+                // The value is built here and nowhere earlier, so a `TypeError` that nobody catches
+                // never pays for the object it would have been.
+                let value = self.exception(error)?;
+                self.stack.set(handler.register, value);
+                return Ok(Landing {
+                    function,
+                    pc: handler.target.0 as usize,
+                });
+            }
+            let frame = self
+                .stack
+                .pop()
+                .expect("an exception is always thrown inside a frame");
+            let Some(caller) = self.stack.current().copied() else {
+                return Err(error);
+            };
+            function = caller.function;
+            pc = frame.return_pc as usize;
+        }
+    }
+
+    /// Whether a `catch` is allowed to see this error at all.
+    ///
+    /// The three that are not are not JavaScript exceptions. A program cannot catch running out of
+    /// memory under Node, it cannot catch being killed by a worker terminating, and an opcode this
+    /// build has not written yet is a gap in katsu rather than an event in the program, so letting
+    /// a `catch` swallow one would turn a missing feature into a wrong answer.
+    const fn catchable(error: &RuntimeError) -> bool {
+        !matches!(
+            error,
+            RuntimeError::NotImplemented(_) | RuntimeError::OutOfMemory | RuntimeError::Interrupted
+        )
+    }
+
+    /// The value a `catch` binds, which is where an engine error stops being a message.
+    ///
+    /// A thrown value is already a value and passes straight through. The three the engine raises
+    /// are a name and a message until this point, and become an object with those two as own
+    /// properties, which is what `e.name` and `e.message` read.
+    ///
+    /// It is not an `Error` yet, in the sense that there is no `Error` to be an instance of:
+    /// `e instanceof Error` needs prototypes and `e.stack` needs the source spans that stack traces
+    /// need, and both are still ahead on M1. So `console.log(e)` prints the object rather than
+    /// `TypeError: ...`, which is a difference from Node that is visible and deliberate rather than
+    /// quietly wrong.
+    fn exception(&mut self, error: RuntimeError) -> Result<Value, RuntimeError> {
+        let (name, message) = match error {
+            RuntimeError::Thrown(value) => return Ok(value),
+            RuntimeError::Reference(message) => ("ReferenceError", message),
+            RuntimeError::Type(message) => ("TypeError", message),
+            RuntimeError::Range(message) => ("RangeError", message),
+            // Unreachable, because `handle` returns the uncatchable ones before it starts looking
+            // for a handler. Handing it back rather than panicking keeps that a fact about one
+            // function instead of a claim two functions have to agree on.
+            other => return Err(other),
+        };
+        // The name is interned and the message is not, on purpose. There are three names and a
+        // program that throws will mention them again, while a message is built by `format!` and
+        // is usually seen once, so hashing it would be work spent on a string with no second use.
+        let name = self.intern(name)?;
+        let message = self
+            .isolate
+            .allocate_string(&message)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let message = self.string_value(message);
+        self.host_object(&[("name", name), ("message", message)])
     }
 
     /// The environment the running frame reads captured variables through.
@@ -1797,7 +2010,7 @@ fn compare_numbers(left: f64, right: f64) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use katsu_ir::{
-        CacheIndex, CodeOffset, ConstIndex, ConstantPool, FunctionBlueprint, Op, Register,
+        CacheIndex, CodeOffset, ConstIndex, ConstantPool, FunctionBlueprint, Handler, Op, Register,
     };
 
     use std::fmt::Write;
@@ -1832,6 +2045,34 @@ mod tests {
         };
         blueprint.verify().expect("the test assembled bad bytecode");
         blueprint
+    }
+
+    /// Assemble instructions that protect some of themselves, and verify the lot.
+    ///
+    /// Written out by hand rather than lowered from source, because the point of these tests is
+    /// what the loop does with a table and not what the frontend puts in one. A table lowering
+    /// cannot produce today, such as two entries over the same range, is exactly the case worth
+    /// asking about.
+    fn assemble_handled(code: Vec<Op>, handlers: Vec<Handler>) -> FunctionBlueprint {
+        let blueprint = FunctionBlueprint {
+            frame_size: FRAME,
+            cache_slots: 1,
+            code,
+            handlers,
+            ..FunctionBlueprint::default()
+        };
+        blueprint.verify().expect("the test assembled bad bytecode");
+        blueprint
+    }
+
+    /// One entry, spelled with plain numbers so a test reads as a table rather than as a struct.
+    fn handler(start: u32, end: u32, target: u32, register: u16) -> Handler {
+        Handler {
+            start: CodeOffset(start),
+            end: CodeOffset(end),
+            target: CodeOffset(target),
+            register: Register(register),
+        }
     }
 
     /// Run a sequence of instructions and return what it returned.
@@ -2613,6 +2854,200 @@ mod tests {
         assert!(interpreter.run(&throws).is_err());
         assert_eq!(interpreter.depth(), 0);
         assert_eq!(interpreter.run(&returns), Ok(Value::from_i32(3)));
+        assert_eq!(interpreter.depth(), 0);
+    }
+
+    #[test]
+    fn a_thrown_value_that_nothing_catches_comes_back_as_the_text_of_that_value() {
+        // A value is an address in one interpreter's heap, so it cannot leave as itself. This is
+        // where it stops being a value, and it is the last point at which anything can read it.
+        let mut constants = ConstantPool::default();
+        let boom = constants.string("boom");
+        assert_eq!(
+            run_with(
+                vec![
+                    Op::LoadConst {
+                        dst: Register(0),
+                        src: boom,
+                    },
+                    Op::Throw { src: Register(0) },
+                ],
+                constants,
+            ),
+            Err(RuntimeError::Uncaught("boom".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_throw_inside_a_protected_range_lands_in_the_handler_with_the_value() {
+        let blueprint = assemble_handled(
+            vec![
+                Op::LoadInt {
+                    dst: Register(0),
+                    value: 7,
+                },
+                Op::Throw { src: Register(0) },
+                // Never runs, and it is here so that a handler that did not take would return
+                // something visibly different rather than the same answer by luck.
+                Op::LoadInt {
+                    dst: Register(1),
+                    value: 99,
+                },
+                Op::Return { src: Register(1) },
+                Op::Return { src: Register(2) },
+            ],
+            vec![handler(0, 2, 4, 2)],
+        );
+        assert_eq!(
+            Interpreter::new()
+                .expect("should reserve a stack")
+                .run(&blueprint),
+            Ok(Value::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn a_throw_outside_every_range_is_not_caught() {
+        // The same code with the range moved off the throw. This is the test that says the search
+        // reads the table rather than taking the first entry it finds.
+        let blueprint = assemble_handled(
+            vec![
+                Op::LoadInt {
+                    dst: Register(0),
+                    value: 7,
+                },
+                Op::Throw { src: Register(0) },
+                Op::Return { src: Register(2) },
+            ],
+            vec![handler(2, 3, 2, 2)],
+        );
+        assert_eq!(
+            Interpreter::new()
+                .expect("should reserve a stack")
+                .run(&blueprint),
+            Err(RuntimeError::Uncaught("7".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_first_entry_whose_range_contains_the_throw_wins() {
+        // Two entries over exactly the same range, which is a table lowering would not build and
+        // is the shortest way to ask whether order decides. It has to, because order is how a
+        // nested `try` is told from the one around it without comparing ranges.
+        let blueprint = assemble_handled(
+            vec![
+                Op::LoadInt {
+                    dst: Register(0),
+                    value: 1,
+                },
+                Op::Throw { src: Register(0) },
+                Op::LoadInt {
+                    dst: Register(1),
+                    value: 10,
+                },
+                Op::Return { src: Register(1) },
+                Op::LoadInt {
+                    dst: Register(1),
+                    value: 20,
+                },
+                Op::Return { src: Register(1) },
+            ],
+            vec![handler(0, 2, 2, 3), handler(0, 2, 4, 3)],
+        );
+        assert_eq!(
+            Interpreter::new()
+                .expect("should reserve a stack")
+                .run(&blueprint),
+            Ok(Value::from_i32(10))
+        );
+    }
+
+    #[test]
+    fn an_engine_error_becomes_an_object_the_moment_something_catches_it() {
+        // Until here it is a name and a message, which is what makes entering a `try` free and an
+        // uncaught error cheap. Not an `Error` instance, because there is no `Error` to be an
+        // instance of yet: that needs prototypes, and so does the `stack` this deliberately lacks.
+        let blueprint = assemble_handled(
+            vec![Op::ThrowConstAssignment, Op::Return { src: Register(0) }],
+            vec![handler(0, 1, 1, 0)],
+        );
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        let value = interpreter.run(&blueprint).expect("the handler catches it");
+        assert_eq!(
+            interpreter.display(value),
+            "{ name: 'TypeError', message: 'Assignment to constant variable.' }"
+        );
+    }
+
+    #[test]
+    fn what_no_program_could_have_caused_is_not_catchable() {
+        // An opcode this build does not run is a gap in katsu rather than an event in the program,
+        // and a `catch` that swallowed one would turn a missing feature into a wrong answer. Node
+        // draws the same line: a program cannot catch running out of memory either.
+        let blueprint = assemble_handled(
+            vec![
+                Op::GetIndex {
+                    dst: Register(0),
+                    obj: Register(1),
+                    index: Register(2),
+                    cache: IC,
+                },
+                Op::Return { src: Register(0) },
+            ],
+            vec![handler(0, 1, 1, 0)],
+        );
+        assert!(matches!(
+            Interpreter::new()
+                .expect("should reserve a stack")
+                .run(&blueprint),
+            Err(RuntimeError::NotImplemented(_))
+        ));
+    }
+
+    #[test]
+    fn an_interrupt_is_not_catchable_either() {
+        // Otherwise a program could refuse to be stopped by wrapping itself in a `try`, which is
+        // the one thing the interrupt exists to prevent.
+        let blueprint = assemble_handled(
+            vec![
+                Op::LoadInt {
+                    dst: Register(0),
+                    value: 0,
+                },
+                Op::LoopBackEdge {
+                    target: CodeOffset(0),
+                    profile: IC,
+                },
+                Op::Return { src: Register(0) },
+            ],
+            vec![handler(0, 2, 2, 0)],
+        );
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        let interrupt = interpreter.interrupt();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            interrupt.request();
+        });
+        assert_eq!(interpreter.run(&blueprint), Err(RuntimeError::Interrupted));
+    }
+
+    #[test]
+    fn catching_leaves_the_stack_where_it_was() {
+        // The handler runs in the frame that owns it, so nothing is left over and the interpreter
+        // is as usable afterwards as it is after a return.
+        let blueprint = assemble_handled(
+            vec![
+                Op::LoadInt {
+                    dst: Register(0),
+                    value: 5,
+                },
+                Op::Throw { src: Register(0) },
+                Op::Return { src: Register(1) },
+            ],
+            vec![handler(0, 2, 2, 1)],
+        );
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        assert_eq!(interpreter.run(&blueprint), Ok(Value::from_i32(5)));
         assert_eq!(interpreter.depth(), 0);
     }
 

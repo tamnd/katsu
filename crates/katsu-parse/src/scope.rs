@@ -50,7 +50,8 @@ use std::rc::Rc;
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
-    Case, DeclKind, Expr, ExprKind, Func, Ident, Module, Span, Stmt, StmtKind, Target, TargetKind,
+    Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident, Module, Span, Stmt, StmtKind,
+    Target, TargetKind,
 };
 
 /// Which function a scope belongs to.
@@ -77,6 +78,13 @@ pub enum BindingKind {
     /// A function declaration, or the name a named function expression can see itself by. Both are
     /// initialised when the scope is entered, so neither has a dead zone.
     Function,
+    /// A `catch` parameter, initialised by the handler before the body starts.
+    ///
+    /// Its own kind rather than [`BindingKind::Param`] because the two agree about everything
+    /// except where they live. A function parameter arrives in one of the registers the calling
+    /// convention reserved and a caught value is stored into an ordinary frame slot, so sharing a
+    /// kind would put a catch parameter in register zero and hand it the first argument.
+    Caught,
 }
 
 impl BindingKind {
@@ -586,6 +594,22 @@ impl Analyser {
                         self.hoist_vars(&case.body)?;
                     }
                 }
+                // All three parts, because a `var` hoists out of every one of them. The catch
+                // parameter is not hoisted and is deliberately not looked at here, since it is a
+                // parameter rather than a `var` and belongs to the catch scope alone.
+                StmtKind::Try {
+                    block,
+                    catch,
+                    finally,
+                } => {
+                    self.hoist_vars(&block.body)?;
+                    if let Some(catch) = catch {
+                        self.hoist_vars(&catch.body.body)?;
+                    }
+                    if let Some(finally) = finally {
+                        self.hoist_vars(&finally.body)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -728,9 +752,57 @@ impl Analyser {
                     });
                 }
             }
+            StmtKind::Throw(value) => self.expression(value)?,
+            StmtKind::Try {
+                block,
+                catch,
+                finally,
+            } => self.try_statement(block, catch.as_ref(), finally.as_ref())?,
             StmtKind::Empty => {}
         }
         Ok(())
+    }
+
+    /// Walk the two or three parts of a `try`.
+    ///
+    /// They are scopes side by side and not nested, and the spans passed to `push_block` are what
+    /// say so. That is what makes `try { let q; } catch (e) { var q; }` legal, which it is in node
+    /// and would not be if the catch body sat inside the try block's span.
+    fn try_statement(
+        &mut self,
+        block: &Block,
+        catch: Option<&Catch>,
+        finally: Option<&Block>,
+    ) -> Result<(), ScopeError> {
+        self.push_block(block.span);
+        let result = self.block_body(&block.body);
+        self.blocks.pop();
+        result?;
+        if let Some(catch) = catch {
+            self.push_block(catch.body.span);
+            let result = self.catch_body(catch);
+            self.blocks.pop();
+            result?;
+        }
+        if let Some(finally) = finally {
+            self.push_block(finally.span);
+            let result = self.block_body(&finally.body);
+            self.blocks.pop();
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Declare the catch parameter, then walk the body it is in scope for.
+    ///
+    /// The parameter goes in before `block_body` declares the body's own names, which is what makes
+    /// `catch (e) { let e; }` the redeclaration error node reports rather than a shadowing.
+    fn catch_body(&mut self, catch: &Catch) -> Result<(), ScopeError> {
+        if let Some(param) = &catch.param {
+            let binding = self.declare(param, BindingKind::Caught, param.span)?;
+            self.declaration_reference(param, binding);
+        }
+        self.block_body(&catch.body.body)
     }
 
     fn expression(&mut self, expr: &Expr) -> Result<(), ScopeError> {
@@ -1099,6 +1171,26 @@ mod tests {
                     }
                 }
                 StmtKind::Block(body) => variable_idents(body, out),
+                StmtKind::Throw(value) => expression_idents(value, out),
+                StmtKind::Try {
+                    block,
+                    catch,
+                    finally,
+                } => {
+                    variable_idents(&block.body, out);
+                    if let Some(catch) = catch {
+                        // The parameter is a name in a scope like any other, so it belongs in this
+                        // list. A test that asked whether every identifier resolved would otherwise
+                        // pass by never asking about the one name a `catch` introduces.
+                        if let Some(param) = &catch.param {
+                            out.push(param.clone());
+                        }
+                        variable_idents(&catch.body.body, out);
+                    }
+                    if let Some(finally) = finally {
+                        variable_idents(&finally.body, out);
+                    }
+                }
                 StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {}
             }
         }
@@ -1743,5 +1835,79 @@ mod tests {
         let outer = resolved(&scopes, source, "x", 3);
         assert_ne!(inner.binding, outer.binding);
         assert_eq!(scopes.top_level().frame_slots, 2);
+    }
+
+    #[test]
+    fn a_catch_parameter_is_a_binding_of_its_own_kind() {
+        // Its own kind because a parameter and a caught value disagree about exactly one thing,
+        // which is where they live. A function parameter arrives in one of the registers the
+        // calling convention reserved, so sharing the kind would hand this one the first argument.
+        let source = "try { f(); } catch (e) { e; }";
+        let scopes = analysed(source);
+
+        let reference = resolved(&scopes, source, "e", 1);
+        let binding = reference.binding.expect("the read resolves to a binding");
+        assert_eq!(
+            scopes.bindings()[binding.0 as usize].kind,
+            BindingKind::Caught
+        );
+        assert!(
+            !scopes.bindings()[binding.0 as usize].needs_dead_zone,
+            "the handler stores the value before the body starts, so there is no dead zone"
+        );
+    }
+
+    #[test]
+    fn a_catch_parameter_shadows_an_outer_name_and_gives_it_back() {
+        let source = "let e = 1; try { f(); } catch (e) { e; } e;";
+        let scopes = analysed(source);
+
+        let caught = resolved(&scopes, source, "e", 2);
+        let after = resolved(&scopes, source, "e", 3);
+        assert_ne!(
+            caught.binding, after.binding,
+            "the name inside the clause is the caught one and the name after it is not"
+        );
+    }
+
+    #[test]
+    fn the_catch_parameter_and_the_catch_body_share_one_scope() {
+        // The standard describes two scopes, one for the parameter around one for the body, and
+        // then adds an early error saying the body must not lexically declare the parameter's name.
+        // One scope says the same thing, and node agrees on both halves of it.
+        let (_, _, message) = refused("try { f(); } catch (e) { let e; }");
+        assert!(
+            message.contains("already been declared"),
+            "a let of the parameter's name is a redeclaration, got {message}"
+        );
+        analysed("try { f(); } catch (e) { var e; }");
+    }
+
+    #[test]
+    fn the_try_block_and_the_catch_clause_are_scopes_side_by_side() {
+        // Not nested, which is what makes this legal in node. If the catch body were inside the try
+        // block's span, the check that catches a `var` hoisted past a `let` would fire on it.
+        let scopes = analysed("try { let q; } catch (e) { var q; }");
+        assert_eq!(
+            scopes.top_level().frame_slots,
+            3,
+            "the hoisted var, the let in the block and the catch parameter"
+        );
+    }
+
+    #[test]
+    fn a_var_hoists_out_of_all_three_parts_of_a_try() {
+        let source = "try { var a = 1; } catch (e) { var b = 2; } a; b;";
+        let scopes = analysed(source);
+        assert_eq!(
+            resolved(&scopes, source, "a", 0).binding,
+            resolved(&scopes, source, "a", 1).binding,
+            "a var in the protected block is the same binding as the one read after it"
+        );
+        assert_eq!(
+            resolved(&scopes, source, "b", 0).binding,
+            resolved(&scopes, source, "b", 1).binding,
+            "and so is a var in the handler"
+        );
     }
 }

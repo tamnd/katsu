@@ -16,7 +16,7 @@ mod constant;
 mod op;
 mod position;
 
-pub use blueprint::{BlueprintError, FunctionBlueprint};
+pub use blueprint::{BlueprintError, FunctionBlueprint, Handler};
 pub use constant::{ConstIndex, Constant, ConstantPool};
 pub use op::{BlueprintIndex, CacheIndex, CodeOffset, Op, Register};
 pub use position::SourcePositions;

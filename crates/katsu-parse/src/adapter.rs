@@ -29,8 +29,8 @@ use oxc_ast::ast as oxc;
 
 use crate::ParseError;
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, Case, DeclKind, Expr, ExprKind, Func, Ident, LogicalOp, Module,
-    Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident,
+    LogicalOp, Module, Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 
 /// Turn one parsed program into our tree.
@@ -146,28 +146,14 @@ impl Adapter<'_> {
                 Stmt::new(span(node.span), StmtKind::While { test, body })
             }
 
-            oxc::Statement::SwitchStatement(node) => {
-                let discriminant = self.expression(&node.discriminant, strict)?;
-                let mut cases = Vec::with_capacity(node.cases.len());
-                for case in &node.cases {
-                    let test = match case.test.as_ref() {
-                        Some(test) => Some(self.expression(test, strict)?),
-                        None => None,
-                    };
-                    cases.push(Case {
-                        span: span(case.span),
-                        test,
-                        body: self.statements(&case.consequent, strict)?,
-                    });
-                }
-                Stmt::new(
-                    span(node.span),
-                    StmtKind::Switch {
-                        discriminant,
-                        cases,
-                    },
-                )
-            }
+            oxc::Statement::SwitchStatement(node) => self.switch_statement(node, strict)?,
+
+            oxc::Statement::ThrowStatement(node) => Stmt::new(
+                span(node.span),
+                StmtKind::Throw(self.expression(&node.argument, strict)?),
+            ),
+
+            oxc::Statement::TryStatement(node) => self.try_statement(node, strict)?,
 
             // A label can only be attached by a labelled statement, which is not in the subset, so
             // a label here has nothing to name and refusing it costs nothing today.
@@ -223,6 +209,97 @@ impl Adapter<'_> {
         };
 
         Ok(Some(adapted))
+    }
+
+    /// Adapt a `switch` and its clauses.
+    ///
+    /// A `default` keeps its position in the list and is the clause with no test, rather than being
+    /// pulled out into a field of its own. It has to be compared after every case and laid out where
+    /// it was written, so the list is the only shape that says both without one of them being
+    /// reconstructed later.
+    fn switch_statement(
+        &self,
+        node: &oxc::SwitchStatement<'_>,
+        strict: bool,
+    ) -> Result<Stmt, ParseError> {
+        let discriminant = self.expression(&node.discriminant, strict)?;
+        let mut cases = Vec::with_capacity(node.cases.len());
+        for case in &node.cases {
+            let test = match case.test.as_ref() {
+                Some(test) => Some(self.expression(test, strict)?),
+                None => None,
+            };
+            cases.push(Case {
+                span: span(case.span),
+                test,
+                body: self.statements(&case.consequent, strict)?,
+            });
+        }
+        Ok(Stmt::new(
+            span(node.span),
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            },
+        ))
+    }
+
+    /// Adapt a `try` and its two or three parts.
+    ///
+    /// `finally` needs a completion token to route a `return` or a `break` out of the protected
+    /// block through it, and that is the next piece of work rather than this one. It is refused by
+    /// its own name so that a program using it is told which half is missing, and the field is
+    /// carried on the tree anyway so that the shape does not change when it arrives.
+    fn try_statement(
+        &self,
+        node: &oxc::TryStatement<'_>,
+        strict: bool,
+    ) -> Result<Stmt, ParseError> {
+        let block = self.block(&node.block, strict)?;
+        let catch = match node.handler.as_ref() {
+            Some(handler) => Some(self.catch(handler, strict)?),
+            None => None,
+        };
+        let finally = match node.finalizer.as_ref() {
+            Some(finalizer) => Some(self.block(finalizer, strict)?),
+            None => None,
+        };
+        if finally.is_some() {
+            return self.refuse("a finally clause", node.span);
+        }
+        Ok(Stmt::new(
+            span(node.span),
+            StmtKind::Try {
+                block,
+                catch,
+                finally,
+            },
+        ))
+    }
+
+    /// Adapt the `catch` clause of a `try`.
+    ///
+    /// The parameter is optional in the grammar, because `catch {}` is a way of saying that the
+    /// value is not wanted, and it is a binding pattern rather than a name when it is present. A
+    /// pattern is refused here for the same reason it is refused in a declaration.
+    fn catch(&self, handler: &oxc::CatchClause<'_>, strict: bool) -> Result<Catch, ParseError> {
+        let param = match handler.param.as_ref() {
+            Some(param) => Some(self.binding_name(&param.pattern)?),
+            None => None,
+        };
+        Ok(Catch {
+            span: span(handler.span),
+            param,
+            body: self.block(&handler.body, strict)?,
+        })
+    }
+
+    /// Adapt a braced block that is part of a larger statement rather than a statement itself.
+    fn block(&self, node: &oxc::BlockStatement<'_>, strict: bool) -> Result<Block, ParseError> {
+        Ok(Block {
+            span: span(node.span),
+            body: self.statements(&node.body, strict)?,
+        })
     }
 
     /// Adapt the statement in the arm of an `if` or the body of a `while`.
@@ -1209,8 +1286,10 @@ mod tests {
         // This list is the M1 work list read backwards, and every line of it should disappear.
         assert_eq!(refused("t.js", "for (;;) {}"), "a for loop");
         assert_eq!(refused("t.js", "for (const x of xs) {}"), "a for of loop");
-        assert_eq!(refused("t.js", "try { f(); } catch {}"), "try");
-        assert_eq!(refused("t.js", "throw new Error();"), "throw");
+        assert_eq!(
+            refused("t.js", "try { f(); } finally {}"),
+            "a finally clause"
+        );
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
         assert_eq!(refused("t.js", "let f = () => 1;"), "an arrow function");
@@ -1233,6 +1312,58 @@ mod tests {
         assert_eq!(
             refused("t.js", "async function f() {}"),
             "an async function"
+        );
+    }
+
+    #[test]
+    fn a_try_keeps_its_three_parts_apart() {
+        let StmtKind::Try {
+            block,
+            catch,
+            finally,
+        } = one("t.js", "try { f(); } catch (e) { g(); }").kind
+        else {
+            panic!("expected a try");
+        };
+        assert_eq!(block.body.len(), 1);
+        let catch = catch.expect("there is a handler");
+        assert_eq!(
+            catch.param.expect("there is a parameter").name.as_str(),
+            "e"
+        );
+        assert_eq!(catch.body.body.len(), 1);
+        assert!(finally.is_none());
+    }
+
+    #[test]
+    fn a_catch_can_have_no_parameter() {
+        let StmtKind::Try { catch, .. } = one("t.js", "try { f(); } catch { g(); }").kind else {
+            panic!("expected a try");
+        };
+        assert!(catch.expect("there is a handler").param.is_none());
+    }
+
+    #[test]
+    fn a_finally_clause_is_refused_by_its_own_name() {
+        // Refused rather than dropped, because a `finally` that quietly did not run would turn a
+        // program that releases a resource into a program that does not. Running one needs a
+        // completion token to route a `return` out of the protected block through it, and that is
+        // the next piece of work rather than this one.
+        assert_eq!(
+            refused("t.js", "try { f(); } finally { g(); }"),
+            "a finally clause"
+        );
+        assert_eq!(
+            refused("t.js", "try { f(); } catch (e) {} finally { g(); }"),
+            "a finally clause"
+        );
+    }
+
+    #[test]
+    fn a_destructuring_catch_parameter_is_refused_like_any_other_pattern() {
+        assert_eq!(
+            refused("t.js", "try { f(); } catch ({ message }) {}"),
+            "object destructuring"
         );
     }
 
