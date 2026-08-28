@@ -30,9 +30,9 @@ pub(crate) const KIND_OFFSET: usize = 0;
 
 /// What kind of object a pointer in the cage points at.
 ///
-/// Five today, and the enum is deliberately not exhaustive over what M1 adds, because the point of
-/// it is to answer the question the interpreter actually asks: is this a string, is it callable, is
-/// it something with properties on it, or is it something the caller has no arm for yet.
+/// The enum is deliberately not exhaustive over what the rest of M1 adds, because the point of it is
+/// to answer the question the interpreter actually asks: is this a string, is it callable, is it
+/// something with properties on it, or is it something the caller has no arm for yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapKind {
     /// A string in any of its representations.
@@ -43,26 +43,37 @@ pub enum HeapKind {
     Context,
     /// A function whose body is Rust rather than bytecode.
     Native,
-    /// A fixed set of named values, which is what a host object is until shapes exist.
-    Record,
+    /// An ordinary object: the thing a program makes with `{}` and puts properties on.
+    ///
+    /// The only kind with no tag of its own, because its first word holds a shape and a shape is a
+    /// pointer. That is the arrangement the whole file was written to allow, and it means the check
+    /// for "is this an object" is a tag test on one word rather than a compare against a constant.
+    Object,
+    /// A shape, which is shared by every object with the same properties in the same order.
+    Shape,
+    /// The values of an object that did not fit in the room it was built with.
+    Properties,
 }
 
 impl HeapKind {
-    /// The tag this kind writes into the first word.
+    /// The tag this kind writes into the first word, for the kinds that write one.
     ///
     /// A small integer rather than a raw number, so the low bit says integer rather than pointer and
-    /// a real shape can never be read as a kind by accident.
-    pub(crate) const fn tag(self) -> u32 {
+    /// a shape can never be read as a kind by accident. An ordinary object has no tag: it writes a
+    /// shape into that word instead, which is what tells it apart from all of these.
+    pub(crate) const fn tag(self) -> Option<u32> {
         let n: u32 = match self {
             HeapKind::String => 0,
             HeapKind::Closure => 1,
             HeapKind::Context => 2,
             HeapKind::Native => 3,
-            HeapKind::Record => 4,
+            HeapKind::Shape => 4,
+            HeapKind::Properties => 5,
+            HeapKind::Object => return None,
         };
         // `from_smi` cannot fail for a number this small, and `expect` is not const, so the shift is
         // spelled out. It is the same shift `Slot::from_smi` performs.
-        n << 1
+        Some(n << 1)
     }
 
     /// What a slot points at, or `None` if it is not a pointer or points at a tag nobody wrote.
@@ -75,13 +86,21 @@ impl HeapKind {
         let offset = slot.as_offset()?;
         // SAFETY: the offset came out of a slot that was built from a cage offset, and every
         // allocated object is at least one word long, so the first word is inside the cage.
-        let tag = unsafe { read_u32(cage, offset, KIND_OFFSET) };
-        match tag {
+        let first = Slot::from_bits(unsafe { read_u32(cage, offset, KIND_OFFSET) });
+        // A pointer in that word is a shape, and only an ordinary object has one there. The pointee
+        // is not checked, because the alternative to trusting it is a second dereference on the
+        // hottest path in the runtime to re-derive something only a corrupted heap could disagree
+        // with.
+        if first.is_pointer() {
+            return Some(HeapKind::Object);
+        }
+        match first.to_bits() {
             0 => Some(HeapKind::String),
             2 => Some(HeapKind::Closure),
             4 => Some(HeapKind::Context),
             6 => Some(HeapKind::Native),
-            8 => Some(HeapKind::Record),
+            8 => Some(HeapKind::Shape),
+            10 => Some(HeapKind::Properties),
             _ => None,
         }
     }
@@ -90,6 +109,45 @@ impl HeapKind {
 /// The offset a freshly allocated pointer sits at, as a slot.
 pub(crate) fn slot_of(cage: &Cage, pointer: NonNull<u8>) -> Option<Slot> {
     cage.offset_of(pointer.as_ptr()).map(Slot::from_offset)
+}
+
+/// Stamp the kind tag into the first word of a freshly allocated object.
+///
+/// One place holds the knowledge that an ordinary object is the kind without a tag, so that every
+/// other kind writes its own with a single call and nobody has to think about it.
+///
+/// # Panics
+///
+/// Panics if `kind` is [`HeapKind::Object`], which writes a shape into that word rather than a tag.
+///
+/// # Safety
+///
+/// `pointer` must be the start of an allocation at least four bytes long.
+pub(crate) unsafe fn write_kind(pointer: NonNull<u8>, kind: HeapKind) {
+    let tag = kind
+        .tag()
+        .expect("an ordinary object writes its shape into the first word rather than a tag");
+    // SAFETY: the caller guarantees the allocation is long enough for its first word.
+    unsafe {
+        write_u32(pointer, KIND_OFFSET, tag);
+    }
+}
+
+/// Write a four byte field of an object that is already in the cage.
+///
+/// The companion to [`write_u32`], which takes the pointer an allocation just handed back. This one
+/// starts from an offset, which is what a reference into the heap actually holds.
+///
+/// # Safety
+///
+/// `offset` must be the start of an allocation in `cage` at least `at + 4` bytes long, and nothing
+/// else may be reading the cage for the duration of the write.
+pub(crate) unsafe fn write_u32_at(cage: &Cage, offset: u32, at: usize, value: u32) {
+    // SAFETY: as `write_u32`, with the address derived from the cage rather than passed in.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe {
+        cage.address_of(offset).add(at).cast::<u32>().write(value);
+    }
 }
 
 /// # Safety

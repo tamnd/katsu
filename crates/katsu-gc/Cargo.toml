@@ -28,6 +28,10 @@ harness = false
 name = "strings"
 harness = false
 
+[[bench]]
+name = "objects"
+harness = false
+
 [features]
 # The collector choice is open question Q3 and is decided by measurement at M4.
 default = []

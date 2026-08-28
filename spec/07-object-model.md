@@ -152,11 +152,11 @@ Under the memory budget, N is chosen from the shape's transition history rather 
 
 Dictionary mode exists for objects that are used as hash maps, with thousands of properties or frequent deletes. Transitioning into dictionary mode is one way, it disables inline caching for that object, and it exists so that pathological programs degrade instead of exploding the shape tree.
 
-### 7.4.1 Five heap kinds before there are shapes, as built
+### 7.4.1 Six heap kinds and the word that tells them apart, as built
 
-Shapes are M1 work and calls are M0 work, so the cage holds five kinds of object today with nothing to describe them. `crates/katsu-gc/src/function.rs` adds a closure, a context and a function written in Rust to the string that was there already, `crates/katsu-gc/src/record.rs` adds a record, and the question every pointer now has to answer is which of the five it points at. The word they share and the reads and writes that reach it live in `crates/katsu-gc/src/object.rs`, which is where they went once they stopped being about functions.
+The cage holds six kinds of object. `crates/katsu-gc/src/function.rs` adds a closure, a context and a function written in Rust to the string that was there already, `crates/katsu-gc/src/shape.rs` and `crates/katsu-gc/src/ordinary.rs` add a shape, an ordinary object and the properties array an object overflows into, and the question every pointer has to answer is which of them it points at. The word they share and the reads and writes that reach it live in `crates/katsu-gc/src/object.rs`, which is where they went once they stopped being about functions.
 
-The answer is in the word every object already starts with, the one this section reserves for the shape. It is a slot, so by 7.2.1 its low bit says whether it holds a pointer or a small integer, and a shape is a pointer while a kind tag is a small integer. A tag written there today is therefore not something a shape can ever be mistaken for. When shapes arrive the tag does not have to move out of the way either, because the shape carries the same answer the tag does and the check becomes a read through the map rather than a compare against a constant.
+The answer is in the word every object already starts with, the one this section reserves for the shape. It is a slot, so by 7.2.1 its low bit says whether it holds a pointer or a small integer, and a shape is a pointer while a kind tag is a small integer. That is not a coincidence exploited after the fact, it is the arrangement this section reserved the word for, and it means an ordinary object needs no tag at all: the first word being a pointer is what makes it an ordinary object. `HeapKind::of` reads one word, and `HeapKind::tag` returns nothing for an ordinary object because there is nothing to write. Every other kind pays four bytes and one store for its tag, and the kind a JavaScript program allocates most of pays neither.
 
 Zero is a string, and that assignment is not arbitrary. A freshly committed page is zero and the bump heap never reuses memory, so every string ever allocated already holds the right answer in that word without a single instruction being spent to put it there. Giving strings a real tag would have added a store to every string allocation to record what the memory already said.
 
@@ -166,13 +166,29 @@ A context is a sixteen byte header, which is the tag, the enclosing context and 
 
 A function written in Rust is eight bytes: the kind tag and an ordinal into a table the isolate owns. What it deliberately does not hold is the code. A function pointer is eight bytes in a four byte world, and it points into the text segment of the process rather than into the cage, so putting one in a heap object would be a pointer the collector has to know not to trace and the compression story has to make an exception for. An ordinal is a small integer that means nothing outside the isolate that issued it, which is exactly the property every other reference in the cage already has. The name lives next to the code in that table for the same reason, since a builtin's name is fixed at the point the realm is built and never comes from the heap.
 
-A record is the fifth kind and it is what a host object is until there are shapes. Eight bytes of header, which is the tag and a count, then one four byte name per entry, then the names rounded up to eight so that the values that follow them are aligned. Two arrays rather than one array of pairs, because a name is four bytes and a value is eight and interleaving them would put seven bytes of padding in front of every value or force every value to a misaligned read. Kept apart, sixteen candidate names fit in one cache line, which is what makes the lookup below what it is.
-
-What a record deliberately does not have is a prototype, a property descriptor, a way to delete a name or a way to add one. Every one of those needs a shape to record the answer in, and a record exists precisely so that `console.log` can run before there is one. It is the right shape for a host object anyway: the runtime knows every name it is installing at the moment it installs them, and an object the program is not supposed to be rearranging is one that does not need machinery for rearranging it.
-
-The lookup is a linear scan comparing interned addresses. That is not a placeholder standing in for a hash table. Every name in a `get_prop` was interned when its unit loaded, so two names are equal exactly when their addresses are, and a scan over eight four byte addresses is eight compares inside one cache line with no hash and no indirection. A hash table would be a hash, a probe and a compare to beat that, and it would lose on an object this size. What eventually beats it is not a better table but not looking at all, which is what a shape and an inline cache buy and why they are the M1 work they are.
-
 The padding word in the context header is not waste that rearranging could recover. Cells have to start on an eight byte boundary, and there is nothing else to put in front of them until a context needs a shape, which is the same M1 that takes the cells back down to four bytes.
+
+### 7.4.2 The shape tree and the ordinary object, as built
+
+`crates/katsu-gc/src/shape.rs` builds the transition tree 7.4 describes and `crates/katsu-gc/src/ordinary.rs` builds the object that points at it. This subsection is what was actually built, which is less than 7.4 asks for and is the part of it every later piece stands on.
+
+A shape is twenty four bytes and six four byte fields: the kind tag, the number of properties, the name this shape adds, its parent, its first child and its next sibling. It is a node in a tree rather than a description of a layout. The root is the empty object, an edge is one property being added, and a shape is reached by walking down from the root. That is why two objects built by adding the same names in the same order arrive at the same node without anything ever comparing two property lists: they take the same edges.
+
+Insertion order is part of a shape's identity, and this is the language's requirement rather than an implementation convenience. String keyed enumeration order is insertion order, so `{a: 1, b: 2}` and `{b: 2, a: 1}` enumerate differently and cannot share a description of their layout. They get two shapes, and the tree gives that for free by being a tree.
+
+The children of a shape are a singly linked list threaded through the shapes themselves, with a new child pushed on the front. There is no separate transition table, which is one allocation and one hash saved per shape, and it is the right trade while fan out is small. Fan out is small in ordinary code, because a program that adds `x` to an empty object usually adds `x` every time. The case it is bad at is a program making many objects that share nothing, and 7.4 already says the answer is a map once the list gets long. The benchmark that would have to move to justify one is `object/set/add/first_time_fan_out_64`.
+
+An ordinary object is a sixteen byte header of a shape, a properties array and an inline capacity, with one word of padding, followed by its inline slots. A value is eight bytes here for exactly the reason a context cell is eight bytes, written down above, and it goes back to four when there is a heap number and a set of realm singletons for a slot to point at.
+
+The elements word 7.4 puts in the header is deliberately not there yet. Nothing indexes an object today, since `o[k]` has no interpreter arm at all, and a word reserved for a feature that does not exist is eight bytes on every object in the heap to buy nothing. It goes in when arrays do, and the header grows by one word at that point rather than starting out with a hole in it.
+
+Inline capacity is in the object and not in the shape, which is a real departure from V8, where the map holds the instance size. The reason is that the same shape is reached two ways: by a literal built with room for its properties, and by an empty object grown one property at a time. Those two objects have the same layout and different sizes, so a size in the shape has to be either wrong for one of them or accompanied by the slack tracking machinery V8 needs to make it right. Four bytes in the object buys not building that.
+
+Properties that fit inside stay inside, and the rest go to a properties array on the side which starts at four slots and doubles. So an object literal built with room for its properties is one allocation, an object that grows a little pays for one small array, and an object that grows a lot pays a geometric number of them rather than one per property.
+
+Lookup is a walk up the parent chain comparing the four byte name slot at each step. No dereference, because the names are interned and two interned names are equal exactly when their slots are. That is one compare per property, and it is linear, and the measured cost is what a linear walk looks like: about one nanosecond to find the name that was added last no matter how many there are, and about fifteen to find the first of sixteen. The fix for the second number is not a per shape hash table, it is an inline cache at the access site that skips the walk entirely, which is 7.5 and is the next piece of M1.
+
+What is not here yet: a prototype, property attributes, delete, indexed properties and dictionary mode. Each of those is its own piece of work and each needs a place in the shape to record its answer, which is why the shape has a count and a name rather than a descriptor per property today.
 
 ## 7.5 Inline caches, with one description per cache
 
@@ -274,12 +290,14 @@ The numbers this design is aiming at, as targets that document 15 measures rathe
 
 | Thing | Bytes |
 |---|---|
-| Empty object `{}` | 24, being header plus a small inline slot allowance |
-| `{a: 1, b: 2, c: 3}` | 36 |
+| Empty object `{}` | 24 budgeted, 16 measured, being header and nothing else (7.4.2) |
+| `{a: 1, b: 2, c: 3}` | 36 budgeted, 40 measured, being a 16 byte header and three 8 byte values |
 | Array of 1000 packed Smis | ~4 KB plus header |
 | Array of 1000 packed doubles | ~8 KB plus header |
 | Short ASCII string, 10 chars | 26 budgeted, 22 measured, 24 after alignment (7.7.1) |
 | Closure with two captured variables | 40 plus the shared blueprint |
-| Shape, shared across all objects with that layout | ~64, amortized to near zero per object |
+| Shape, shared across all objects with that layout | ~64 budgeted, 24 measured, amortized to near zero per object |
+
+The three property object is four bytes over budget rather than under, and the reason is the eight byte value that 7.4.2 and the context paragraph in 7.4.1 both write down: a slot is four bytes and can hold a small integer or a pointer, and a property can hold a double. Twelve bytes of values plus a sixteen byte header rounds to thirty two, which is under the budget, and that is where this lands once there is a heap number to point at. The empty object is under budget because it has no inline slot allowance at all, which is right for `{}` and is not a saving on an object that goes on to grow.
 
 The comparison that matters is not against a hand written Rust struct, it is against V8, which already compresses. We win on header size, on not allocating feedback until a function is warm, and on sizing inline slots from real transition history. We do not win by 10x, and document 02.7 says so.

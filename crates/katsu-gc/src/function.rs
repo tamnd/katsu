@@ -17,7 +17,7 @@
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
-use crate::object::{HeapKind, KIND_OFFSET, read_u32, read_u64, slot_of, write_u32, write_u64};
+use crate::object::{HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u64};
 use crate::string::StringRef;
 
 /// Bytes in a closure: the kind tag, the function index, the captured context and the name.
@@ -64,7 +64,7 @@ impl ClosureRef {
         // SAFETY: the allocation is `CLOSURE_SIZE` bytes of freshly committed memory that nothing
         // else holds a reference to, and all three writes are inside it.
         unsafe {
-            write_u32(pointer, KIND_OFFSET, HeapKind::Closure.tag());
+            write_kind(pointer, HeapKind::Closure);
             write_u32(pointer, FUNCTION_OFFSET, function);
             write_u32(
                 pointer,
@@ -167,7 +167,7 @@ impl NativeRef {
         // SAFETY: the allocation is `NATIVE_SIZE` bytes of freshly committed memory that nothing else
         // holds a reference to, and both writes are inside it.
         unsafe {
-            write_u32(pointer, KIND_OFFSET, HeapKind::Native.tag());
+            write_kind(pointer, HeapKind::Native);
             write_u32(pointer, ORDINAL_OFFSET, ordinal);
         }
         Some(NativeRef(slot))
@@ -247,7 +247,7 @@ impl ContextRef {
         let slot = slot_of(heap.cage(), pointer)?;
         // SAFETY: the allocation is `bytes` long and every write below is inside it.
         unsafe {
-            write_u32(pointer, KIND_OFFSET, HeapKind::Context.tag());
+            write_kind(pointer, HeapKind::Context);
             write_u32(
                 pointer,
                 PARENT_OFFSET,
