@@ -42,6 +42,8 @@ pub enum ObjectKind {
     String,
     /// A closure, not counting the shared blueprint.
     Closure,
+    /// One level of environment, holding the variables a nested function captured.
+    Context,
     /// A shape, which is shared across every object with that layout.
     Shape,
     /// A property array that overflowed the inline slots.
@@ -55,11 +57,12 @@ pub enum ObjectKind {
 
 impl ObjectKind {
     /// Every category, in the order the census prints them.
-    pub const ALL: [ObjectKind; 7] = [
+    pub const ALL: [ObjectKind; 8] = [
         ObjectKind::Object,
         ObjectKind::Elements,
         ObjectKind::String,
         ObjectKind::Closure,
+        ObjectKind::Context,
         ObjectKind::Shape,
         ObjectKind::Properties,
         ObjectKind::Other,
@@ -73,6 +76,7 @@ impl ObjectKind {
             ObjectKind::Elements => "elements",
             ObjectKind::String => "strings",
             ObjectKind::Closure => "closures",
+            ObjectKind::Context => "contexts",
             ObjectKind::Shape => "shapes",
             ObjectKind::Properties => "properties",
             ObjectKind::Other => "other",
@@ -85,9 +89,10 @@ impl ObjectKind {
             ObjectKind::Elements => 1,
             ObjectKind::String => 2,
             ObjectKind::Closure => 3,
-            ObjectKind::Shape => 4,
-            ObjectKind::Properties => 5,
-            ObjectKind::Other => 6,
+            ObjectKind::Context => 4,
+            ObjectKind::Shape => 5,
+            ObjectKind::Properties => 6,
+            ObjectKind::Other => 7,
         }
     }
 }
@@ -114,7 +119,7 @@ pub struct KindTotals {
 /// these ones learning to decrease.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Census {
-    totals: [KindTotals; 7],
+    totals: [KindTotals; 8],
     /// Bytes handed out in total, after alignment padding.
     pub allocated_bytes: u64,
     /// Allocations in total.

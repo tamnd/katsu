@@ -19,17 +19,22 @@
 //! of the five JavaScript primitive types are here in full, numbers and strings, and the three that
 //! have one value each are here because they are immediates in the value encoding.
 //!
-//! Calls, closures, environments, globals and property access are not here. They need an object with
-//! a shape and M0 has strings and nothing else on the heap, so they land in the next piece of work
-//! rather than being faked here. Every one of them reaches the same arm at the bottom of the match
-//! and produces an error that names the opcode, which is a refusal rather than a wrong answer.
+//! Calls are here too, which means closures, environments and captured variables are here. A
+//! function value is a closure, a call pushes a frame and moves the three locals above the loop, and
+//! a return pops one and puts them back. That is enough for recursion, for a function that reads a
+//! variable from the scope it was written in, and for a function that outlives that scope.
+//!
+//! Globals, property access and method calls are not here. All three need an object with a shape,
+//! and a shape is M1. They reach the same arm at the bottom of the match and produce an error that
+//! names the opcode, which is a refusal rather than a wrong answer.
 //!
 //! # The one assumption about the heap
 //!
-//! Every heap object in M0 is a string. Nothing else is allocated yet, so a pointer is a string and
-//! a range check settles it. That assumption stops being true in M1, and rather than spread it over
-//! twenty arms it lives in exactly one function, [`Interpreter::as_string`], which is where the shape
-//! read goes when there is a shape to read.
+//! There are three kinds of heap object now, strings, closures and contexts, and the first word of
+//! an object says which. A pointer is no longer self describing, so the two functions that turn a
+//! value into an object, [`Interpreter::as_string`] and [`Interpreter::as_closure`], read that word
+//! before they believe anything. Everywhere else in the loop goes through one of them, which is what
+//! keeps the assumption in two places instead of twenty when shapes arrive.
 
 // Same reason as in `number`. JavaScript equality on numbers is exact IEEE equality, so comparing
 // two doubles with `==` is the specified behaviour and not an oversight.
@@ -39,11 +44,12 @@ use std::cmp::Ordering as Sorting;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use katsu_gc::StringRef;
+use katsu_gc::{ClosureRef, ContextRef, HeapKind, StringRef};
 use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
 
 use crate::number::{exponentiate, from_string, shift_count, to_int32, to_string, to_uint32};
-use crate::stack::{Stack, StackError};
+use crate::stack::{Invocation, Stack, StackError};
+use crate::unit::{Resolved, Unit};
 use crate::{Isolate, Value};
 
 /// Why execution stopped somewhere other than a `return`.
@@ -198,10 +204,13 @@ impl Interpreter {
     /// rather than refusing, because the alternative is a print that fails. Node does the same.
     #[must_use]
     pub fn display(&self, value: Value) -> String {
-        match self.as_string(value) {
-            Some(string) => string.to_utf8_lossy(self.isolate.cage()).into_owned(),
-            None => Self::primitive_text(value),
+        if let Some(string) = self.as_string(value) {
+            return string.to_utf8_lossy(self.isolate.cage()).into_owned();
         }
+        if let Some(closure) = self.as_closure(value) {
+            return self.function_text(closure);
+        }
+        Self::primitive_text(value)
     }
 
     /// Run a blueprint from its first instruction and return the value it returns.
@@ -214,40 +223,59 @@ impl Interpreter {
     /// Returns whatever the body threw, or [`RuntimeError::NotImplemented`] if it reached an opcode
     /// this interpreter does not run yet.
     pub fn run(&mut self, blueprint: &FunctionBlueprint) -> Result<Value, RuntimeError> {
-        let constants = self.resolve(blueprint)?;
-        self.stack.push(blueprint.frame_size, &[], 0, Register(0))?;
-        let outcome = self.execute(blueprint, &constants);
-        self.stack.pop();
+        let unit = self.load(blueprint)?;
+        self.stack.push(blueprint.frame_size, &[], 0)?;
+        let outcome = self.execute(&unit);
+        // Unconditionally, because a `return` at the top level pops the last frame itself and an
+        // error can stop anywhere with any number of frames still live. Either way the interpreter
+        // is left with an empty stack and is usable again, rather than carrying dead frames the next
+        // call would trip over.
+        self.stack.unwind();
         outcome
     }
 
-    /// Turn a blueprint's constant pool into values, once, before the first instruction runs.
+    /// Flatten a blueprint tree into a unit, resolving every function's constant pool on the way.
     ///
     /// The pool holds Rust strings because the pass that built it could not reach the atom table,
     /// which is the arrangement written down at the top of `katsu-ir`'s constant module. This is the
     /// other half of it: one walk that interns every string and boxes every number, so that a
     /// `load_const` is an index into a slice rather than a hash of a literal.
     ///
-    /// Doing it per run is the shape, not the destination. It belongs at load time, once per
-    /// blueprint per realm, and it moves there when there is a realm to load into. A program that
-    /// runs one blueprint once, which is every program M0 can run, cannot tell the difference.
-    ///
     /// String constants are interned rather than merely allocated, because a literal is exactly the
     /// kind of string a program mentions repeatedly and every duplicate saved is a duplicate the
     /// collector never has to walk.
-    fn resolve(&mut self, blueprint: &FunctionBlueprint) -> Result<Vec<Value>, RuntimeError> {
-        blueprint
-            .constants
-            .values()
-            .iter()
-            .map(|constant| match constant {
-                Constant::Number(number) => Ok(Value::from_f64(*number)),
-                Constant::String(text) => {
-                    let atom = self.isolate.intern(text).ok_or(RuntimeError::OutOfMemory)?;
-                    Ok(self.string_value(atom.as_string()))
-                }
-            })
-            .collect()
+    ///
+    /// Every function is resolved, not only the top level, which is the part that changed when calls
+    /// arrived. A string literal inside a function body used to be unreachable, because there was no
+    /// way to get into a function body.
+    fn load<'a>(&mut self, root: &'a FunctionBlueprint) -> Result<Unit<'a>, RuntimeError> {
+        // The closure borrows the isolate rather than all of `self`, because `Unit::load` holds it
+        // for the whole walk and the stack has to stay reachable.
+        let isolate = &mut self.isolate;
+        let mut intern = |text: &str| -> Result<Value, RuntimeError> {
+            let atom = isolate.intern(text).ok_or(RuntimeError::OutOfMemory)?;
+            Ok(Value::from_slot(atom.as_string().slot(), isolate.cage()))
+        };
+        Unit::load(root, |blueprint| {
+            let constants = blueprint
+                .constants
+                .values()
+                .iter()
+                .map(|constant| match constant {
+                    Constant::Number(number) => Ok(Value::from_f64(*number)),
+                    Constant::String(text) => intern(text),
+                })
+                .collect::<Result<Vec<Value>, RuntimeError>>()?;
+            // The empty value rather than an interned empty string, because "this function has no
+            // name" and "this function is called the empty string" print differently and only the
+            // first one is what an anonymous function means.
+            let name = if blueprint.name.is_empty() {
+                Value::EMPTY
+            } else {
+                intern(&blueprint.name)?
+            };
+            Ok(Resolved { constants, name })
+        })
     }
 
     /// The loop.
@@ -257,20 +285,24 @@ impl Interpreter {
     /// and `load_undefined` happen to produce the same value today and stop doing so the moment a
     /// function can be called with a receiver, so merging them would be merging two different
     /// questions that currently have the same answer.
+    ///
+    /// The three variables above the loop are the machine state a call and a return change: which
+    /// function is running, its code and its constants. They are locals rather than reads through
+    /// the frame because every instruction touches at least one of them, and a call is the only
+    /// thing that moves them.
     #[allow(clippy::too_many_lines, clippy::match_same_arms)]
-    fn execute(
-        &mut self,
-        blueprint: &FunctionBlueprint,
-        constants: &[Value],
-    ) -> Result<Value, RuntimeError> {
-        let code = &blueprint.code;
+    fn execute(&mut self, unit: &Unit<'_>) -> Result<Value, RuntimeError> {
+        let mut function = 0_u32;
+        let mut blueprint = unit.function(function).blueprint;
+        let mut constants = unit.function(function).constants.as_slice();
         let mut pc = 0_usize;
 
         loop {
             // A verified blueprint ends in a terminator and has no jump target past its end, so
             // running off the end is impossible and the index is a bug in lowering rather than in
             // the program. Panicking here would be the same claim with a worse message.
-            let op = *code
+            let op = *blueprint
+                .code
                 .get(pc)
                 .expect("a verified blueprint ends in a terminator, so the pc stays inside it");
             pc += 1;
@@ -486,12 +518,217 @@ impl Interpreter {
                     pc = target.0 as usize;
                 }
 
-                Op::Return { src } => return Ok(self.stack.get(src)),
+                // A closure is the function plus the environment that was live where it was
+                // written, which is this frame's context. Capturing at the point the closure is made
+                // rather than at the point it is called is the whole of what a closure is.
+                Op::NewClosure {
+                    dst,
+                    blueprint: nested,
+                } => {
+                    let target = unit.child(function, nested.0);
+                    let captured = self.frame_context();
+                    let name = self.as_string(unit.function(target).name);
+                    let closure = ClosureRef::new(self.isolate.heap_mut(), target, captured, name)
+                        .ok_or(RuntimeError::OutOfMemory)?;
+                    let value = Value::from_slot(closure.slot(), self.isolate.cage());
+                    self.stack.set(dst, value);
+                }
 
-                // Everything that needs a heap object to point at, which is calls, closures,
-                // environments, globals and property access. Named rather than silently wrong.
+                // A new level of environment, nested inside whatever this frame already had. The
+                // cells start as the hole and not as `undefined`, because a `let` that a nested
+                // function reads is in its dead zone until its declaration runs, and the hole is how
+                // the dead zone is spelled everywhere else in this loop.
+                Op::NewContext { size } => {
+                    let parent = self.frame_context();
+                    let context = ContextRef::new(
+                        self.isolate.heap_mut(),
+                        parent,
+                        u32::from(size),
+                        Value::EMPTY.to_bits(),
+                    )
+                    .ok_or(RuntimeError::OutOfMemory)?;
+                    self.set_frame_context(Some(context));
+                }
+
+                Op::LoadUpvalue { dst, hops, slot } => {
+                    let value = self.upvalue(hops, slot)?;
+                    self.stack.set(dst, value);
+                }
+                Op::StoreUpvalue { hops, slot, src } => {
+                    let value = self.stack.get(src);
+                    let context = self.context_at(hops)?;
+                    if !context.set_cell(self.isolate.heap_mut(), u32::from(slot), value.to_bits())
+                    {
+                        return Err(Self::broken_environment());
+                    }
+                }
+
+                Op::Call {
+                    dst,
+                    callee,
+                    args,
+                    argc,
+                    ..
+                } => {
+                    let target = self.stack.get(callee);
+                    let Some(closure) = self.as_closure(target) else {
+                        // Node names the expression that was called and this names the value it
+                        // produced, so `x()` on a five reports `5 is not a function` where Node
+                        // reports `x is not a function`. Naming the expression means keeping the
+                        // source span of every call site, which is the same work that makes a
+                        // function stringify as its source, and both land together.
+                        let text = self.display(target);
+                        return Err(RuntimeError::Type(format!("{text} is not a function")));
+                    };
+                    let index = closure.function(self.isolate.cage());
+                    let captured = closure.captured(self.isolate.cage());
+                    let callee = unit.function(index).blueprint;
+                    // The resume point is the instruction after the call, and `pc` is already
+                    // there because it was advanced before the match. It is recorded on the frame
+                    // being pushed rather than the one being left, so a return is one pop and a
+                    // read rather than a search back through the stack.
+                    self.stack.push_call(
+                        callee.frame_size,
+                        Invocation {
+                            arity: callee.arity,
+                            first: args,
+                            passed: argc,
+                            function: index,
+                            return_pc: u32::try_from(pc).map_err(|_| Self::code_too_long())?,
+                            return_to: dst,
+                        },
+                    )?;
+                    self.set_frame_context(captured);
+                    function = index;
+                    blueprint = callee;
+                    constants = unit.function(index).constants.as_slice();
+                    pc = 0;
+                }
+
+                Op::Return { src } => {
+                    let value = self.stack.get(src);
+                    let frame = self
+                        .stack
+                        .pop()
+                        .expect("a return happens inside the frame it returns from");
+                    // Nothing underneath means the outermost function returned, which is the value
+                    // the embedder asked for.
+                    let Some(caller) = self.stack.current().copied() else {
+                        return Ok(value);
+                    };
+                    self.stack.set(frame.return_to, value);
+                    function = caller.function;
+                    blueprint = unit.function(function).blueprint;
+                    constants = unit.function(function).constants.as_slice();
+                    pc = frame.return_pc as usize;
+                }
+
+                // Everything that still needs an object with a shape, which is globals, property
+                // access and method calls. Named rather than silently wrong.
                 _ => return Err(RuntimeError::NotImplemented(op)),
             }
+        }
+    }
+
+    /// The environment the running frame reads captured variables through.
+    fn frame_context(&self) -> Option<ContextRef> {
+        let bits = self
+            .stack
+            .current()
+            .expect("something is running whenever an instruction is executing")
+            .context;
+        ContextRef::from_slot(katsu_gc::Slot::from_bits(bits))
+    }
+
+    /// Replace the running frame's environment, which a call and `new_context` both do.
+    fn set_frame_context(&mut self, context: Option<ContextRef>) {
+        self.stack
+            .current_mut()
+            .expect("something is running whenever an instruction is executing")
+            .context = context.map_or(0, |context| context.slot().to_bits());
+    }
+
+    /// Walk `hops` levels out from the running frame's environment.
+    ///
+    /// `hops` counts levels of context and not levels of source nesting, because scope analysis only
+    /// asks for a context when a nested function actually reads an outer variable. A function three
+    /// blocks deep whose parents captured nothing is one hop from the outermost context, and that is
+    /// what makes the walk short in real code rather than proportional to how deeply somebody
+    /// indented.
+    fn context_at(&self, hops: u16) -> Result<ContextRef, RuntimeError> {
+        let mut context = self.frame_context().ok_or_else(Self::broken_environment)?;
+        for _ in 0..hops {
+            context = context
+                .parent(self.isolate.cage())
+                .ok_or_else(Self::broken_environment)?;
+        }
+        Ok(context)
+    }
+
+    /// Read one captured variable.
+    fn upvalue(&self, hops: u16, slot: u16) -> Result<Value, RuntimeError> {
+        let context = self.context_at(hops)?;
+        let bits = context
+            .cell(self.isolate.cage(), u32::from(slot))
+            .ok_or_else(Self::broken_environment)?;
+        Ok(Value::from_bits(bits))
+    }
+
+    /// The error for an environment that does not have the shape the bytecode expects.
+    ///
+    /// Not reachable from any JavaScript program, because scope analysis computed both the hop count
+    /// and the slot number and lowering emitted them together. It is an error rather than a panic
+    /// because the alternative to reporting a compiler bug is taking down the process of whoever
+    /// happened to run into it.
+    fn broken_environment() -> RuntimeError {
+        RuntimeError::Reference(
+            "an environment did not have the shape the bytecode expected, which is a bug in katsu \
+             rather than in this program"
+                .to_owned(),
+        )
+    }
+
+    /// The error for a function whose code is longer than a return address can name.
+    ///
+    /// Four billion instructions in one function. Lowering would run out of memory long before a
+    /// program got here, and it is checked anyway because the alternative to checking is a truncated
+    /// return address that resumes somewhere plausible and wrong.
+    fn code_too_long() -> RuntimeError {
+        RuntimeError::Range(
+            "a function has more instructions than katsu can return into".to_owned(),
+        )
+    }
+
+    /// The one place a value becomes a closure.
+    ///
+    /// The companion to [`Interpreter::as_string`] and the reason that function stopped being a
+    /// range check. There are three kinds of object in the cage now, so a pointer is no longer
+    /// self describing and both of these read the kind word before they believe anything.
+    fn as_closure(&self, value: Value) -> Option<ClosureRef> {
+        let slot = value.to_slot(self.isolate.cage())?;
+        match HeapKind::of(self.isolate.cage(), slot)? {
+            HeapKind::Closure => ClosureRef::from_slot(slot),
+            HeapKind::String | HeapKind::Context => None,
+        }
+    }
+
+    /// The text `console.log` prints for a function, which is what Node prints for one.
+    ///
+    /// Node shows the name because that is almost always the only thing about a function that
+    /// identifies it at a glance, and `[Function (anonymous)]` when there is no name rather than an
+    /// empty pair of brackets that reads like a mistake.
+    ///
+    /// The name comes off the closure and not out of the unit, which is why it is stored on the
+    /// closure at all. An embedder holding a value has no unit to look anything up in, and a
+    /// function that printed as `[Function (anonymous)]` outside the run that made it would be
+    /// reporting the API's ignorance as a fact about the program.
+    fn function_text(&self, closure: ClosureRef) -> String {
+        match closure.name(self.isolate.cage()) {
+            Some(name) => format!(
+                "[Function: {}]",
+                name.to_utf8_lossy(self.isolate.cage()).into_owned()
+            ),
+            None => "[Function (anonymous)]".to_owned(),
         }
     }
 
@@ -508,13 +745,17 @@ impl Interpreter {
 
     /// The one place a value becomes a string reference.
     ///
-    /// Every heap object in M0 is a string, so a pointer is a string and this is a range check
-    /// against the cage. The claim is wrong the moment there is a second kind of object, which is
-    /// M1, and this is where the shape read goes when that happens. One chokepoint rather than a
-    /// dozen scattered casts is the entire reason the function exists, because a scattered version
-    /// of this assumption would have to be found before it could be fixed.
+    /// This used to be a range check against the cage, on the grounds that every heap object was a
+    /// string. Closures and contexts ended that, so it reads the kind word and a value that points
+    /// at either of them is not a string. One chokepoint rather than a dozen scattered casts is the
+    /// entire reason the function exists, and it is what made adding two object kinds a change to
+    /// two functions rather than a hunt through the match.
     fn as_string(&self, value: Value) -> Option<StringRef> {
-        StringRef::from_slot(value.to_slot(self.isolate.cage())?)
+        let slot = value.to_slot(self.isolate.cage())?;
+        match HeapKind::of(self.isolate.cage(), slot)? {
+            HeapKind::String => StringRef::from_slot(slot),
+            HeapKind::Closure | HeapKind::Context => None,
+        }
     }
 
     /// Whether a value is a string, which is the same question with the answer thrown away.
@@ -571,14 +812,28 @@ impl Interpreter {
 
     /// The `typeof` operator.
     ///
-    /// Same split as [`Interpreter::truthy`] and for the same reason. `typeof` on a pointer is
-    /// `"string"` for everything M0 has and `"object"` for most of what M1 adds, and only the cage
-    /// can tell which.
+    /// A pointer answers three different ways depending on what it points at, so this reads the kind
+    /// word once rather than asking `is_string` and then `as_closure` and paying for two. Everything
+    /// that is not a pointer is decided by the tag and never touches the cage.
+    ///
+    /// A context is never in a register, because nothing in the instruction set moves one there, so
+    /// the arm for it is a fallback rather than a case that happens.
+    ///
+    /// The pointer test comes first and is a tag check, because `to_slot` narrows a small integer
+    /// into a slot as happily as it narrows an address, and a small integer is a number rather than
+    /// something to go looking for a kind word in front of.
     fn type_of(&self, value: Value) -> &'static str {
-        if self.is_string(value) {
-            return "string";
+        if !value.is_pointer() {
+            return value.type_of();
         }
-        value.type_of()
+        let kind = value
+            .to_slot(self.isolate.cage())
+            .and_then(|slot| HeapKind::of(self.isolate.cage(), slot));
+        match kind {
+            Some(HeapKind::String) => "string",
+            Some(HeapKind::Closure) => "function",
+            Some(HeapKind::Context) | None => "object",
+        }
     }
 
     /// `typeof` as the string value the opcode stores.
@@ -599,17 +854,26 @@ impl Interpreter {
     /// than the arrangement deserves and it is the simple version of the right answer: once there
     /// are ropes, in M1, a number's text goes straight into the rope rather than through a `String`
     /// on the way.
+    /// A function converts to the text `console.log` shows for it, which is not what Node does.
+    /// Node hands back the source text the function was written with, because that is what
+    /// `Function.prototype.toString` is specified to return, and reproducing it means keeping the
+    /// span of every function and the source text to slice it out of. That is its own piece of work,
+    /// it is the same piece of work that makes `x is not a function` name `x` instead of naming the
+    /// value, and until it lands this at least says the thing is a function.
     fn coerce_to_string(&mut self, value: Value) -> Result<StringRef, RuntimeError> {
         if let Some(string) = self.as_string(value) {
             return Ok(string);
         }
-        let text = Self::primitive_text(value);
+        let text = match self.as_closure(value) {
+            Some(closure) => self.function_text(closure),
+            None => Self::primitive_text(value),
+        };
         self.isolate
             .allocate_string(&text)
             .ok_or(RuntimeError::OutOfMemory)
     }
 
-    /// The text of a value that is not a string, which in M0 is every value not on the heap.
+    /// The text of a primitive, meaning everything that is not on the heap.
     ///
     /// The hole is not reachable here, because a register holding it is checked by the dead zone
     /// check before anything can read it, and a register that was never written holds `undefined`.
@@ -626,8 +890,8 @@ impl Interpreter {
         if let Some(number) = value.as_f64() {
             return to_string(number);
         }
-        // Reachable only if the heap grows a second kind of object without this growing an arm for
-        // it, which is the M1 change this file's header describes.
+        // Only the callers that already ruled out every heap object get here, so this is the answer
+        // for the objects M1 adds and nothing reaches it today.
         "[object Object]".to_owned()
     }
 
@@ -2286,6 +2550,273 @@ mod tests {
                 constants
             ),
             "ababab"
+        );
+    }
+
+    /// Compile a program so that its last expression is the value it returns.
+    ///
+    /// Lowering does not compute script completion values yet. The top level ends by loading
+    /// `undefined` over the register the last expression went into and returning that register, so
+    /// turning that one load into a self move leaves the expression's value exactly where the return
+    /// reads it. Replacing rather than deleting keeps every instruction at the offset it already
+    /// had, which matters because a jump can target the instruction being replaced: `if (c) { f(); }`
+    /// jumps to it when the condition is false.
+    ///
+    /// The tests above assemble bytecode because they are about one opcode each. The tests below go
+    /// through the frontend because a call is the one thing where the interesting behaviour is the
+    /// agreement between lowering, scope analysis and the loop, and hand written bytecode would be
+    /// testing the loop against my idea of what lowering emits rather than against what it emits.
+    fn as_expression(source: &str) -> FunctionBlueprint {
+        let mut blueprint = crate::compile("t.js", source).expect("should compile");
+        let at = blueprint.code.len() - 2;
+        let Op::LoadUndefined { dst } = blueprint.code[at] else {
+            panic!("a program used here should end with an expression statement");
+        };
+        blueprint.code[at] = Op::Move { dst, src: dst };
+        blueprint
+            .verify()
+            .expect("replacing one op kept it well formed");
+        blueprint
+    }
+
+    /// Run a program and hand back the value of its last expression.
+    fn evaluate(source: &str) -> Result<Value, RuntimeError> {
+        Interpreter::new()
+            .expect("should reserve a stack")
+            .run(&as_expression(source))
+    }
+
+    #[track_caller]
+    fn evaluate_number(source: &str) -> f64 {
+        evaluate(source)
+            .expect("should not throw")
+            .as_f64()
+            .expect("should produce a number")
+    }
+
+    /// Run a program and print what its last expression produced, the way `console.log` would.
+    #[track_caller]
+    fn evaluate_display(source: &str) -> String {
+        let blueprint = as_expression(source);
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        let value = interpreter.run(&blueprint).expect("should not throw");
+        interpreter.display(value)
+    }
+
+    #[test]
+    fn a_call_runs_the_callee_and_comes_back_with_what_it_returned() {
+        assert_eq!(
+            evaluate_number("function twice(x) { return x * 2; } twice(21);"),
+            42.0
+        );
+    }
+
+    #[test]
+    fn a_call_returns_undefined_when_the_body_falls_off_the_end() {
+        assert_eq!(
+            evaluate("function nothing() {} nothing();"),
+            Ok(Value::UNDEFINED)
+        );
+    }
+
+    #[test]
+    fn a_call_leaves_the_callers_registers_alone() {
+        // The two frames are neighbouring windows into one region, so a callee that sized its frame
+        // wrong or copied its arguments to the wrong place writes over the caller's variables. The
+        // three bindings are read after the call rather than before it for that reason.
+        assert_eq!(
+            evaluate_number(
+                "function twice(x) { return x * 2; } \
+                 function main() { const a = 10; const b = twice(3); const c = 100; \
+                 return a + b + c; } main();"
+            ),
+            116.0
+        );
+    }
+
+    #[test]
+    fn a_function_can_call_itself() {
+        // The whole mechanism at once: a self reference read out of the environment, two calls in
+        // one frame, and returns that have to land in the right register of the right frame.
+        assert_eq!(
+            evaluate_number(
+                "function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); } fib(20);"
+            ),
+            6765.0
+        );
+    }
+
+    #[test]
+    fn a_deep_recursion_returns_all_the_way_back() {
+        assert_eq!(
+            evaluate_number(
+                "function down(n) { if (n === 0) return 0; return 1 + down(n - 1); } down(1000);"
+            ),
+            1000.0
+        );
+    }
+
+    #[test]
+    fn a_nested_function_reads_a_variable_from_the_scope_it_was_written_in() {
+        assert_eq!(
+            evaluate_number(
+                "function outer() { let a = 3; function inner() { return a + 1; } \
+                 return inner(); } outer();"
+            ),
+            4.0
+        );
+    }
+
+    #[test]
+    fn a_closure_still_reads_its_variable_after_the_call_that_made_it_returned() {
+        // The frame `counter` ran in is gone by the time `next` runs, so `n` was never living in it.
+        // Three calls rather than one, because a closure that captured a copy answers 1 every time.
+        assert_eq!(
+            evaluate_number(
+                "function counter() { let n = 0; function next() { n = n + 1; return n; } \
+                 return next; } const step = counter(); step(); step(); step();"
+            ),
+            3.0
+        );
+    }
+
+    #[test]
+    fn two_closures_over_one_function_get_a_variable_each() {
+        assert_eq!(
+            evaluate_number(
+                "function counter() { let n = 0; function next() { n = n + 1; return n; } \
+                 return next; } const a = counter(); const b = counter(); a(); a(); b();"
+            ),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_variable_two_levels_out_is_two_hops_when_the_level_between_captured_something() {
+        assert_eq!(
+            evaluate_number(
+                "function a() { let v = 1; function b() { let w = 20; \
+                 function c() { return v + w; } return c(); } return b(); } a();"
+            ),
+            21.0
+        );
+    }
+
+    #[test]
+    fn a_level_that_captured_nothing_does_not_cost_a_hop() {
+        // The same nesting with the middle function holding nothing of its own, so `c` finds `v`
+        // without walking. Scope analysis only asks for a context where something is captured, which
+        // is what keeps the walk proportional to capturing rather than to how deeply somebody
+        // indented.
+        assert_eq!(
+            evaluate_number(
+                "function a() { let v = 7; function b() { function c() { return v; } \
+                 return c(); } return b(); } a();"
+            ),
+            7.0
+        );
+    }
+
+    #[test]
+    fn arguments_past_the_declared_parameters_are_dropped() {
+        // The registers above the parameters are the callee's scratch space, so an extra argument
+        // copied into one of them is a value sitting where the callee expects to find its own.
+        assert_eq!(
+            evaluate_number("function one(a) { return a; } one(1, 2, 3);"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_parameter_that_was_not_passed_is_undefined() {
+        assert_eq!(
+            evaluate("function two(a, b) { return b; } two(1);"),
+            Ok(Value::UNDEFINED)
+        );
+    }
+
+    #[test]
+    fn a_string_literal_inside_a_function_body_is_interned_like_any_other() {
+        // Unreachable until there was a way into a function body, which is why the pass that
+        // resolves constants had to grow from the top level to every function in the unit.
+        assert_eq!(
+            evaluate_display("function greet() { return 'hello'; } greet();"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn calling_something_that_is_not_a_function_says_so_and_says_what_it_was() {
+        assert_eq!(
+            evaluate("const x = 5; x();"),
+            Err(RuntimeError::Type("5 is not a function".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_function_that_never_stops_calling_itself_reports_the_stack_rather_than_crashing() {
+        // The message is Node's, word for word, because a program that prints what it caught should
+        // not be able to tell which engine caught it.
+        assert_eq!(
+            evaluate("function f() { return f(); } f();"),
+            Err(RuntimeError::Range(
+                "Maximum call stack size exceeded".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn an_interpreter_that_overflowed_its_stack_can_run_the_next_program() {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        let overflow = as_expression("function f() { return f(); } f();");
+        assert!(interpreter.run(&overflow).is_err());
+        assert_eq!(interpreter.depth(), 0, "the dead frames should be gone");
+        let again = interpreter
+            .run(&as_expression(
+                "function twice(x) { return x * 2; } twice(4);",
+            ))
+            .expect("should not throw");
+        assert_eq!(again.as_f64(), Some(8.0));
+    }
+
+    #[test]
+    fn typeof_a_function_is_function_and_not_object() {
+        // A closure is a pointer and so is a string, so this only works because the kind word is
+        // read. It answered "string" for every pointer before there was more than one kind.
+        assert_eq!(
+            evaluate_display("function f() { return 1; } typeof f;"),
+            "function"
+        );
+    }
+
+    #[test]
+    fn a_function_prints_as_its_name() {
+        assert_eq!(
+            evaluate_display(
+                "function outer() { function greet() { return 1; } return greet; } outer();"
+            ),
+            "[Function: greet]"
+        );
+    }
+
+    #[test]
+    fn a_function_written_without_a_name_says_so_rather_than_printing_an_empty_one() {
+        assert_eq!(
+            evaluate_display("function outer() { return function () { return 1; }; } outer();"),
+            "[Function (anonymous)]"
+        );
+    }
+
+    #[test]
+    fn a_function_joined_to_a_string_says_that_it_is_a_function() {
+        // Node produces the source text the function was written with, which needs spans that are
+        // not kept yet. Pinned here so the difference is a decision on the record rather than a
+        // surprise the first time a program concatenates one.
+        assert_eq!(
+            evaluate_display(
+                "function outer() { function greet() {} return 'a ' + greet; } outer();"
+            ),
+            "a [Function: greet]"
         );
     }
 

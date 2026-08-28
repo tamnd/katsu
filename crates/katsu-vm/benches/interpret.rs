@@ -33,6 +33,18 @@
 //! are measured apart. Both of them exist mostly to be read next to `add_chain` and `compare_chain`,
 //! since the question a reader has is not what a concatenation costs in isolation but how much the
 //! string case costs over the number case that was there before it.
+//!
+//! The `call` group reports nanoseconds per call rather than per instruction, because a call is not
+//! one instruction: it is a frame pushed, arguments copied, three locals in the dispatch loop moved
+//! and all of it undone on the way back. It is the cost every program pays constantly and it is
+//! where an interpreter is usually slow, so it is measured on its own. `call_return` is the floor,
+//! `fib` is the same thing with real recursion and a captured self reference around it, and
+//! `closure_call` adds a read through the environment so that the cost of capturing is visible next
+//! to the cost of calling.
+//!
+//! The call benchmarks come from source rather than from assembled bytecode, because a call is the
+//! one place where the cost depends on what lowering and scope analysis decided, and hand written
+//! bytecode would measure my guess at those decisions.
 
 use std::hint::black_box;
 
@@ -49,6 +61,16 @@ const ITERATIONS: i32 = 1_000;
 
 /// Instructions in the body of the counting loop: the compare, the branch, the add and the edge.
 const LOOP_BODY: u64 = 4;
+
+/// How many calls in a straight chain of them, for the same reason `CHAIN` is what it is.
+const CALLS: usize = 1_000;
+
+/// How many calls a `fib(20)` makes.
+///
+/// The count satisfies `C(n) = 1 + C(n - 1) + C(n - 2)` with `C(0)` and `C(1)` both one, which
+/// closes to `2 * F(n + 1) - 1`, and `F(21)` is 10946. Spelled out because the division that turns
+/// a wall clock number into nanoseconds per call is only as trustworthy as this constant.
+const FIB_CALLS: u64 = 21_891;
 
 const IC: CacheIndex = CacheIndex(0);
 
@@ -68,6 +90,13 @@ fn blueprint_with(code: Vec<Op>, constants: ConstantPool) -> FunctionBlueprint {
         ..FunctionBlueprint::default()
     };
     out.verify().expect("the benchmark assembled bad bytecode");
+    out
+}
+
+/// Compile a program the way the runtime does, and check it before it is timed.
+fn program(source: &str) -> FunctionBlueprint {
+    let out = katsu_vm::compile("bench.js", source).expect("the benchmark wrote bad JavaScript");
+    out.verify().expect("lowering produced bad bytecode");
     out
 }
 
@@ -263,5 +292,50 @@ fn strings(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, straight_line, loops, strings);
+fn calls(c: &mut Criterion) {
+    let mut group = c.benchmark_group("call");
+
+    // A chain of calls rather than a loop around one, so that nothing but the call is being timed.
+    // The callee returns its argument, which is the shortest body a real function can have.
+    let mut source = String::from("function id(x) { return x; }\n");
+    for _ in 0..CALLS {
+        source.push_str("id(1);\n");
+    }
+    let chain = program(&source);
+    group.throughput(Throughput::Elements(CALLS as u64));
+    group.bench_function("call_return", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&chain))));
+    });
+
+    // The same call with a read through the environment inside it, which is what any function that
+    // uses a variable from where it was written pays on top.
+    let mut source = String::from(
+        "function make() { let base = 1; function add(x) { return x + base; } return add; }\nconst add = make();\n",
+    );
+    for _ in 0..CALLS {
+        source.push_str("add(1);\n");
+    }
+    let captured = program(&source);
+    group.bench_function("closure_call", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&captured))));
+    });
+
+    // Recursion, which is calls with a real stack under them and a self reference read out of the
+    // environment at every one. The oldest benchmark in the business and still the one that says
+    // whether a call is cheap.
+    let fib = program(
+        "function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }\nfib(20);",
+    );
+    group.throughput(Throughput::Elements(FIB_CALLS));
+    group.bench_function("fib", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&fib))));
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, straight_line, loops, strings, calls);
 criterion_main!(benches);

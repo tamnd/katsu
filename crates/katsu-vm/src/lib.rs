@@ -7,6 +7,7 @@
 mod interpret;
 mod number;
 mod stack;
+mod unit;
 mod value;
 
 use std::fmt;
@@ -15,7 +16,8 @@ use katsu_gc::{Atom, AtomTable, BumpHeap, Cage, CageError, StringRef};
 use katsu_ir::FunctionBlueprint;
 
 pub use interpret::{Interpreter, Interrupt, RuntimeError};
-pub use stack::{Frame, Stack, StackError};
+pub use stack::{Frame, Invocation, Stack, StackError};
+pub use unit::{Loaded, Resolved, Unit};
 pub use value::Value;
 
 /// Why a source file could not be turned into something executable.

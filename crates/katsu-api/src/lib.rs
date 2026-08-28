@@ -172,9 +172,12 @@ mod tests {
     #[test]
     fn something_this_build_cannot_run_says_so_and_names_it() {
         let mut runtime = runtime();
+        // Calls run now, so the opcode this stops at is the global load in front of the call rather
+        // than the call itself. It is still the case being checked: something the frontend can lower
+        // and the loop cannot run is named rather than being guessed at or crashed on.
         let error = runtime
             .eval("ok.js", "console.log(1)")
-            .expect_err("calls are not implemented yet");
+            .expect_err("globals are not implemented yet");
         assert!(matches!(error, Error::NotImplemented(_)), "got {error:?}");
     }
 }
