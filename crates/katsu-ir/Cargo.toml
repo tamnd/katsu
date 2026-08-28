@@ -1,0 +1,24 @@
+[package]
+name = "katsu-ir"
+description = "Bytecode, function blueprints and the opcode description language for the katsu runtime. Internal, no stability promise."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags.workspace = true
+rustc-hash.workspace = true
+serde = { workspace = true, optional = true }
+smallvec.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "smallvec/serde"]

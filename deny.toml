@@ -1,0 +1,34 @@
+# cargo-deny configuration.
+#
+# The dependency count is a budget, not an accident. A supply chain is an attack surface,
+# and every dependency is a thing that can stop being maintained. See
+# spec/16-package-layout.md.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Permissive licenses only. Anything copyleft in the dependency graph of a runtime that
+# other people embed in their own binaries is a problem for them, not just for us.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of the same crate in one binary is dead weight in a distribution size budget
+# measured in single megabytes.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

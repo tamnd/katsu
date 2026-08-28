@@ -1,0 +1,23 @@
+[package]
+name = "katsu-vm"
+description = "Interpreter, object model, shapes, inline caches and isolates for the katsu runtime. Internal, no stability promise."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-gc.workspace = true
+katsu-ir.workspace = true
+katsu-parse.workspace = true
+katsu-platform.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

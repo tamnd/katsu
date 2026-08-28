@@ -1,0 +1,20 @@
+[package]
+name = "test262-runner"
+description = "Runs the test262 conformance suite against katsu and ratchets the expectations file."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-runtime.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# test262 and Node's own test suite are vendored by a script rather than committed, because
+# they carry their own licenses and they are large. See tools/README.md.
+/vendor
+
+# Benchmark output and profiles.
+/bench-results
+*.profraw
+*.profdata
+
+.DS_Store

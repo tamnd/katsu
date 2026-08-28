@@ -1,0 +1,45 @@
+name: Performance problem
+description: Something is slower or uses more memory than it should.
+labels: ["kind: perf"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every number here should name the machine, the operating system, the versions compared, and the run count, because that is the standard we hold our own published numbers to in spec/15-benchmarks.md.
+  - type: textarea
+    id: measurement
+    attributes:
+      label: The measurement
+      description: The command, the numbers, and how many runs.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine and operating system
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions compared
+      description: For example, katsu 0.1.0 against Node.js 24.18.0.
+    validations:
+      required: true
+  - type: dropdown
+    id: axis
+    attributes:
+      label: Which axis
+      description: The seven axes are in spec/02-the-10x-goal.md.
+      options:
+        - Cold start
+        - Baseline memory at idle
+        - Distribution size
+        - Typed compute, ahead of time mode
+        - Server request throughput
+        - Peak compute, JIT mode
+        - Heap under load
+        - Compile time
+    validations:
+      required: true

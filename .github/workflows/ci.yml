@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  layers:
+    name: Layer stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      # The dependency direction in spec/03-architecture.md is a rule rather than a
+      # suggestion, so it is a failing build rather than a paragraph nobody reads.
+      - run: cargo run -p xtask -- layers
+
+  test:
+    name: Test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86-64
+            os: ubuntu-latest
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macos aarch64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo test --workspace --all-features
+      - run: cargo build --release
+      - run: ./target/release/katsu --build-info
+
+  features:
+    name: Feature set ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The four configurations in spec/16-package-layout.md are real products rather than
+      # theoretical combinations, and a feature flag that is not in CI is a feature flag
+      # that is already broken.
+      matrix:
+        include:
+          - name: full
+            args: -p katsu
+          - name: embedded
+            args: -p katsu-runtime --no-default-features --features jit,minimal
+          - name: jitless
+            args: -p katsu --no-default-features --features node
+          - name: minimal jitless
+            args: -p katsu-runtime --no-default-features --features minimal
+          - name: io_uring
+            args: -p katsu-runtime --features uring
+          - name: native addons
+            args: -p katsu --features addons
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo check ${{ matrix.args }} --all-targets
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo doc --workspace --no-deps --all-features
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  # Distribution size is one of the four axes where the 10x claim actually holds, so it is
+  # measured on every commit rather than at release time when it is too late to react.
+  size:
+    name: Distribution size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo build --release -p katsu
+      - name: Report binary size against the budget
+        run: |
+          bytes=$(stat -c %s target/release/katsu)
+          budget=$((15 * 1000 * 1000))
+          echo "katsu binary: $bytes bytes, budget $budget bytes" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$bytes" -gt "$budget" ]; then
+            echo "over the 15 MB budget in spec/02-the-10x-goal.md"
+            exit 1
+          fi

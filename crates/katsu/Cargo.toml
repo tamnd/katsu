@@ -1,0 +1,35 @@
+[package]
+name = "katsu"
+description = "A JavaScript and TypeScript runtime in Rust, with its own JIT and an ahead of time mode that compiles to Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-aot = { workspace = true, optional = true }
+katsu-runtime.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = ["jit", "node", "full-intl", "aot"]
+jit = ["katsu-runtime/jit"]
+aot = ["dep:katsu-aot"]
+node = ["katsu-runtime/node"]
+addons = ["katsu-runtime/addons"]
+full-intl = ["katsu-runtime/full-intl"]
+minimal = ["katsu-runtime/minimal"]
+uring = ["katsu-runtime/uring"]
+
+[[bin]]
+name = "katsu"
+path = "src/main.rs"

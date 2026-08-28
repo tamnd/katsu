@@ -1,0 +1,111 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/*", "xtask"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tamnd/katsu"
+homepage = "https://github.com/tamnd/katsu"
+authors = ["The katsu authors"]
+
+[workspace.dependencies]
+# Internal crates. One version number across the whole workspace, released in lockstep.
+katsu-aot = { version = "0.0.0", path = "crates/katsu-aot" }
+katsu-api = { version = "0.0.0", path = "crates/katsu-api" }
+katsu-builtins = { version = "0.0.0", path = "crates/katsu-builtins" }
+katsu-gc = { version = "0.0.0", path = "crates/katsu-gc" }
+katsu-ir = { version = "0.0.0", path = "crates/katsu-ir" }
+katsu-jit = { version = "0.0.0", path = "crates/katsu-jit" }
+katsu-loop = { version = "0.0.0", path = "crates/katsu-loop" }
+katsu-macros = { version = "0.0.0", path = "crates/katsu-macros" }
+katsu-node = { version = "0.0.0", path = "crates/katsu-node" }
+katsu-parse = { version = "0.0.0", path = "crates/katsu-parse" }
+katsu-platform = { version = "0.0.0", path = "crates/katsu-platform" }
+katsu-runtime = { version = "0.0.0", path = "crates/katsu-runtime" }
+katsu-stencils = { version = "0.0.0", path = "crates/katsu-stencils" }
+katsu-vm = { version = "0.0.0", path = "crates/katsu-vm" }
+
+# Frontend. See spec/04-frontend.md and open question Q9.
+oxc_allocator = "0.147.0"
+oxc_ast = "0.147.0"
+oxc_parser = "0.147.0"
+oxc_resolver = "11.24.3"
+oxc_semantic = "0.147.0"
+oxc_span = "0.147.0"
+regress = "0.12.0"
+
+# Event loop. See spec/12-concurrency-and-io.md. libuv is not the contract, the phase ordering is.
+tokio = { version = "1.53.1", default-features = false }
+
+# Everything else, deliberately boring. The count is a budget, see spec/16-package-layout.md.
+anyhow = "1.0.104"
+bitflags = "2.13.1"
+bumpalo = "3.20.3"
+clap = { version = "4.6.6", features = ["derive"] }
+indexmap = "2.14.0"
+libc = "0.2.189"
+memmap2 = "0.9.11"
+proc-macro2 = "1.0.104"
+quote = "1.0.42"
+rustc-hash = "2.1.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+smallvec = "1.15.2"
+syn = { version = "2.0.108", features = ["full"] }
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Tooling only, never in the runtime dependency graph.
+criterion = "0.8.2"
+hdrhistogram = "7.6.0"
+rayon = "1.12.0"
+sysinfo = "0.39.6"
+tabled = "0.21.0"
+walkdir = "2.5.0"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# The doc comments in this workspace are written as English prose on purpose, because they
+# explain why a decision was made and point at the specification document that made it.
+# doc_markdown wants backticks around every identifier-shaped word in that prose, which
+# turns readable paragraphs into code soup, so it is off.
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+undocumented_unsafe_blocks = "warn"
+
+# Release builds are what the benchmark numbers in spec/15-benchmarks.md are taken from,
+# so the profile is part of the measurement and lives in version control.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# A release build with symbols, for profiling and for reading a real backtrace out of a
+# JIT frame. Same code as release, so a number taken here is comparable.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[profile.bench]
+inherits = "profiling"
+
+# Tests run the interpreter against the JIT millions of times, so an unoptimized
+# dependency tree makes the differential suite in spec/14-quality-bar.md unusable.
+[profile.dev.package."*"]
+opt-level = 2

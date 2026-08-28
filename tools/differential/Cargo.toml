@@ -1,0 +1,17 @@
+[package]
+name = "differential"
+description = "Differential testing between the katsu interpreter and the compilation tiers, with the interpreter as oracle."
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-runtime.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+walkdir.workspace = true

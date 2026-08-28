@@ -1,0 +1,23 @@
+[package]
+name = "katsu-node"
+description = "The Node.js compatible layer for the katsu runtime: node modules, globals and the Node-API host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-api.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+# Node-API host and dlopen of .node addons. This is a security decision, see spec/14-quality-bar.md.
+addons = []

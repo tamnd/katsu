@@ -1,0 +1,24 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # One pull request per family rather than one per crate. oxc in particular releases
+      # roughly weekly across a dozen crates that have to move together.
+      oxc:
+        patterns: ["oxc*"]
+      tracing:
+        patterns: ["tracing*"]
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

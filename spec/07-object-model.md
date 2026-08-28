@@ -1,0 +1,119 @@
+# The object model
+
+This is where a JavaScript engine's performance and its memory footprint are both decided, which makes it the document where the two halves of the 10x goal pull hardest against each other.
+
+## 7.1 Values
+
+Two representations, used in different places, which is the arrangement V8 arrived at and the one that satisfies both halves of our goal.
+
+**In heap slots: 32 bit compressed values.** Object property slots, array elements, and context slots are 4 bytes. A slot is either a Smi (a 31 bit signed integer, tagged by the low bit) or a compressed pointer, which is a 32 bit offset from the cage base.
+
+**In registers and on our stack: 64 bit tagged values.** Interpreter registers and JIT virtual registers hold a full 64 bit value, so doubles do not have to be boxed while they are in flight, and the tag scheme distinguishes Smi, double, and pointer without a memory access.
+
+The reason to compress heap slots is that this is where the memory goal lives. V8 measured up to 43% heap reduction from pointer compression, up to 20% off Chrome's renderer memory, because tagged values are around 70% of a real heap. A V8 developer put the cost of turning it off at 60 to 70% more memory. There is no version of a 10x memory target that does not include this.
+
+The reason not to compress registers is that a compressed double has to be boxed, and boxing every intermediate in a numeric loop is exactly the tax that makes an engine slow.
+
+The consequence is that loading a value from a slot into a register is a decompress (add the cage base, or a shift plus add for a Smi) and storing is a compress with a check. Those are one or two instructions, they are what every V8 property access already pays, and they are the price of the memory goal.
+
+## 7.2 The cage
+
+All of the JavaScript heap lives in one reserved region of virtual address space per isolate, aligned so that the base can be held in a pinned register and the compression is a masked add.
+
+This caps a single isolate's heap at 4 GB, which is exactly the trade Chrome made. It is a product limitation and it goes in the documentation rather than being discovered by a user with a 6 GB working set. `--no-pointer-compression` exists as an escape hatch for those users and it costs them the memory win and the sandbox.
+
+The cage is also the security boundary. The threat model from document 01.7 is an attacker turning a JIT type confusion into a corrupted pointer and then into arbitrary process read and write. Inside a cage, a corrupted reference is an offset that lands somewhere else inside the cage, which is a much weaker primitive. Native pointers therefore do not live in the cage: an object that references host memory holds an index into an external pointer table, and the table lives outside. Cloudflare's Workers hardening describes the shape we are copying, including large unmapped guard regions around the cage so that out of bounds indexing faults rather than reads.
+
+One honest note: because compressed pointers have no spare bits, the whole heap needs a single memory tag, which makes ARM MTE useless for catching corruption between objects inside the heap. That is a real loss and it is why the fuzzing in document 14 matters more for us than for a runtime that could rely on hardware tagging.
+
+## 7.3 Why not Nova's index based design
+
+Nova represents every heap reference as a type discriminated 32 bit index into a per type vector, which gets pointer compression for free, prevents type confusion by construction because reinterpreting an index changes which arena you read, and lays out objects data oriented so a field read does not drag unused fields into cache. It is a genuinely interesting design and the Web Engines Hackfest slides make a good case.
+
+We are not taking it, for one reason: an inline cache and a piece of JIT generated code want to load a property with a single memory access at a known offset from a known base. An index into an arena is one more indirection on the hottest path in the engine, and it is an indirection the JIT cannot optimize away because the arena can move and grow. Nova is interpreter only today, and this is the part of its design that a JIT would stress hardest.
+
+If the copy and patch spike in M2 turns up something that changes this analysis, document 17 is where it gets revisited. Otherwise: tagged compressed pointers into a cage.
+
+## 7.4 Shapes
+
+Objects with the same property layout share a shape, and a shape describes the property names, their attributes, and their storage offsets. Adding a property transitions to a new shape via a transition table, so `{}` then `.x` then `.y` always reaches the same shape and ten thousand objects built the same way share one description. This is Chambers, Ungar and Lee's maps from SELF in 1989 and every engine since has some version of it.
+
+Layout of an ordinary object:
+
+```
+[ shape (compressed) ] [ elements (compressed) ] [ properties (compressed) ] [ inline slot 0 .. N ]
+```
+
+Header is two words in compressed form. Inline slots hold the first N properties directly in the object, so a small object is one allocation. Overflow goes to the out of line properties array. Indexed properties go to elements.
+
+Under the memory budget, N is chosen from the shape's transition history rather than being a fixed guess: an object literal with three properties allocates three inline slots, and a constructor that reliably adds five gets five once the shape tree has seen it happen. Over allocating inline slots is a classic way to burn memory on millions of small objects.
+
+Dictionary mode exists for objects that are used as hash maps, with thousands of properties or frequent deletes. Transitioning into dictionary mode is one way, it disables inline caching for that object, and it exists so that pathological programs degrade instead of exploding the shape tree.
+
+## 7.5 Inline caches, with one description per cache
+
+The best documented modern design here is SpiderMonkey's CacheIR: rather than hand writing a stub for each cache case, an inline cache is a small program in a dedicated IR, and one description generates the interpreter's cache, the baseline stub, and the input the optimizing compiler uses for inlining decisions.
+
+We copy that idea, because it is the same argument as document 05.2 applied to caches instead of opcodes. Writing property access fast paths three times, once per tier, is how tiers drift apart.
+
+A cache program is a short sequence of operations: guard the shape, guard the prototype chain is unmodified via a validity cell, load from a fixed slot, or call a getter. The interpreter runs it as data. Tier 1 compiles it into an inline slab in the generated code (document 06.2). Tier 2 reads it as type information and inlines the load with a guard.
+
+Cache states are the standard progression: uninitialized, monomorphic, polymorphic up to four shapes, then megamorphic, which falls back to a global stub cache keyed by shape and property name so that a genuinely polymorphic site is still better than a full lookup.
+
+Prototype chain invalidation uses validity cells: a shape's cell is invalidated when anything on its prototype chain is mutated, so a cache does not need to walk the chain to know it is still valid.
+
+## 7.6 Arrays
+
+Arrays get specialized element storage, because a JavaScript array is not one data structure.
+
+| Kind | Storage |
+|---|---|
+| PackedSmi | 4 byte compressed Smi values, no holes |
+| PackedDouble | 8 byte unboxed doubles, no holes |
+| PackedObject | 4 byte compressed references, no holes |
+| Holey variants of each | same, with a hole sentinel |
+| Dictionary | sparse, hash map |
+
+Transitions only go one way, from more specific to less. Writing a double into a PackedSmi array converts the whole backing store once. Writing past the end creates holes and transitions to holey, and the holey kinds are meaningfully slower because every read has to check for the hole and consult the prototype chain if it finds one.
+
+Typed arrays and `ArrayBuffer` are separate: the backing store is a raw allocation outside the cage, reached through the external pointer table, which is what makes zero copy sharing with Rust possible in document 11.
+
+## 7.7 Strings, and the UTF-16 problem
+
+JavaScript strings are sequences of UTF-16 code units and may contain lone surrogates. Rust's `String` is guaranteed UTF-8. There is no free conversion between them, and this is the single most consequential representation decision for a JavaScript engine written in Rust.
+
+The design:
+
+**Two flat representations.** Latin-1, one byte per character, covering the overwhelming majority of real strings, and UTF-16, two bytes per code unit, for everything else. A one byte string that never needs widening never pays double, which is where a lot of the memory win over a naive UTF-16 engine comes from.
+
+**Ropes for concatenation.** `a + b` in a loop builds a tree rather than copying, and the tree is flattened lazily on the first operation that needs contiguous storage. This is what makes string building in JavaScript not quadratic.
+
+**Slices** for `substring`, referencing the parent's storage, with the usual care that a small slice of a huge string keeps the huge string alive, so slices flatten when the ratio is bad.
+
+**Interned atoms** for property names, in a table that lives in the realm snapshot, so `"length"` is one pointer comparison.
+
+**The Rust boundary is explicit.** `Value::as_str()` does not exist as a free operation. Converting a JavaScript string to a Rust `&str` is either free (Latin-1 that is ASCII, or already valid UTF-8), a copy (UTF-16 to UTF-8), or an error (lone surrogates). Document 11 makes the API force that choice rather than hide it, because hiding it is how you get a runtime that silently copies megabytes on every call.
+
+`regress` handles the regex side, since it offers UTF-16 and UCS-2 input modes where surrogate pairs split freely, which is what strict `RegExp` semantics require and what `regex` cannot do.
+
+## 7.8 Snapshot constraints
+
+Because the realm is snapshotted at build time (document 03.8), nothing in the snapshotted heap may contain an absolute address.
+
+Compressed slots are already offsets, so they survive relocation for free, which is a pleasant second reason to compress. Native function pointers are stored as ordinals into a table resolved at map time. External pointer table entries are rebuilt at startup. Anything else that needs an absolute address either does not go in the snapshot or gets a fixup entry, and there is a debug assertion that walks the snapshot looking for violations.
+
+## 7.9 The per object memory budget
+
+The numbers this design is aiming at, as targets that document 15 measures rather than claims already met:
+
+| Thing | Bytes |
+|---|---|
+| Empty object `{}` | 24, being header plus a small inline slot allowance |
+| `{a: 1, b: 2, c: 3}` | 36 |
+| Array of 1000 packed Smis | ~4 KB plus header |
+| Array of 1000 packed doubles | ~8 KB plus header |
+| Short ASCII string, 10 chars | 26 |
+| Closure with two captured variables | 40 plus the shared blueprint |
+| Shape, shared across all objects with that layout | ~64, amortized to near zero per object |
+
+The comparison that matters is not against a hand written Rust struct, it is against V8, which already compresses. We win on header size, on not allocating feedback until a function is warm, and on sizing inline slots from real transition history. We do not win by 10x, and document 02.7 says so.

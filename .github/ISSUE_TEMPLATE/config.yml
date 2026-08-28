@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Node.js compatibility gap
+    url: https://github.com/tamnd/katsu-compat/issues/new
+    about: A Node.js API that is missing, wrong, or behaves differently. Those are tracked in katsu-compat.
+  - name: Benchmark result or methodology
+    url: https://github.com/tamnd/katsu-bench/issues/new
+    about: A number that looks wrong, or a workload we should be measuring. Those are tracked in katsu-bench.

@@ -1,0 +1,18 @@
+[package]
+name = "katsu-stencils"
+description = "Build time stencil generation and the shipped copy and patch artifacts for the katsu baseline JIT. Internal, no stability promise."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-ir.workspace = true
+katsu-platform.workspace = true
+thiserror.workspace = true

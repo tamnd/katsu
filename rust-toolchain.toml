@@ -1,0 +1,8 @@
+[toolchain]
+# Stable only. spec/16-package-layout.md commits to never requiring nightly for a default
+# build, and the nightly-only interpreter dispatch strategy in spec/05-interpreter.md sits
+# behind a feature flag precisely so that this stays true.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+# No `targets` list on purpose. Naming cross targets here makes every contributor download
+# three standard libraries on first build. CI adds the target it needs, where it needs it.
