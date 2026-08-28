@@ -1,0 +1,21 @@
+[package]
+name = "katsu-aot"
+description = "The Rust emitter for katsu ahead of time mode. Compiles a JavaScript or TypeScript program into a Rust crate. Internal, no stability promise."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-ir.workspace = true
+katsu-parse.workspace = true
+katsu-vm.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

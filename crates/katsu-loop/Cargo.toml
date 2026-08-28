@@ -1,0 +1,24 @@
+[package]
+name = "katsu-loop"
+description = "Event loop and I/O for the katsu runtime, with Node observable phase ordering on tokio. Internal, no stability promise."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-vm.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "fs", "sync", "io-util"] }
+tracing.workspace = true
+
+[features]
+default = []
+# io_uring is opt in, not default. Docker 25 blocks its syscalls in the default seccomp profile.
+uring = []

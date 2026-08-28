@@ -1,0 +1,27 @@
+[package]
+name = "katsu-runtime"
+description = "The katsu runtime facade. This is what ahead of time compiled output and embedders link against."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+katsu-api.workspace = true
+katsu-macros.workspace = true
+katsu-node = { workspace = true, optional = true }
+
+[features]
+default = ["jit", "node", "full-intl"]
+jit = ["katsu-api/jit"]
+node = ["dep:katsu-node"]
+addons = ["node", "katsu-node/addons"]
+full-intl = ["katsu-api/full-intl"]
+minimal = []
+uring = ["katsu-api/uring"]

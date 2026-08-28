@@ -1,0 +1,5 @@
+# Stable options only. Nightly-only rustfmt settings would make `cargo fmt --check` in CI
+# depend on a nightly toolchain, and spec/16-package-layout.md commits to not requiring one.
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
