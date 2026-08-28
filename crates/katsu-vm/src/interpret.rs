@@ -338,7 +338,10 @@ impl Interpreter {
             return self.native_text(native);
         }
         if let Some(object) = self.as_object(value) {
-            return self.object_text(object, inspect::DEPTH, 0);
+            // A fresh cycle set per printed value, because the numbering restarts for each one.
+            // `console.log(a, a)` on an object that holds itself prints `<ref *1>` twice rather
+            // than numbering the second one two.
+            return self.object_text(object, inspect::DEPTH, 0, &mut Cycles::default());
         }
         // Negative zero is the one number that inspection and `ToString` spell differently. The
         // specification says `ToString` of it is "0", and Node's console prints "-0", because a
@@ -567,11 +570,11 @@ impl Interpreter {
                 }
 
                 Op::Equal { dst, lhs, rhs, .. } => {
-                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs));
+                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs))?;
                     self.stack.set(dst, Value::from_bool(equal));
                 }
                 Op::NotEqual { dst, lhs, rhs, .. } => {
-                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs));
+                    let equal = self.loose_equal(self.stack.get(lhs), self.stack.get(rhs))?;
                     self.stack.set(dst, Value::from_bool(!equal));
                 }
                 Op::StrictEqual { dst, lhs, rhs, .. } => {
@@ -591,21 +594,21 @@ impl Interpreter {
                 // them as its own float comparison agrees on numbers and disagrees on strings, where
                 // `"a" <= "b"` is not `!("a" > "b")` by accident but by definition.
                 Op::Less { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs));
+                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs))?;
                     self.stack.set(dst, Value::from_bool(less.unwrap_or(false)));
                 }
                 Op::Greater { dst, lhs, rhs, .. } => {
                     // The operands go in the other way round, which is what makes `>` a `<` with its
                     // arguments swapped rather than a comparison of its own.
-                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs));
+                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs))?;
                     self.stack.set(dst, Value::from_bool(less.unwrap_or(false)));
                 }
                 Op::LessEqual { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs));
+                    let less = self.less_than(self.stack.get(rhs), self.stack.get(lhs))?;
                     self.stack.set(dst, Value::from_bool(!less.unwrap_or(true)));
                 }
                 Op::GreaterEqual { dst, lhs, rhs, .. } => {
-                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs));
+                    let less = self.less_than(self.stack.get(lhs), self.stack.get(rhs))?;
                     self.stack.set(dst, Value::from_bool(!less.unwrap_or(true)));
                 }
 
@@ -673,6 +676,16 @@ impl Interpreter {
                     let closure = ClosureRef::new(self.isolate.heap_mut(), target, captured, name)
                         .ok_or(RuntimeError::OutOfMemory)?;
                     let value = Value::from_slot(closure.slot(), self.isolate.cage());
+                    self.stack.set(dst, value);
+                }
+
+                // An empty object with room for the properties the stores after this one are about
+                // to put in it. It starts at the root shape and walks down the transition tree one
+                // store at a time, which is what makes a literal and an object grown a property at
+                // a time reach the same shape.
+                Op::NewObject { dst, slots } => {
+                    let object = self.new_object(usize::from(slots))?;
+                    let value = Value::from_slot(object.slot(), self.isolate.cage());
                     self.stack.set(dst, value);
                 }
 
@@ -1212,16 +1225,37 @@ impl Interpreter {
     /// reason: inside an object the quotes are what tell a string apart from a name.
     ///
     /// The depth is Node's, and it is a limit on how much of a large object is worth looking at
-    /// rather than a way of stopping an endless walk. An object can hold itself now that it can be
-    /// mutated after it is made, so the depth is doing both jobs, and the second one is why it is
-    /// checked before anything is read rather than after.
-    fn object_text(&self, object: ObjectRef, depth: u32, indent: usize) -> String {
+    /// rather than a way of stopping an endless walk. Stopping the walk is the cycle set's job, and
+    /// the two are separate because a cycle is reported wherever it is found and a depth limit only
+    /// applies below the third level, so an object that points back at itself from four levels down
+    /// prints `[Circular *1]` and not `[Object]`.
+    fn object_text(
+        &self,
+        object: ObjectRef,
+        depth: u32,
+        indent: usize,
+        cycles: &mut Cycles,
+    ) -> String {
+        let slot = object.slot();
+        // Asked before the depth check, and that order was measured rather than chosen.
+        if cycles.inside(slot) {
+            return inspect::circular(cycles.number(slot));
+        }
+        let cage = self.isolate.cage();
+        let names = object.names(cage);
+        // Also before the depth check, and also measured. An object with nothing in it prints as
+        // `{}` however deep it is, because there is nothing below it for the limit to be protecting
+        // anybody from, and `[Object]` would be six characters longer as well as less informative.
+        // The differential harness found this one: `[Object]` is long enough to push the object
+        // holding it over the width limit, so getting it wrong breaks a line that Node keeps whole.
+        if names.is_empty() {
+            return "{}".to_owned();
+        }
         if depth == 0 {
             return "[Object]".to_owned();
         }
-        let cage = self.isolate.cage();
-        let entries: Vec<String> = object
-            .names(cage)
+        cycles.enter(slot);
+        let entries: Vec<String> = names
             .into_iter()
             .enumerate()
             .map(|(index, name)| {
@@ -1229,24 +1263,35 @@ impl Interpreter {
                     .value_at(cage, u32::try_from(index).unwrap_or(u32::MAX))
                     .expect("a name at this index means there is a value at it");
                 let key = inspect::key(&name.to_utf8_lossy(cage));
-                let value =
-                    self.inspect(Value::from_bits(value), depth - 1, inspect::nested(indent));
+                let value = self.inspect(
+                    Value::from_bits(value),
+                    depth - 1,
+                    inspect::nested(indent),
+                    cycles,
+                );
                 format!("{key}: {value}")
             })
             .collect();
-        inspect::braces(&entries, indent)
+        cycles.leave();
+        // Read after the walk and not before it, because whether anything points back at this
+        // object is only known once everything under it has been printed.
+        let base = match cycles.assigned(slot) {
+            Some(number) => inspect::reference(number),
+            None => String::new(),
+        };
+        inspect::braces(&entries, indent, &base)
     }
 
     /// What one value looks like inside a printed object.
     ///
     /// A string is quoted here and not quoted when it is printed on its own, which is not an
     /// inconsistency: inside an object the quotes are what tell a string apart from a name.
-    fn inspect(&self, value: Value, depth: u32, indent: usize) -> String {
+    fn inspect(&self, value: Value, depth: u32, indent: usize, cycles: &mut Cycles) -> String {
         if let Some(string) = self.as_string(value) {
             return inspect::quote(&string.to_utf8_lossy(self.isolate.cage()));
         }
         if let Some(object) = self.as_object(value) {
-            return self.object_text(object, depth, indent);
+            return self.object_text(object, depth, indent, cycles);
         }
         self.display(value)
     }
@@ -1435,10 +1480,45 @@ impl Interpreter {
     #[cold]
     #[inline(never)]
     fn add_slowly(&mut self, left: Value, right: Value) -> Result<Value, RuntimeError> {
+        // ToPrimitive on both sides first and then the string test, which is the order the
+        // specification gives and is not the same as testing for a string and converting after.
+        // `{} + 1` is the case that tells them apart: neither side is a string, and the answer is
+        // still the text `[object Object]1` rather than NaN, because the object became a string on
+        // the way in.
+        let left = self.coerce_to_primitive(left)?;
+        let right = self.coerce_to_primitive(right)?;
         if self.is_string(left) || self.is_string(right) {
             return self.concatenate(left, right);
         }
         Ok(Value::from_f64(self.number(left) + self.number(right)))
+    }
+
+    /// `ToPrimitive`, which today gives back a string or the value it was handed.
+    ///
+    /// Every heap value that is not already a string reaches the default `toString`, because there
+    /// is no prototype yet to carry a `valueOf` and no `Symbol.toPrimitive` to look up first. That
+    /// is why the hint the specification passes is not threaded through here: number and string and
+    /// default all reach the same place, so a parameter for it would be a parameter nothing reads.
+    /// It arrives with prototypes, and so does the ability of this to run code and throw, which is
+    /// why it already returns a `Result`.
+    ///
+    /// The test for having anything to do is `is_pointer`, which is a range check on a word that is
+    /// already in a register rather than a load of a heap kind, so a comparison between two numbers
+    /// or two strings pays a predictable branch and nothing else.
+    fn coerce_to_primitive(&mut self, value: Value) -> Result<Value, RuntimeError> {
+        if !value.is_pointer() || self.is_string(value) {
+            return Ok(value);
+        }
+        let string = self.coerce_to_string(value)?;
+        Ok(self.string_value(string))
+    }
+
+    /// Whether a value is an object rather than a primitive, which for `==` is the whole question.
+    ///
+    /// A string is on the heap and is not an object, which is the one case that makes this more than
+    /// a pointer test.
+    fn is_object(&self, value: Value) -> bool {
+        value.is_pointer() && !self.is_string(value)
     }
 
     /// `+` when at least one side is a string.
@@ -1553,9 +1633,9 @@ impl Interpreter {
     /// Two numbers short circuit to the same answer `===` gives, so the common case does not pay for
     /// the recursion, and the rest of it stays out of the dispatch loop.
     #[inline]
-    fn loose_equal(&self, left: Value, right: Value) -> bool {
+    fn loose_equal(&mut self, left: Value, right: Value) -> Result<bool, RuntimeError> {
         if let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) {
-            return left == right;
+            return Ok(left == right);
         }
         self.loose_equal_slowly(left, right)
     }
@@ -1563,19 +1643,25 @@ impl Interpreter {
     /// `==` when at least one side is not a number.
     #[cold]
     #[inline(never)]
-    fn loose_equal_slowly(&self, left: Value, right: Value) -> bool {
+    fn loose_equal_slowly(&mut self, left: Value, right: Value) -> Result<bool, RuntimeError> {
         // Checked before anything else, because `null == undefined` is true and neither of them is
-        // equal to anything else at all, not to zero, not to false, and not to the empty string.
+        // equal to anything else at all, not to zero, not to false, not to the empty string and not
+        // to an object.
         if left.is_nullish() || right.is_nullish() {
-            return left.is_nullish() && right.is_nullish();
+            return Ok(left.is_nullish() && right.is_nullish());
         }
-        // Two of a kind is the strict question, which covers both numbers, both strings and both
-        // booleans.
+        // Two of a kind is the strict question, which covers both numbers, both strings, both
+        // booleans and both objects. Objects belong in that list rather than in the conversion below
+        // it, because two objects are equal when they are the same object and never because their
+        // contents match. Left out, an object compared against itself would fall all the way through
+        // to the number comparison and answer false, since its primitive is a string that is NaN as
+        // a number and NaN is not equal to itself.
         if left.is_number() && right.is_number()
             || left.is_bool() && right.is_bool()
             || self.is_string(left) && self.is_string(right)
+            || self.is_object(left) && self.is_object(right)
         {
-            return self.strict_equal(left, right);
+            return Ok(self.strict_equal(left, right));
         }
         // A boolean converts to a number and the question is asked again, rather than being compared
         // against the other side directly. That extra step is why `"1" == true` is true: the boolean
@@ -1586,9 +1672,20 @@ impl Interpreter {
         if let Some(boolean) = right.as_bool() {
             return self.loose_equal(left, Value::from_i32(i32::from(boolean)));
         }
-        // The only pair left in M0 is a number against a string, and the string is the side that
-        // converts, which is why `"0x10" == 16` is true.
-        self.number(left) == self.number(right)
+        // An object against a primitive converts the object and asks again, the same recursion the
+        // boolean case above uses. It is why `({}) == '[object Object]'` is true, which reads like a
+        // curiosity and is the mechanism `[] == ''` and `[1] == 1` rest on once there are arrays.
+        if self.is_object(left) {
+            let left = self.coerce_to_primitive(left)?;
+            return self.loose_equal(left, right);
+        }
+        if self.is_object(right) {
+            let right = self.coerce_to_primitive(right)?;
+            return self.loose_equal(left, right);
+        }
+        // The only pair left is a number against a string, and the string is the side that converts,
+        // which is why `"0x10" == 16` is true.
+        Ok(self.number(left) == self.number(right))
     }
 
     /// The ECMAScript abstract relational comparison, asking whether `left` is less than `right`.
@@ -1601,27 +1698,91 @@ impl Interpreter {
     /// true because the capitals come first in the table, and `"ab" < "b"` is true because the
     /// comparison stops at the first unit that differs.
     ///
-    /// The specification also carries a flag saying which operand to convert first, because `<=`
-    /// converts its right operand before its left. Nothing in M0 can tell the difference, since no
-    /// conversion here can run code or throw, so that flag arrives with `valueOf` rather than now.
+    /// The specification also carries a flag saying which operand to convert first, because `<=` and
+    /// `>` swap their operands and still have to convert the one written on the left first. Nothing
+    /// can tell the difference yet, since no conversion here can run code or throw, so the four arms
+    /// go on passing their operands in whichever order makes the comparison right and the flag
+    /// arrives with `valueOf`.
     ///
     /// Two numbers are the case every loop condition in every program is, so they are tested for
     /// first and answered without touching the heap, for the same reason the addition above is.
-    fn less_than(&self, left: Value, right: Value) -> Option<bool> {
+    fn less_than(&mut self, left: Value, right: Value) -> Result<Option<bool>, RuntimeError> {
         match (left.as_f64(), right.as_f64()) {
-            (Some(left), Some(right)) => compare_numbers(left, right),
+            (Some(left), Some(right)) => Ok(compare_numbers(left, right)),
             _ => self.less_than_slowly(left, right),
         }
     }
 
     /// The relational comparison when at least one side is not already a number.
+    ///
+    /// The conversion runs before the string test rather than after it, which is what makes
+    /// `'9' < {}` true: an object is not a string, but its primitive is, so this ends up comparing
+    /// `'9'` against `'[object Object]'` by code unit rather than comparing two NaNs.
     #[cold]
     #[inline(never)]
-    fn less_than_slowly(&self, left: Value, right: Value) -> Option<bool> {
+    fn less_than_slowly(
+        &mut self,
+        left: Value,
+        right: Value,
+    ) -> Result<Option<bool>, RuntimeError> {
+        let left = self.coerce_to_primitive(left)?;
+        let right = self.coerce_to_primitive(right)?;
         if let (Some(left), Some(right)) = (self.as_string(left), self.as_string(right)) {
-            return Some(left.compare(self.isolate.cage(), right) == Sorting::Less);
+            return Ok(Some(
+                left.compare(self.isolate.cage(), right) == Sorting::Less,
+            ));
         }
-        compare_numbers(self.number(left), self.number(right))
+        Ok(compare_numbers(self.number(left), self.number(right)))
+    }
+}
+
+/// What one printed value's walk remembers about the objects it is inside.
+///
+/// Two separate things, and keeping them apart is what makes the output match Node. The path is the
+/// objects between the root and wherever the walk is now, and it is an ancestor test rather than a
+/// seen test: printing `{ p: e, q: e }` shows `e` twice with no reference on either, because the
+/// second `e` is not inside the first. The numbers are the objects a walk did find its way back
+/// into, and a number is handed out where the way back is found rather than where the object was
+/// first printed, which is why the first cycle in reading order is always the one numbered one.
+///
+/// Both are vectors rather than sets, because a cycle is rare and a printed object has a handful of
+/// levels above it, so a linear scan over a slice that is already in cache beats hashing.
+#[derive(Default)]
+struct Cycles {
+    path: Vec<katsu_gc::Slot>,
+    numbers: Vec<katsu_gc::Slot>,
+}
+
+impl Cycles {
+    /// Whether the walk is already inside this object, which is what makes a reference a cycle.
+    fn inside(&self, slot: katsu_gc::Slot) -> bool {
+        self.path.contains(&slot)
+    }
+
+    /// The number for an object the walk has just found its way back into, handing out a new one the
+    /// first time and the same one every time after.
+    fn number(&mut self, slot: katsu_gc::Slot) -> usize {
+        if let Some(at) = self.numbers.iter().position(|held| *held == slot) {
+            return at + 1;
+        }
+        self.numbers.push(slot);
+        self.numbers.len()
+    }
+
+    /// The number this object was given, if anything under it pointed back at it.
+    fn assigned(&self, slot: katsu_gc::Slot) -> Option<usize> {
+        self.numbers
+            .iter()
+            .position(|held| *held == slot)
+            .map(|at| at + 1)
+    }
+
+    fn enter(&mut self, slot: katsu_gc::Slot) {
+        self.path.push(slot);
+    }
+
+    fn leave(&mut self) {
+        self.path.pop();
     }
 }
 
@@ -3577,6 +3738,101 @@ mod tests {
         interpreter.display(value)
     }
 
+    /// Run a program and print the value of one of its expressions, put through a function that
+    /// hands it back.
+    ///
+    /// A statement that is only a name lowers to no instructions at all, because the value is
+    /// already in the variable's own register and a statement discards it. That makes the last
+    /// instruction of such a program belong to some earlier expression, so a test that wants to
+    /// look at a variable has to make the value be produced by the last instruction. Script
+    /// completion values are their own piece of work and are not this one.
+    #[track_caller]
+    fn evaluate_value(program: &str, expression: &str) -> String {
+        evaluate_display(&format!(
+            "function id(v) {{ return v; }} {program} id({expression})"
+        ))
+    }
+
+    #[test]
+    fn an_object_literal_builds_an_object_and_prints_the_way_node_prints_one() {
+        assert_eq!(
+            evaluate_value("var o = { a: 1, b: 'two', c: true, d: null };", "o"),
+            "{ a: 1, b: 'two', c: true, d: null }"
+        );
+        assert_eq!(evaluate_value("var o = {};", "o"), "{}");
+        assert_eq!(
+            evaluate_value("var o = { 'a-b': 1, _x: 2 };", "o"),
+            "{ 'a-b': 1, _x: 2 }"
+        );
+    }
+
+    #[test]
+    fn a_property_of_an_object_literal_reads_back_and_a_missing_one_is_undefined() {
+        assert_eq!(evaluate_number("var o = { a: 41 }; o.a + 1"), 42.0);
+        assert_eq!(evaluate_display("var o = { a: 1 }; o.b"), "undefined");
+    }
+
+    #[test]
+    fn a_literal_and_an_object_grown_a_property_at_a_time_agree() {
+        // The reason a literal lowers to stores rather than to one instruction taking a list. Both
+        // of these walk the same path down the transition tree, so both print the same and both
+        // enumerate in the same order.
+        assert_eq!(
+            evaluate_value("var a = { x: 1, y: 2 };", "a"),
+            evaluate_value("var b = {}; b.x = 1; b.y = 2;", "b")
+        );
+    }
+
+    #[test]
+    fn a_duplicate_name_keeps_its_first_position_and_its_last_value() {
+        // Two rules at once, and they pull in different directions. The value is the last one
+        // written and the position is where the name first appeared, which is what falls out of a
+        // store that finds the name already there and does not move it.
+        assert_eq!(
+            evaluate_value("var o = { a: 1, b: 2, a: 3 };", "o"),
+            "{ a: 3, b: 2 }"
+        );
+    }
+
+    #[test]
+    fn an_object_literal_evaluates_its_values_in_source_order() {
+        assert_eq!(
+            evaluate_value(
+                "var n = 0; var o = { first: (n = 1), second: n, third: (n = n + 1) };",
+                "o"
+            ),
+            "{ first: 1, second: 1, third: 2 }"
+        );
+    }
+
+    #[test]
+    fn a_literal_assigned_to_the_variable_its_values_write_is_still_the_literal() {
+        // The hazard the lowerer builds into a temporary for. Without that, the object would be
+        // built in `x`, the inner assignment would overwrite it with a number, and the store would
+        // go nowhere.
+        assert_eq!(
+            evaluate_value("var x = 0; x = { a: (x = 1), b: 2 };", "x"),
+            "{ a: 1, b: 2 }"
+        );
+    }
+
+    #[test]
+    fn an_object_literal_can_hold_another_one() {
+        assert_eq!(
+            evaluate_value("var o = { p: { q: { r: { s: 1 } } } };", "o"),
+            "{ p: { q: { r: [Object] } } }"
+        );
+        assert_eq!(evaluate_number("var o = { p: { q: 7 } }; o.p.q"), 7.0);
+    }
+
+    #[test]
+    fn an_object_literal_grows_past_the_room_it_was_built_with() {
+        assert_eq!(
+            evaluate_number("var o = { a: 1, b: 2 }; o.c = 3; o.d = 4; o.e = 5; o.a + o.e"),
+            6.0
+        );
+    }
+
     #[test]
     fn a_property_that_is_there_reads_back() {
         assert_eq!(hosted_display("host.version"), "5");
@@ -3707,15 +3963,68 @@ mod tests {
     }
 
     #[test]
-    fn an_object_that_holds_itself_prints_rather_than_running_forever() {
+    fn an_object_that_holds_itself_prints_the_way_node_marks_a_cycle() {
         // Growing is what made this possible: until a store could add a property there was no way to
-        // build a cycle, and now there is. The depth limit is doing two jobs at once here.
+        // build a cycle, and now there is. The number on the front and the number in the middle are
+        // the same number, which is the whole point of the notation.
         let blueprint = as_expression("host.self = host; host");
         let mut interpreter = hosted();
         let value = interpreter.run(&blueprint).expect("should not throw");
-        let text = interpreter.display(value);
-        assert!(text.contains("self: {"), "{text}");
-        assert!(text.contains("[Object]"), "{text}");
+        assert_eq!(
+            interpreter.display(value),
+            "<ref *1> { log: [Function: log], version: 5, self: [Circular *1] }"
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_marked_where_the_walk_comes_back_and_not_where_the_depth_runs_out() {
+        // The back reference is four levels down, which is past the point where an ordinary object
+        // prints `[Object]`. Node still writes `[Circular *1]` there, so the two checks are separate
+        // and the cycle check is the one that runs first.
+        assert_eq!(
+            evaluate_value(
+                "var a = {}; var b = {}; var c = {}; a.b = b; b.c = c; c.a = a;",
+                "a"
+            ),
+            "<ref *1> { b: { c: { a: [Circular *1] } } }"
+        );
+    }
+
+    #[test]
+    fn an_object_with_nothing_in_it_prints_as_itself_however_deep_it_is() {
+        // The check for empty comes before the check for depth, which was measured against Node and
+        // is not what the ordering in the code first said. It matters beyond looking tidier:
+        // `[Object]` is six characters longer than `{}` and that is enough to break a line Node
+        // keeps whole, so getting it wrong shows up two levels away from where it happened.
+        assert_eq!(
+            evaluate_value("var o = { p: { q: { r: {} } } };", "o"),
+            "{ p: { q: { r: {} } } }"
+        );
+        assert_eq!(
+            evaluate_value("var o = { p: { q: { r: { s: {} } } } };", "o"),
+            "{ p: { q: { r: [Object] } } }"
+        );
+    }
+
+    #[test]
+    fn the_same_object_twice_in_different_places_is_not_a_cycle() {
+        // The test is whether the walk is inside the object, not whether it has seen it. An object
+        // held by two properties of the same parent prints twice with no reference on either.
+        assert_eq!(
+            evaluate_value("var e = {}; var o = { p: e, q: e };", "o"),
+            "{ p: {}, q: {} }"
+        );
+    }
+
+    #[test]
+    fn two_cycles_in_one_printed_value_are_numbered_in_the_order_they_are_found() {
+        assert_eq!(
+            evaluate_value(
+                "var i = { a: 1 }; i.self = i; var j = { b: 2 }; j.self = j; var o = { i: i, j: j };",
+                "o"
+            ),
+            "{\n  i: <ref *1> { a: 1, self: [Circular *1] },\n  j: <ref *2> { b: 2, self: [Circular *2] }\n}"
+        );
     }
 
     #[test]
@@ -3776,6 +4085,45 @@ mod tests {
         // `console.log` inspects and `+` converts, and the two giving different answers is the
         // language rather than an inconsistency.
         assert_eq!(hosted_display("'' + host"), "[object Object]");
+    }
+
+    #[test]
+    fn adding_an_object_to_a_number_joins_text_rather_than_giving_not_a_number() {
+        // The number on the other side is what makes this worth a test of its own. `'' + host`
+        // passes with a `+` that only asks whether either side is already a string, because one
+        // side is. This one only passes if the object converts first, and it is the case that was
+        // wrong: it read as `NaN` because an object is not a string and nothing ran ToPrimitive.
+        assert_eq!(hosted_display("host + 1"), "[object Object]1");
+        assert_eq!(hosted_display("1 + host"), "1[object Object]");
+        assert_eq!(
+            hosted_display("host + host"),
+            "[object Object][object Object]"
+        );
+    }
+
+    #[test]
+    fn adding_a_function_to_a_number_joins_text_rather_than_giving_not_a_number() {
+        // A closure rather than an object, because it takes the same path: a function is on the
+        // heap, so its primitive is a string, so this joins rather than arriving at NaN.
+        //
+        // The text is not right yet and that is a different piece of work. Node gives
+        // `function f() { return 1; }1`, because `ToString` of a function is its own source, and
+        // this gives `[Function: f]1` because a closure has a name and a start offset but no end
+        // offset and nothing keeps the script text alive to slice. It lands with the source spans
+        // that stack traces need. What this test pins is that the operand converted at all.
+        assert_eq!(
+            evaluate_display("function f() { return 1; } f + 1"),
+            "[Function: f]1"
+        );
+    }
+
+    #[test]
+    fn an_object_in_any_arithmetic_other_than_plus_is_not_a_number() {
+        // `+` is the only operator that asks whether the primitive is a string. Every other one
+        // runs ToNumber on the result, and ToNumber of `[object Object]` is NaN.
+        assert_eq!(hosted_display("host - 1"), "NaN");
+        assert_eq!(hosted_display("host * 2"), "NaN");
+        assert_eq!(hosted_display("-host"), "NaN");
     }
 
     #[test]

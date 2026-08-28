@@ -427,6 +427,20 @@ pub enum Op {
         blueprint: BlueprintIndex,
     },
 
+    /// Put a new empty object in `dst`, with room inside it for `slots` properties.
+    ///
+    /// The properties are not here. An object literal is this instruction followed by one
+    /// `set_prop` per property, which is three or four instructions where one would do and is
+    /// deliberate: a store is the operation that takes the shape transition, so building a literal
+    /// out of stores means a literal and an object grown a property at a time reach the same shape,
+    /// and neither of them needs a second code path. It also means a literal is already inline
+    /// cacheable at each store without a new kind of cache.
+    ///
+    /// `slots` is a promise about what is about to be stored rather than a limit. It is what makes
+    /// the literal one allocation instead of one plus a properties array, and an object that ends up
+    /// with more than it was built for grows the ordinary way.
+    NewObject { dst: Register, slots: u16 },
+
     /// Continue at `target`.
     Jump { target: CodeOffset },
     /// Continue at `target` if `cond` is truthy.
@@ -625,6 +639,7 @@ impl fmt::Display for Op {
             ),
             Self::Return { src } => write!(f, "return {src}"),
             Self::NewClosure { dst, blueprint } => write!(f, "new_closure {dst}, {blueprint}"),
+            Self::NewObject { dst, slots } => write!(f, "new_object {dst}, {slots}"),
             Self::Jump { target } => write!(f, "jump {target}"),
             Self::JumpIfTrue { cond, target } => write!(f, "jump_if_true {cond}, {target}"),
             Self::JumpIfFalse { cond, target } => write!(f, "jump_if_false {cond}, {target}"),

@@ -54,6 +54,16 @@
 //! without checking. `method_call` is the same lookup with a call on the end of it, which is the
 //! most common call shape in real code and is why it is one opcode rather than two.
 //!
+//! The `object` group is what building an object costs, reported per object rather than per
+//! instruction, since a literal is a `new_object` and one store per property rather than one
+//! opcode. `literal_empty` is the allocation on its own and the other two say what a property adds
+//! to it, and `grown_4` builds the same four property object out of an empty literal and four
+//! separate stores so that what the room in `new_object` is worth is a difference between two
+//! measured numbers rather than an argument. `no_object` is a body of the same length with no
+//! object in it at all, and it is there to be subtracted: the isolate these run in is fresh every
+//! iteration and standing one up is not free, so the baseline makes that cost visible instead of
+//! letting it sit inside the four numbers underneath it.
+//!
 //! The `native` group is a call that leaves the interpreter. It has the same shape as `call_return`
 //! on purpose: the callee is already in a register and the body does nothing, so the difference
 //! between the two is the difference between pushing a frame and making a Rust call. Every builtin
@@ -503,6 +513,62 @@ fn properties(c: &mut Criterion) {
     group.finish();
 }
 
+/// How many objects one body in the `object` group builds.
+///
+/// A thousand, chosen by measuring rather than by taste. Every one of these allocates and there is
+/// no collector to take the memory back yet, so each iteration runs in a fresh isolate, and the cost
+/// of standing an isolate up is fixed however long the body is. At two hundred objects that fixed
+/// cost was most of the measurement and every number in the group came out several times too large.
+/// A thousand pushes it down far enough that the `no_object` baseline is a small correction rather
+/// than the bulk of the answer, and a four property object still only reaches forty eight bytes, so
+/// the whole group fits in well under a megabyte per iteration.
+const LITERALS: usize = 1_000;
+
+fn objects(c: &mut Criterion) {
+    let mut group = c.benchmark_group("object");
+    group.throughput(Throughput::Elements(LITERALS as u64));
+
+    // Reported per object built rather than per instruction, because an object literal is not one
+    // instruction and the question a reader has is what one object costs. `literal_empty` is the
+    // allocation and the transition to the root shape and nothing else, so the gap between it and
+    // the other two is what a property costs at the interpreter level, which is a store, a
+    // transition lookup and a write.
+    //
+    // `grown_4` is the pair that matters. It builds the same four property object out of an empty
+    // literal and four separate stores, so it walks the same transition path and lands on the same
+    // shape node, and the only thing it does differently is start with no room, which means its
+    // last properties end up in an overflow array. Everything the object model bought is in the
+    // difference between those two numbers, and it is the number that says whether the count in
+    // `new_object` is earning its place in the instruction.
+    //
+    // `no_object` is here because every body in this group is timed with a fresh isolate around it,
+    // which puts the first touch of newly reserved pages inside the measurement. That cost is the
+    // same in all five and it is not what anybody wants to read, so it is measured on its own and
+    // subtracted rather than left silently inside the other four.
+    for (name, body) in [
+        ("no_object", "x = 1;\n"),
+        ("literal_empty", "x = {};\n"),
+        ("literal_2", "x = { a: 1, b: 2 };\n"),
+        ("literal_4", "x = { a: 1, b: 2, c: 3, d: 4 };\n"),
+        ("grown_4", "x = {}; x.a = 1; x.b = 2; x.c = 3; x.d = 4;\n"),
+    ] {
+        let mut source = String::from("let x;\n");
+        for _ in 0..LITERALS {
+            source.push_str(body);
+        }
+        let built = program(&source);
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || Interpreter::new().expect("should reserve a stack"),
+                |mut interpreter| black_box(interpreter.run(black_box(&built))),
+                BatchSize::PerIteration,
+            );
+        });
+    }
+
+    group.finish();
+}
+
 fn natives(c: &mut Criterion) {
     let mut group = c.benchmark_group("native");
     group.throughput(Throughput::Elements(CALLS as u64));
@@ -597,6 +663,7 @@ criterion_group!(
     calls,
     globals,
     properties,
+    objects,
     natives
 );
 criterion_main!(benches);

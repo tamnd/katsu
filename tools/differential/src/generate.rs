@@ -76,6 +76,23 @@ const BINARY: [&str; 23] = [
 /// Unary operators the interpreter runs today.
 const UNARY: [&str; 5] = ["-", "+", "!", "~", "typeof "];
 
+/// Property names that can be written after a dot, which is the only member syntax the parser takes.
+///
+/// `$k` is in the table for one reason: the rule node uses to decide whether to leave a name unquoted
+/// when it prints an object is narrower than the language's rule for an identifier, and the dollar
+/// sign is exactly where the two part company. `$k` is a perfectly ordinary name to write and it
+/// comes back quoted.
+const NAMES: [&str; 6] = ["a", "b", "c", "x0", "_k", "$k"];
+
+/// Property names that can only be written as a string inside a literal, because they are not
+/// identifiers and there is no computed member syntax yet to read them back with.
+///
+/// No integer-like name is here, and that is a gap being left open on purpose rather than an
+/// oversight. `{ b: 1, '1': 2 }` enumerates the integer first in node, this engine has no elements
+/// yet and enumerates in insertion order, so every seed that drew one would report the same known
+/// difference and drown out anything new. It goes in the day elements do.
+const QUOTED_NAMES: [&str; 4] = ["a-b", "", "9a", "a b"];
+
 /// A generated program and the seed it came from.
 #[derive(Clone, Debug)]
 pub(crate) struct Program {
@@ -116,6 +133,7 @@ pub(crate) fn program(seed: u64, statements: usize) -> Program {
         random: &mut random,
         live: Vec::new(),
         mutable: Vec::new(),
+        objects: Vec::new(),
         next: 0,
         loops: 0,
     };
@@ -146,6 +164,14 @@ struct Builder<'a> {
     live: Vec<String>,
     /// The subset of `live` declared with `let`, which is what an assignment is allowed to target.
     mutable: Vec<String>,
+    /// The subset of `live` that is known to be holding an object, which is what a property read or
+    /// a property store is allowed to use as its receiver.
+    ///
+    /// Reading a property of a number or a string is `undefined` and reading one of `null` or
+    /// `undefined` is a `TypeError` that ends the program, so the receiver cannot be drawn from
+    /// `live`. Every name in here is declared `const`, which is what keeps the claim true for the
+    /// rest of the program without following what each assignment did.
+    objects: Vec<String>,
     next: usize,
     /// How many loops are open around the statement being built.
     ///
@@ -171,15 +197,17 @@ impl Builder<'_> {
         }
 
         let choice = if depth >= 2 {
-            self.random.below(2)
+            self.random.below(4)
         } else {
-            self.random.below(6)
+            self.random.below(8)
         };
         match choice {
             0 | 1 => self.declaration(),
-            2 => self.assignment(),
-            3 => self.branch(depth),
-            4 => self.switch_statement(depth),
+            2 => self.object_declaration(),
+            3 => self.property_store(),
+            4 => self.assignment(),
+            5 => self.branch(depth),
+            6 => self.switch_statement(depth),
             _ => self.loop_statement(depth),
         }
     }
@@ -201,6 +229,74 @@ impl Builder<'_> {
         }
         self.mutable.push(name.clone());
         format!("let {name} = {value};")
+    }
+
+    /// `const v3 = { a: 1, 'a-b': <expr> };`, and the name is remembered as holding an object.
+    ///
+    /// Always `const`, and that is what makes every other object production safe rather than being a
+    /// stylistic choice. A property read or a store needs a receiver that is not `null` or
+    /// `undefined`, and a name an assignment can reach is a name that could be holding either by the
+    /// time the store runs, which is a `TypeError` that ends the program and stops it testing
+    /// everything after that line. A binding nothing can write costs less than following what every
+    /// assignment did to it.
+    fn object_declaration(&mut self) -> String {
+        let name = format!("v{}", self.next);
+        self.next += 1;
+        let literal = self.object_literal(0);
+        self.live.push(name.clone());
+        self.objects.push(name.clone());
+        format!("const {name} = {literal};")
+    }
+
+    /// `v3.a = <expr>;` or a compound form, and a declaration when there is nothing to store into.
+    ///
+    /// This is where a property that was not in the literal gets added, so it is the production that
+    /// makes a generated program walk past the room its object was built with and into an overflow
+    /// array, and the one that makes a name arrive after the ones the object was made with and have
+    /// to enumerate there.
+    fn property_store(&mut self) -> String {
+        if self.objects.is_empty() {
+            return self.object_declaration();
+        }
+        let receiver = self.random.pick(&self.objects.clone()).clone();
+        let name = *self.random.pick(&NAMES);
+        let operator = self.random.pick(&["=", "+=", "-=", "*=", "|=", "&="]);
+        let value = self.expression(0);
+        format!("{receiver}.{name} {operator} {value};")
+    }
+
+    /// `{ a: 1, b: <expr> }`, sometimes empty and sometimes with the same name twice.
+    ///
+    /// A duplicate name is not filtered out, because it is three rules at once and each of them is
+    /// somewhere an engine can be wrong: the property is stored twice, the last value wins, and it
+    /// keeps the position the first store gave it rather than moving to the end.
+    fn object_literal(&mut self, depth: usize) -> String {
+        let count = self.random.below(5);
+        let mut properties = Vec::new();
+        for _ in 0..count {
+            let name = if self.random.chance(4) {
+                format!("'{}'", self.random.pick(&QUOTED_NAMES))
+            } else {
+                (*self.random.pick(&NAMES)).to_owned()
+            };
+            let value = self.expression(depth + 1);
+            properties.push(format!("{name}: {value}"));
+        }
+        if properties.is_empty() {
+            return "{}".to_owned();
+        }
+        format!("{{ {} }}", properties.join(", "))
+    }
+
+    /// `v3.a`, which is `undefined` as often as not and is meant to be.
+    ///
+    /// Not chained. `v3.a.b` throws whenever `v3.a` has not been stored yet, which for a generated
+    /// program is most of the time, and a production that usually ends the program is a production
+    /// that tests the lines before it and nothing else.
+    fn property_read(&mut self) -> String {
+        let receiver = self.random.pick(&self.objects.clone()).clone();
+        let name = *self.random.pick(&NAMES);
+        format!("{receiver}.{name}")
     }
 
     /// `v1 = <expr>;` or a compound form, or a declaration when nothing is assignable yet.
@@ -295,16 +391,18 @@ impl Builder<'_> {
     fn block(&mut self, depth: usize) -> String {
         let live = self.live.len();
         let mutable = self.mutable.len();
+        let objects = self.objects.len();
         let body = self.statement(depth);
         self.live.truncate(live);
         self.mutable.truncate(mutable);
+        self.objects.truncate(objects);
         body
     }
 
     /// One expression, at the given depth.
     fn expression(&mut self, depth: usize) -> String {
         if depth >= 3 || self.random.chance(3) {
-            return self.atom();
+            return self.atom(depth);
         }
         match self.random.below(6) {
             0..=2 => {
@@ -327,12 +425,24 @@ impl Builder<'_> {
                 let other = self.expression(depth + 1);
                 format!("({condition} ? {taken} : {other})")
             }
-            _ => self.atom(),
+            _ => self.atom(depth),
         }
     }
 
     /// A literal or a variable that is in scope.
-    fn atom(&mut self) -> String {
+    ///
+    /// An object literal is drawn here rather than given a production of its own, so that it turns
+    /// up as an operand of whatever the expression above it happened to be. That is the point: an
+    /// object on either side of `+` converts to text and joins, an object anywhere else in the
+    /// arithmetic is NaN, and the two look nothing alike, so the operator has to be the one thing
+    /// varying around it.
+    fn atom(&mut self, depth: usize) -> String {
+        if !self.objects.is_empty() && self.random.chance(5) {
+            return self.property_read();
+        }
+        if depth < 2 && self.random.chance(8) {
+            return self.object_literal(depth);
+        }
         if !self.live.is_empty() && self.random.chance(2) {
             return self.random.pick(&self.live.clone()).clone();
         }
@@ -351,7 +461,7 @@ impl Builder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BINARY, NUMBERS, program};
+    use super::{BINARY, NAMES, NUMBERS, QUOTED_NAMES, program};
 
     #[test]
     fn the_same_seed_gives_the_same_program() {
@@ -455,6 +565,58 @@ mod tests {
                 });
                 assert!(declared, "seed {seed}: {name} is printed but out of scope");
             }
+        }
+    }
+
+    #[test]
+    fn a_property_is_only_reached_through_a_name_that_holds_an_object() {
+        // Reading or writing a property of `null` or `undefined` is a TypeError that ends the
+        // program, so a receiver drawn from every live name would end most programs part way
+        // through and leave every line after that untested. A receiver has to be a name that was
+        // declared with an object literal and cannot be assigned to since.
+        for seed in 0..500 {
+            let source = program(seed, 8).source();
+            for (at, _) in source.match_indices('.') {
+                let mut receiver: Vec<char> = source[..at]
+                    .chars()
+                    .rev()
+                    .take_while(|letter| letter.is_ascii_alphanumeric() || *letter == '_')
+                    .collect();
+                receiver.reverse();
+                let receiver: String = receiver.into_iter().collect();
+                // Everything else with a dot in it is a number from the literal table or the
+                // `console.log` at the end, and neither is a generated name.
+                let generated = receiver.starts_with('v')
+                    && receiver.len() > 1
+                    && receiver[1..].chars().all(|letter| letter.is_ascii_digit());
+                if !generated {
+                    continue;
+                }
+                assert!(
+                    source.contains(&format!("const {receiver} = {{")),
+                    "seed {seed}: {receiver} is a receiver without holding an object"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn objects_turn_up_often_enough_to_be_worth_generating() {
+        // A production that fires once in a thousand seeds is a production nobody is testing. This
+        // is the check that a later change to the draw weights cannot quietly switch objects off.
+        let built = (0..200)
+            .filter(|&seed| program(seed, 8).source().contains(": "))
+            .count();
+        assert!(built > 100, "only {built} programs of 200 built an object");
+    }
+
+    #[test]
+    fn no_generated_property_name_is_an_array_index() {
+        // `{ b: 1, '1': 2 }` enumerates the integer first in node, and this engine has no elements
+        // yet and enumerates in insertion order. Generating one would report the same known
+        // difference on every seed that drew it and bury everything else under it.
+        for name in NAMES.iter().chain(QUOTED_NAMES.iter()) {
+            assert!(name.parse::<u32>().is_err(), "{name} is an array index");
         }
     }
 

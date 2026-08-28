@@ -326,8 +326,33 @@ pub enum ExprKind {
         /// The arguments, in source order. Spread is not in the M0 subset.
         arguments: Vec<Expr>,
     },
+    /// An object literal with property names known at compile time.
+    Object {
+        /// The properties, in source order, which is the order they are stored in and therefore
+        /// the order they enumerate in.
+        properties: Vec<Property>,
+    },
     /// A function expression, named or not.
     Function(Box<Func>),
+}
+
+/// One property of an object literal.
+///
+/// The name is an [`Ident`] rather than an expression because the subset here is the one where the
+/// name is known at compile time. A computed key, a method, a getter, a setter, a spread and a
+/// numeric key are all refused by the adapter, each by name.
+///
+/// A string key is an `Ident` too, and that is not a lie about the source: `{'a-b': 1}` has a name
+/// that is not an identifier, but it is still a name known at compile time and the only thing the
+/// distinction would buy is a different error message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Property {
+    /// The whole property, name and value together.
+    pub span: Span,
+    /// The name being stored under.
+    pub name: Ident,
+    /// The value.
+    pub value: Expr,
 }
 
 /// How a variable was declared.

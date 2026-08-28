@@ -309,7 +309,8 @@ fn highest_register(op: Op) -> Option<Register> {
         | Op::LoadUpvalue { dst, .. }
         | Op::LoadGlobal { dst, .. }
         | Op::LoadGlobalForTypeof { dst, .. }
-        | Op::NewClosure { dst, .. } => smallvec![dst],
+        | Op::NewClosure { dst, .. }
+        | Op::NewObject { dst, .. } => smallvec![dst],
         Op::Move { dst, src }
         | Op::Neg { dst, src, .. }
         | Op::BitNot { dst, src, .. }
