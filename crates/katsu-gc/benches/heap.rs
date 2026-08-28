@@ -14,6 +14,11 @@
 //! The other is compression and decompression, which run on every property load and store and
 //! are meant to be a bitwise or and a subtraction. The fast and slow allocation paths are
 //! measured separately, because an average of the two is a number that describes neither.
+//!
+//! Every group that needs a fresh heap uses `BatchSize::PerIteration`. `SmallInput` would run the
+//! setup for a whole batch before timing any of it, and since each heap owns an eight gigabyte
+//! reservation that means hundreds of them alive at once. macOS accepts that and Linux refuses it
+//! with ENOMEM, which is what the first run on the x86 reference machine reported.
 
 use std::hint::black_box;
 
@@ -44,7 +49,9 @@ fn allocation(c: &mut Criterion) {
                 }
                 heap
             },
-            criterion::BatchSize::SmallInput,
+            // PerIteration, not SmallInput, and the same everywhere below. See the note at the
+            // top of the file about why a batched setup cannot be used here.
+            criterion::BatchSize::PerIteration,
         );
     });
 
@@ -62,7 +69,7 @@ fn allocation(c: &mut Criterion) {
                 }
                 heap
             },
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         );
     });
 
@@ -78,7 +85,7 @@ fn allocation(c: &mut Criterion) {
                 }
                 heap
             },
-            criterion::BatchSize::SmallInput,
+            criterion::BatchSize::PerIteration,
         );
     });
 
