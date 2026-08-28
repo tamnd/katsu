@@ -32,8 +32,13 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          # Cross compiled from the arm64 runner rather than built on an Intel one. GitHub
+          # retired the macos-13 image on 4 December 2025, and the only remaining x86_64 macOS
+          # image, macos-15-intel, is announced as going away in autumn 2027 with no
+          # replacement. A release job does not run tests, so building this target on Apple
+          # silicon costs nothing and does not have to be revisited on somebody else's schedule.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest

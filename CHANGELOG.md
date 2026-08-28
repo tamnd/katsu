@@ -6,6 +6,8 @@ Versions are cut on a fixed rhythm rather than when something feels finished. A 
 
 Two pull requests on from the first tag. Still nothing runs, and the interpreter is still the next thing, but the platform layer now covers all three operating systems and the frontend resolves every name it parses.
 
+Neither this tag nor 0.0.1 has binaries attached to it. The release workflow asked for an Intel macOS runner by a label GitHub retired on 4 December 2025, and a job that asks for a runner that does not exist neither fails nor times out, it queues until GitHub gives up a day later, so the publish step that needed it never ran and nothing said so. Fixed in #30. Moving either tag forward onto the fix would make the tag contain work its own entry does not describe, so both are left where they are and 0.0.3 is the first tag that publishes anything. Build from source at either tag and you get exactly what the entry says.
+
 ### Platform
 
 Windows is supported and in the test matrix on every commit, in #26. The virtual memory seam is five items wide, `page_size`, `reserve`, `release`, `commit` and `decommit`, with one file per platform picked by `cfg` at the module boundary, so nothing above the seam knows which one it got.
