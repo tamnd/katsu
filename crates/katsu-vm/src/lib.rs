@@ -8,6 +8,7 @@ mod global;
 mod interpret;
 mod native;
 mod number;
+mod output;
 mod stack;
 mod unit;
 mod value;
@@ -20,6 +21,7 @@ use katsu_ir::FunctionBlueprint;
 pub use global::Globals;
 pub use interpret::{Interpreter, Interrupt, RuntimeError};
 pub use native::{NativeFn, Natives, arg};
+pub use output::{Discard, Output, Recorder, Standard, Stream};
 pub use stack::{Frame, Invocation, Stack, StackError};
 pub use unit::{Loaded, Resolved, Unit};
 pub use value::Value;
@@ -67,11 +69,17 @@ pub fn compile(path: &str, source: &str) -> Result<FunctionBlueprint, CompileErr
 /// Strictly these two are a realm rather than an isolate, and one isolate can hold several realms
 /// once there is a way to make one. There is not, so a second type today would be a type with one
 /// instance.
+///
+/// The output sink is here on the same grounds. It is per realm rather than per process, because two
+/// isolates on two threads printing into one buffer is exactly the thing this design is built to
+/// avoid, and because an embedder that runs a script wants that script's output rather than every
+/// script's output.
 pub struct Isolate {
     heap: BumpHeap,
     atoms: AtomTable,
     globals: Globals,
     natives: Natives,
+    output: Box<dyn Output>,
 }
 
 impl fmt::Debug for Isolate {
@@ -81,6 +89,7 @@ impl fmt::Debug for Isolate {
             .field("atoms", &self.atoms.len())
             .field("globals", &self.globals.len())
             .field("natives", &self.natives)
+            .field("output", &self.output)
             .finish()
     }
 }
@@ -98,7 +107,25 @@ impl Isolate {
             atoms: AtomTable::new(),
             globals: Globals::new(),
             natives: Natives::new(),
+            output: Box::new(Standard),
         })
+    }
+
+    /// Send everything this isolate prints somewhere other than the process's own streams.
+    ///
+    /// Returns the sink that was there, which is [`Standard`] on an isolate nobody has changed.
+    /// Returning it rather than dropping it means a caller can put a recorder in, read what a
+    /// script printed and put the old sink back, which is what a test harness does.
+    pub fn set_output(&mut self, output: Box<dyn Output>) -> Box<dyn Output> {
+        std::mem::replace(&mut self.output, output)
+    }
+
+    /// Write to this isolate's sink.
+    ///
+    /// The text goes out exactly as given. Deciding that a line ends with a newline is the builtin's
+    /// job, because `console.log` adds one and `process.stdout.write` does not.
+    pub fn write_output(&mut self, stream: Stream, text: &str) {
+        self.output.write(stream, text);
     }
 
     /// The heap, for reading.
