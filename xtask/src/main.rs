@@ -540,20 +540,50 @@ mod tests {
     #[test]
     fn each_script_pins_the_way_its_platform_pins() {
         let linux = machine("gamingpc").unwrap();
-        let script = unix_script(linux, "abc123", "katsu-gc", " -- allocate");
-        assert!(script.contains("taskset -c 4 cargo bench -p katsu-gc -- allocate"));
+        let script = unix_script(linux, "abc123", "katsu-gc", "allocate");
+        assert!(script.contains("taskset -c 4 cargo bench -p katsu-gc -- 'allocate'"));
         assert!(script.contains("git checkout -q --detach abc123"));
 
         let windows = machine("gamingpc-win").unwrap();
-        let script = windows_script(windows, "abc123", "katsu-gc", " -- allocate");
+        let script = windows_script(windows, "abc123", "katsu-gc", "allocate");
         // The mask is hexadecimal because that is what `start /affinity` reads it as, and 3 is
         // the two threads of the first performance core.
-        assert!(script.contains("start /wait /b /affinity 3 cmd /c cargo bench -p katsu-gc"));
+        assert!(
+            script.contains(r"start /wait /b /affinity 3 cmd /c C:\katsu-bench-checkout\bench.cmd")
+        );
         assert!(script.contains("git checkout -q --detach abc123"));
         assert!(
             !script.contains("taskset"),
             "the windows script should not be reaching for a linux tool"
         );
+    }
+
+    #[test]
+    fn a_filter_reaches_the_remote_as_one_argument_and_not_as_a_pipeline() {
+        // Every useful criterion filter is a regex with a `|` in it, and both remote scripts are
+        // a line of shell rather than an argument vector. An unquoted one was read as a pipeline,
+        // which piped cargo into a program named after the second half of the filter and reported
+        // the result as a broken pipe.
+        let linux = unix_script(machine("gamingpc").unwrap(), "abc123", "katsu-vm", "a|b");
+        assert!(linux.contains("cargo bench -p katsu-vm -- 'a|b'"));
+
+        let windows = windows_script(
+            machine("gamingpc-win").unwrap(),
+            "abc123",
+            "katsu-vm",
+            "a|b",
+        );
+        assert!(windows.contains(r#"-Value 'cargo bench -p katsu-vm -- "a|b"'"#));
+    }
+
+    #[test]
+    fn an_empty_filter_runs_every_benchmark_in_the_package() {
+        let linux = unix_script(machine("gamingpc").unwrap(), "abc123", "katsu-vm", "");
+        assert!(linux.contains("cargo bench -p katsu-vm\n"));
+        assert!(!linux.contains(" -- "));
+
+        let windows = windows_script(machine("gamingpc-win").unwrap(), "abc123", "katsu-vm", "");
+        assert!(windows.contains("-Value 'cargo bench -p katsu-vm'"));
     }
 
     #[test]
