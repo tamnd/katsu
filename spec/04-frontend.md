@@ -40,6 +40,8 @@ The frontend benchmark measures parsing and adapting together and does not try t
 
 The TypeScript row being the fastest per byte is not a surprise once you look at what is in it, since a type annotation is bytes the parser skims and the adapter never allocates for. The one place the two machines genuinely disagree is the long function, where the m4 is 38 percent faster per byte than the i9 while the two are within a couple of percent on the other two shapes. A single 600 statement body is one long vector growing under a deep recursion and nothing else, so that row is closer to a memory subsystem measurement than a frontend one. It is recorded rather than explained away, and it is worth a second look if the gap survives the real lowering pass landing on top of it.
 
+Those three numbers are the parser and the adapter alone, taken before scope analysis existed. `parse` runs the scope pass too now, so the same benchmark ids report a larger total today and the current totals are the ones in 4.4.1. The table is left as it was measured rather than restated, because a number that quietly changes what it counts is worse than a number with a date on it.
+
 ## 4.2 TypeScript: erase, transform, never check
 
 `katsu run` treats TypeScript as JavaScript with extra syntax. No type checking at runtime, ever. Node, Deno and Bun all behave this way and users expect it.
@@ -91,6 +93,36 @@ Variables never captured by a closure live in registers and never touch the heap
 `var` hoisting, TDZ for `let` and `const`, function declaration hoisting including the Annex B sloppy mode block level rules, `arguments` materialization only when `arguments` is actually referenced, and the `this` binding rules are all settled here so that the interpreter never has to ask.
 
 Direct `eval` and `with` poison their enclosing function's scope, which loses static resolution for all its bindings. That is what every engine does, and it means those two features cost the program that uses them instead of costing everyone.
+
+### 4.4.1 Scope analysis, as built
+
+`crates/katsu-parse/src/scope.rs` runs over the adapted tree and produces three things: a scope per function holding its frame slot count and its cell slot count, a binding per declared name, and a resolution per identifier occurrence. `parse` runs it before returning, so a `ParsedModule` either has an answer for every name in it or does not exist.
+
+Resolutions are keyed by the byte offset the identifier starts at rather than by the order the walk visited it in. A walk order index is a number that stays valid only as long as nobody reorders a pass, and when it does go wrong it silently returns the answer meant for a different variable. A byte offset survives reordering, and a lookup that misses returns nothing instead of returning something plausible and wrong.
+
+The top level is a function scope rather than the global object. Node wraps every CommonJS module in a function before running it and an ES module has its own scope by definition, so a name declared at the top of a file is not a global in either module system, and modelling it as one would mean unpicking that later for both.
+
+Hops count environments and not function boundaries. A function whose bindings are all uncaptured has no environment at run time, so a closure two functions deep can still be zero hops from what it reads. The depth is computed in one forward pass after the walk, `depth[f] = depth[parent] + 1 if f has an environment else depth[parent]`, and a reference costs `depth[reader] - depth[owner]` hops. Getting this wrong is the kind of bug that only appears in a program with an empty function in the middle of a closure chain, which is why it has a test named after exactly that shape.
+
+Capture cannot be decided during the walk, because whether a binding is captured is not known until the whole subtree below its function has been visited. So slot assignment and resolution building are a separate phase that runs after the walk finishes. Uncaptured bindings get frame slots and captured ones get cell slots, which is the analysis 4.4 asks for, and the test that pins it declares twenty names, reads two from a closure, and asserts the environment has two cells.
+
+The early errors are checked here rather than left to the interpreter, because they have to refuse a program even when the line they are on never runs. A redeclaration, a `var` that hoists past a `let` of the same name, a duplicate parameter in strict mode and a `const` with no initialiser are all refused with the message the other engines print, verified against Node 24.18.0 one at a time. Assignment to a `const` is deliberately not in that list: Node reports it as a runtime `TypeError` and not an early error, so the pass exposes the binding kind and lowering emits the throw.
+
+The temporal dead zone flag is set when the binding has a dead zone and either the reference crosses a function boundary or it starts before the declarator ends. Comparing against the end of the declarator rather than its start is what makes `let x = x;` throw, which is the case the specification is really about. Crossing a function boundary always sets the flag, because textual order says nothing about when a closure runs. Proving some of those checks dead needs a definite assignment analysis, which is worth doing when there is an interpreter to measure the win against.
+
+| Source | m4 | gamingpc | gamingpc-win |
+|---|---|---|---|
+| 200 small functions | 62.6 us, 26% of the frontend | 79.7 us, 30% | 93.8 us, 25% |
+| One 600 statement function | 25.8 us, 14% | 29.4 us, 12% | 30.8 us, 12% |
+| 200 functions with TypeScript types | 62.3 us, 19% | 81.9 us, 21% | 84.5 us, 18% |
+
+Measured at one commit on the three reference machines from document 15.5, with the pass timed on its own over a tree that was already adapted, and the percentage taken against the full `parse` on the same source and the same machine. The pass is a fifth to a quarter of the frontend on the function heavy sources and an eighth on the single long body, which is the shape you would expect from a pass whose work is declarations and scope pushes rather than statements.
+
+The TypeScript row costing the same as the plain one is the useful number in the table. That source is 41.9 KiB against 24.8 KiB and it holds the same 200 functions with annotations added, and the pass sees within a percent of the same cost on m4. Erasure happens in the adapter, so by the time scope analysis runs the annotations are gone and there is nothing left of them to resolve. TypeScript is free here in the literal sense.
+
+One allocation was worth removing. The first version copied every declared name twice, once into the binding and once into the map key of the scope it was declared in. Sharing a single `Rc<str>` between the two took 14 percent off the source with 600 declarations and, correctly, nothing measurable off the source with one long function and few names. A change that only helps where the thing it fixes happens is a change you can believe.
+
+Four gaps are recorded rather than hidden. Annex B block level function declarations are not implemented, so a function declared in a block binds in the block and not the enclosing function. `arguments` is detected and flagged on the scope but has no object to resolve to until the interpreter has frames. A captured `let` is always dead zone checked. `eval` and `with` poisoning is written down in 4.4 and is moot in M0, because the adapter refuses both by name.
 
 ## 4.5 Bytecode lowering
 
