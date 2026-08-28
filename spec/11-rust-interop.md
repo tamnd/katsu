@@ -104,6 +104,16 @@ Handles and scopes come from document 08.4 and the borrow checker enforces them,
 
 The design targets the gap that deno_core's own documentation admits: this API comes with a runtime. `console.log` works. `fetch` works. Modules resolve. The Node layer is a feature flag away, so an embedder who wants a sandbox with no host access gets one, and an embedder who wants to run an existing npm package gets that too, with the same crate.
 
+### 11.4.1 Where what a program prints goes, as built
+
+The first half of that promise is real now, and the shape it took is worth writing down because it is the shape every host facility will take. `console.log` does not call `println!`. It calls a sink the isolate owns, and an embedder can replace it.
+
+Three sinks ship. `Standard` writes to the process's own streams and is what an isolate nobody has changed has. `Recorder` keeps everything written to it and hands it back, which is how a test asserts on what a program printed and how an embedder puts a script's output in its own log. `Discard` throws it away, which is what a host running untrusted code wants. Replacing one returns the one that was there, so a caller can capture output for one call and put the old sink back.
+
+The sink is on the isolate rather than on the process for the same reason everything else in 03 is: two isolates on two threads printing into one buffer is exactly the arrangement this design exists to rule out, and an embedder that runs a script wants that script's output rather than every script's output. It is one sink and two streams rather than two sinks, because `console.log` goes to standard output and `console.error` goes to standard error and a program that redirects one and not the other depends on that, while a recorder wants both in the order they were written.
+
+A write that fails is dropped. Node turns a closed pipe into an `EPIPE` and exits, which needs an exit code and a process object to hang it on, and neither exists in M0. That is written down rather than left to be discovered by somebody piping katsu into `head`.
+
 ## 11.5 Ownership across the boundary
 
 The rules, stated plainly because every subtle interop bug lives here.
