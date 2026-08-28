@@ -206,19 +206,21 @@ Measured per operation on both reference machines from 15.5:
 
 | Operation | m4 | gamingpc |
 |---|---|---|
-| build an eleven character ASCII string | 16.6 ns | |
-| build an eleven code unit UTF-16 string | 31.7 ns | |
-| compare two equal eleven character strings | 3.4 ns | |
-| hash eleven characters of Rust text | 5.9 ns | |
-| borrow a fifty nine character ASCII string as `&str` | 3.2 ns | |
-| copy a twelve character Latin-1 string to UTF-8 | 38.3 ns | |
-| atom lookup that hits, in a table of five hundred | 10.3 ns | |
-| atom lookup that misses | 6.3 ns | |
-| intern a name that is not in the table yet | 34.3 ns | |
+| build an eleven character ASCII string | 16.6 ns | 19.8 ns |
+| build an eleven code unit UTF-16 string | 31.7 ns | 34.2 ns |
+| compare two equal eleven character strings | 3.4 ns | 2.6 ns |
+| hash eleven characters of Rust text | 5.9 ns | 5.3 ns |
+| borrow a fifty nine character ASCII string as `&str` | 3.2 ns | 3.2 ns |
+| copy a twelve character Latin-1 string to UTF-8 | 38.3 ns | 17.7 ns |
+| atom lookup that hits, in a table of five hundred | 10.3 ns | 10.2 ns |
+| atom lookup that misses | 6.3 ns | 5.8 ns |
+| intern a name that is not in the table yet | 34.3 ns | 33.2 ns |
 
 The first line started at 37.6 ns. The obvious way to write the constructor narrows the text into a `Vec<u8>` and hands that to the Latin-1 path, which is a malloc and a free per string, and a parser builds one of these per identifier per file. Writing straight into the cage instead took it to 16.6 ns. The benchmark is the only reason anybody noticed.
 
 The last two lines are the pair worth watching. A lookup that hits does a hash, a probe and a comparison and allocates nothing, which is the property every property access depends on.
+
+The one row where the two machines disagree by more than noise is the copying conversion, where the M4 is twice as slow. That row is dominated by a malloc, so it is measuring the two allocators rather than anything in this engine, and it is a reason to stop allocating a `String` on that path rather than a reason to prefer either machine.
 
 ## 7.8 Snapshot constraints
 
