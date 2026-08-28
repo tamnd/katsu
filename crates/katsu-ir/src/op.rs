@@ -104,6 +104,12 @@ pub enum Op {
     LoadBool { dst: Register, value: bool },
     /// `dst = this`, read from the fixed slot in the frame prologue in spec 5.4.
     LoadThis { dst: Register },
+    /// `dst = the closure that is running`, which is what a named function expression sees itself as.
+    ///
+    /// `const f = function me() { return me; }` binds `me` inside the function and nowhere else, and
+    /// the value it binds is the closure being called rather than whatever `f` holds now. There is
+    /// nothing else to read it from, so it is an opcode.
+    LoadClosure { dst: Register },
     /// `dst = src`
     Move { dst: Register, src: Register },
 
@@ -508,6 +514,7 @@ impl fmt::Display for Op {
             Self::LoadNull { dst } => write!(f, "load_null {dst}"),
             Self::LoadBool { dst, value } => write!(f, "load_bool {dst}, {value}"),
             Self::LoadThis { dst } => write!(f, "load_this {dst}"),
+            Self::LoadClosure { dst } => write!(f, "load_closure {dst}"),
             Self::Move { dst, src } => write!(f, "move {dst}, {src}"),
             Self::LoadUninitialized { dst } => write!(f, "load_uninitialized {dst}"),
             Self::ThrowIfUninitialized { src, name } => {
@@ -787,6 +794,15 @@ mod tests {
             cache: CacheIndex(3),
         };
         assert_eq!(add.to_string(), "add r0, r1, r2, ic3");
+    }
+
+    #[test]
+    fn the_running_closure_is_its_own_instruction() {
+        // `const f = function me() { return me; };` binds `me` to the closure being called and not
+        // to whatever `f` holds now, and there is nothing else to read that from.
+        let load = Op::LoadClosure { dst: Register(0) };
+        assert_eq!(load.to_string(), "load_closure r0");
+        assert!(!load.is_terminator());
     }
 
     #[test]

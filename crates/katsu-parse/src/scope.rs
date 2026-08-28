@@ -123,6 +123,12 @@ pub struct Binding {
     /// This is the flag 4.4 is about. False means the binding lives in a register and never
     /// touches the heap, which is the common case by a wide margin.
     pub captured: bool,
+    /// Whether any reference to it is checked for the temporal dead zone.
+    ///
+    /// Lowering writes the hole into a slot when the scope is entered, and there is no reason to do
+    /// that for a binding nothing ever checks. The ordinary `let x = 1;` read afterwards costs
+    /// nothing because of this flag.
+    pub needs_dead_zone: bool,
     /// The frame slot if it is not captured, or the cell index in its function's environment if it
     /// is. Assigned once the whole function has been walked, because capture is not known before
     /// then.
@@ -179,9 +185,14 @@ pub struct FunctionScope {
     pub parent: Option<FunctionId>,
     /// Every name declared directly in this function, in declaration order.
     pub bindings: Vec<BindingId>,
+    /// How many parameters were written, which is also how many registers the caller fills.
+    pub arity: u16,
     /// How many frame slots the declared names need.
     ///
-    /// Lowering's temporaries start above this, since these slots are live for the whole call.
+    /// Counts the parameters whether or not they are captured, because the calling convention puts
+    /// argument number `n` in register `n` and a captured parameter is copied out of that register
+    /// by the prologue rather than never arriving in it. Lowering's temporaries start above this,
+    /// since these slots are live for the whole call.
     pub frame_slots: u16,
     /// How many cells the environment needs, zero if nothing is captured.
     pub cell_slots: u16,
@@ -208,6 +219,7 @@ pub struct Scopes {
     functions: Vec<FunctionScope>,
     bindings: Vec<Binding>,
     references: FxHashMap<u32, Reference>,
+    functions_by_span: FxHashMap<u32, FunctionId>,
 }
 
 impl Scopes {
@@ -249,6 +261,17 @@ impl Scopes {
     /// How many identifier occurrences were resolved.
     pub fn reference_count(&self) -> usize {
         self.references.len()
+    }
+
+    /// Which scope belongs to the function written at this span.
+    ///
+    /// Keyed by where the function starts, for the same reason references are keyed by where an
+    /// identifier starts. The alternative is for lowering to walk the tree in the same order this
+    /// pass did and count, which works until one of the two walks changes. Two functions cannot
+    /// start at the same byte, so the key is unique. The top level is not in the map, because it is
+    /// function zero and nobody has to look it up.
+    pub fn function_of(&self, span: Span) -> Option<FunctionId> {
+        self.functions_by_span.get(&span.start).copied()
     }
 }
 
@@ -311,7 +334,7 @@ impl Analyser {
         // is deciding whether a nested `var` hoisted through a block, so a span covering the whole
         // possible file is both correct and never a false positive.
         let span = Span::new(0, u32::MAX);
-        let id = self.push_function(String::new(), span, module.strict);
+        let id = self.push_function(String::new(), span, 0, module.strict);
         self.hoist_vars(&module.body)?;
         self.block_body(&module.body)?;
         self.pop_function(id);
@@ -328,7 +351,9 @@ impl Analyser {
             .name
             .as_ref()
             .map_or_else(String::new, |n| n.name.clone());
-        let id = self.push_function(name, func.span, func.strict);
+        let arity = u16::try_from(func.params.len())
+            .expect("a function has fewer than sixty five thousand parameters");
+        let id = self.push_function(name, func.span, arity, func.strict);
 
         if self_named && let Some(own) = func.name.as_ref() {
             let binding = self.declare(own, BindingKind::Function, own.span)?;
@@ -361,7 +386,7 @@ impl Analyser {
     }
 
     /// Start a function scope and the block scope that is its body.
-    fn push_function(&mut self, name: String, span: Span, strict: bool) -> FunctionId {
+    fn push_function(&mut self, name: String, span: Span, arity: u16, strict: bool) -> FunctionId {
         let id = FunctionId(
             u32::try_from(self.functions.len())
                 .expect("a program has fewer than four billion functions"),
@@ -371,6 +396,7 @@ impl Analyser {
             span,
             parent: self.frames.last().map(|frame| frame.id),
             bindings: Vec::new(),
+            arity,
             frame_slots: 0,
             cell_slots: 0,
             uses_this: false,
@@ -478,6 +504,7 @@ impl Analyser {
             kind,
             function,
             captured: false,
+            needs_dead_zone: false,
             slot: 0,
         });
         self.functions[function.0 as usize].bindings.push(id);
@@ -707,6 +734,11 @@ impl Analyser {
         // a later case, which is where this rule has to become conservative.
         let tdz = binding.kind.has_dead_zone() && (crossed || ident.span.start < binding.span.end);
 
+        // Recorded on the binding here rather than folded back from the references afterwards. The
+        // binding is already in hand and already being written to, so it costs nothing, while the
+        // fold was a second pass over every identifier in the file.
+        binding.needs_dead_zone |= tdz;
+
         self.references.push(RawReference {
             at: ident.span.start,
             binding: Some(id),
@@ -733,18 +765,33 @@ impl Analyser {
     /// so the walk records what each reference named and this decides where that lives.
     fn finish(mut self) -> Scopes {
         for function in &mut self.functions {
-            let (mut frame_slots, mut cell_slots) = (0u16, 0u16);
+            // Registers zero to `arity` belong to the parameters before a single instruction runs,
+            // because that is where the caller put the arguments. A parameter that is captured
+            // still arrives in its register and is copied into a cell by the prologue, so its
+            // register stays reserved and everything else starts above the whole run. Getting this
+            // wrong is invisible until a function captures its first parameter and then every
+            // other local reads the wrong slot.
+            let mut frame_slots = function.arity;
+            let (mut cell_slots, mut parameter) = (0u16, 0u16);
             for id in &function.bindings {
                 let binding = &mut self.bindings[id.0 as usize];
-                let counter = if binding.captured {
-                    &mut cell_slots
+                let is_parameter = binding.kind == BindingKind::Param;
+                if binding.captured {
+                    binding.slot = cell_slots;
+                    cell_slots = cell_slots
+                        .checked_add(1)
+                        .expect("a scope has fewer than sixty five thousand names");
+                } else if is_parameter {
+                    binding.slot = parameter;
                 } else {
-                    &mut frame_slots
-                };
-                binding.slot = *counter;
-                *counter = counter
-                    .checked_add(1)
-                    .expect("a scope has fewer than sixty five thousand names");
+                    binding.slot = frame_slots;
+                    frame_slots = frame_slots
+                        .checked_add(1)
+                        .expect("a scope has fewer than sixty five thousand names");
+                }
+                if is_parameter {
+                    parameter += 1;
+                }
             }
             function.frame_slots = frame_slots;
             function.cell_slots = cell_slots;
@@ -789,10 +836,22 @@ impl Analyser {
             );
         }
 
+        let functions_by_span = self
+            .functions
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(index, function)| {
+                let id = FunctionId(u32::try_from(index).expect("counted above"));
+                (function.span.start, id)
+            })
+            .collect();
+
         Scopes {
             functions: self.functions,
             bindings: self.bindings,
             references,
+            functions_by_span,
         }
     }
 }
@@ -823,14 +882,14 @@ mod tests {
 
     /// Parse and analyse, for the cases that are expected to be accepted.
     fn analysed(source: &str) -> Scopes {
-        crate::parse("test.js", source)
+        crate::frontend("test.js", source)
             .expect("should parse and resolve")
-            .scopes
+            .1
     }
 
     /// The early error a source produces, as a line, a column and a message.
     fn refused(source: &str) -> (u32, u32, String) {
-        let error = crate::parse("test.js", source).expect_err("should be refused");
+        let error = crate::frontend("test.js", source).expect_err("should be refused");
         let ParseError::EarlyError {
             line,
             column,
@@ -1170,6 +1229,78 @@ mod tests {
                 tdz: true
             }
         );
+    }
+
+    #[test]
+    fn a_captured_parameter_leaves_its_register_reserved() {
+        // `a` is read from the closure so it lives in a cell, and `b` is not so it lives in a
+        // register. The caller still puts the second argument in register one, so `b` has to be
+        // register one and not register zero. An analysis that packed the registers down would
+        // make every call to this function read its arguments in the wrong order.
+        let source = "function f(a, b) { return function g() { return a; } + b; }";
+        let scopes = analysed(source);
+
+        let f = &scopes.functions()[1];
+        assert_eq!(f.arity, 2);
+        assert_eq!(f.frame_slots, 2);
+        assert_eq!(f.cell_slots, 1);
+        assert_eq!(
+            resolved(&scopes, source, "b", 1).resolution,
+            Resolution::Local {
+                slot: 1,
+                tdz: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_name_a_function_expression_sees_itself_by_does_not_take_a_parameter_register() {
+        let source = "const f = function me(a) { return me(a); };";
+        let scopes = analysed(source);
+
+        assert_eq!(
+            resolved(&scopes, source, "a", 1).resolution,
+            Resolution::Local {
+                slot: 0,
+                tdz: false
+            }
+        );
+        assert_eq!(
+            resolved(&scopes, source, "me", 1).resolution,
+            Resolution::Local {
+                slot: 1,
+                tdz: false
+            }
+        );
+    }
+
+    #[test]
+    fn only_a_binding_something_checks_is_marked_for_the_dead_zone() {
+        let source = "function f() { let checked; let plain = 1; return function g() { return checked; } + plain; }";
+        let scopes = analysed(source);
+
+        let marked = |name: &str| {
+            scopes
+                .bindings()
+                .iter()
+                .find(|binding| &*binding.name == name)
+                .expect("the name is declared")
+                .needs_dead_zone
+        };
+        assert!(marked("checked"));
+        assert!(!marked("plain"));
+    }
+
+    #[test]
+    fn a_function_can_be_found_by_where_it_was_written() {
+        let source = "function outer() { return function inner() { return 1; }; }";
+        let scopes = analysed(source);
+
+        let outer = scopes.functions()[1].span;
+        let inner = scopes.functions()[2].span;
+        assert_eq!(scopes.function_of(outer), Some(FunctionId(1)));
+        assert_eq!(scopes.function_of(inner), Some(FunctionId(2)));
+        assert_eq!(scopes.function_of(crate::ast::Span::new(9999, 9999)), None);
     }
 
     #[test]
