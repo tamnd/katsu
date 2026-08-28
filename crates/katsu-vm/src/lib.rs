@@ -5,6 +5,7 @@
 //! shapes, and `spec/03-architecture.md` for why an isolate is `Send` but not `Sync`.
 
 mod global;
+mod inspect;
 mod interpret;
 mod native;
 mod number;
@@ -15,7 +16,7 @@ mod value;
 
 use std::fmt;
 
-use katsu_gc::{Atom, AtomTable, BumpHeap, Cage, CageError, StringRef};
+use katsu_gc::{Atom, AtomTable, BumpHeap, Cage, CageError, ShapeRef, StringRef};
 use katsu_ir::FunctionBlueprint;
 
 pub use global::Globals;
@@ -90,6 +91,7 @@ pub fn compile(path: &str, source: &str) -> Result<FunctionBlueprint, CompileErr
 pub struct Isolate {
     heap: BumpHeap,
     atoms: AtomTable,
+    root_shape: Option<ShapeRef>,
     globals: Globals,
     natives: Natives,
     output: Box<dyn Output>,
@@ -100,6 +102,7 @@ impl fmt::Debug for Isolate {
         f.debug_struct("Isolate")
             .field("heap_used", &self.heap.cursor())
             .field("atoms", &self.atoms.len())
+            .field("has_root_shape", &self.root_shape.is_some())
             .field("globals", &self.globals.len())
             .field("natives", &self.natives)
             .field("output", &self.output)
@@ -118,6 +121,7 @@ impl Isolate {
         Ok(Isolate {
             heap: BumpHeap::new()?,
             atoms: AtomTable::new(),
+            root_shape: None,
             globals: Globals::new(),
             natives: Natives::new(),
             output: Box::new(Standard),
@@ -192,6 +196,26 @@ impl Isolate {
     /// used once and are not worth the hash an atom costs.
     pub fn allocate_string(&mut self, text: &str) -> Option<StringRef> {
         StringRef::from_str(&mut self.heap, text)
+    }
+
+    /// The shape of an object with no properties, which every other shape in this heap hangs off.
+    ///
+    /// Built on the first object rather than when the isolate is, because an isolate that runs a
+    /// program with no objects in it should allocate nothing, and that is a property the memory
+    /// budget in `spec/02-the-10x-goal.md` is measured against rather than a detail.
+    ///
+    /// One per isolate is the whole point. Two roots would be two transition trees, and two objects
+    /// built identically would then have different shapes, which is exactly what shapes exist to
+    /// prevent.
+    ///
+    /// Returns `None` if the heap is full.
+    pub fn root_shape(&mut self) -> Option<ShapeRef> {
+        if let Some(shape) = self.root_shape {
+            return Some(shape);
+        }
+        let shape = ShapeRef::root(&mut self.heap)?;
+        self.root_shape = Some(shape);
+        Some(shape)
     }
 
     /// Intern a string, so that every mention of the same text reaches one object.
