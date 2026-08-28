@@ -71,7 +71,7 @@ use crate::{Isolate, Value};
 /// Why execution stopped somewhere other than a `return`.
 ///
 /// Some of these are exceptions and some of them are not, and the difference is not a flag on the
-/// variant. It is the list [`Interpreter::handle`] checks before it starts looking for a handler:
+/// variant. It is the list the unwinder checks before it starts looking for a handler:
 /// running out of memory, being asked to stop, and reaching an opcode nobody has written yet are
 /// things that happened to a program rather than things a program did, and Node cannot catch its
 /// equivalents either.
