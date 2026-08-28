@@ -250,15 +250,17 @@ fn bench(args: &BenchArgs) -> Result<()> {
         );
     }
 
-    let filter_arg = if filter.is_empty() {
-        String::new()
-    } else {
-        format!(" -- {filter}")
-    };
+    // A filter is a regex, so the useful ones contain `|`, and a remote run is a line of shell
+    // rather than an argument vector. Quoting is each script's own job below. What cannot be
+    // quoted safely on both sides is a quote character itself, so that is refused here instead of
+    // being mangled into a filter that silently matches something else.
+    if filter.contains('"') {
+        bail!("a benchmark filter cannot contain a double quote, and {filter} does");
+    }
     let script = if machine.windows {
-        windows_script(machine, &commit, &args.package, &filter_arg)
+        windows_script(machine, &commit, &args.package, filter)
     } else {
-        unix_script(machine, &commit, &args.package, &filter_arg)
+        unix_script(machine, &commit, &args.package, filter)
     };
 
     eprintln!(
@@ -269,10 +271,18 @@ fn bench(args: &BenchArgs) -> Result<()> {
 }
 
 /// The bash side of a remote run.
-fn unix_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
+fn unix_script(machine: &Machine, commit: &str, package: &str, filter: &str) -> String {
     let pin = machine
         .pin
         .map_or(String::new(), |core| format!("taskset -c {core} "));
+    // Single quotes, because a filter is a regex and bash would read the `|` in one as a pipeline.
+    // The escape is the standard one for closing the quote, adding a literal quote and opening
+    // again, which is the only way to get a quote inside single quotes in bash.
+    let filter_arg = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" -- '{}'", filter.replace('\'', "'\\''"))
+    };
     format!(
         "set -e\n\
          export PATH=\"$HOME/.cargo/bin:$PATH\"\n\
@@ -297,12 +307,26 @@ fn unix_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str)
 /// a process from the outside before it starts, and the mask is inherited by the benchmark binary
 /// cargo spawns. `/wait /b` keeps it in this console so its output comes back over ssh instead of
 /// opening a window on somebody's desktop.
-fn windows_script(machine: &Machine, commit: &str, package: &str, filter_arg: &str) -> String {
-    let bench = format!("cargo bench -p {package}{filter_arg}");
-    let pinned = match machine.pin {
-        Some(mask) => format!("cmd /c \"start /wait /b /affinity {mask:x} cmd /c {bench}\""),
-        None => bench,
+///
+/// The cargo line goes into a batch file rather than into that command directly. A filter is a
+/// regex with a `|` in it, the pinned form nests cmd inside cmd inside PowerShell, and cmd's rule
+/// for which layer strips which quotes is not something to rely on three levels deep. Inside a
+/// batch file a double quoted argument is passed through untouched, which is all we need.
+fn windows_script(machine: &Machine, commit: &str, package: &str, filter: &str) -> String {
+    let filter_arg = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" -- \"{filter}\"")
     };
+    // The batch file's one line is built as a PowerShell single quoted string, where the only
+    // character with a meaning is the quote itself, and a doubled quote is a literal one.
+    let path = r"C:\katsu-bench-checkout\bench.cmd";
+    let line = format!("cargo bench -p {package}{filter_arg}").replace('\'', "''");
+    let run = match machine.pin {
+        Some(mask) => format!("cmd /c \"start /wait /b /affinity {mask:x} cmd /c {path}\""),
+        None => format!("cmd /c {path}"),
+    };
+    let pinned = format!("Set-Content -Path {path} -Encoding ASCII -Value '{line}'\n{run}");
     format!(
         // Progress records come back over ssh as raw CLIXML in the middle of the results, so
         // they are turned off rather than filtered out afterwards.
