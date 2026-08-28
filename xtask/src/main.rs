@@ -23,6 +23,23 @@ struct Cli {
 enum Task {
     /// Check that no crate depends on a crate in a layer above it.
     Layers,
+    /// Run benchmarks on one of the reference machines from `spec/15-benchmarks.md`.
+    Bench(BenchArgs),
+    /// List the reference machines and say whether each one is reachable.
+    Machines,
+}
+
+#[derive(Debug, clap::Args)]
+struct BenchArgs {
+    /// Which reference machine to run on. See `cargo xtask machines`.
+    #[arg(long, default_value = "m4")]
+    machine: String,
+    /// Which crate's benchmarks to run.
+    #[arg(long, short = 'p', default_value = "katsu-vm")]
+    package: String,
+    /// Passed through to criterion, so `--filter encode` runs only the encode group.
+    #[arg(long)]
+    filter: Option<String>,
 }
 
 /// The layer stack from `spec/03-architecture.md`, deepest first.
@@ -80,7 +97,227 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().command {
         Task::Layers => check_layers(),
+        Task::Bench(args) => bench(&args),
+        Task::Machines => {
+            list_machines();
+            Ok(())
+        }
     }
+}
+
+/// A machine benchmarks may run on.
+///
+/// The roster is in the source rather than in a config file because a benchmark result is only
+/// worth anything if the machine it came from is pinned down, and a machine described in a file
+/// somebody can edit without review is not pinned down.
+struct Machine {
+    /// The name used on the command line and in any published result.
+    name: &'static str,
+    /// The ssh host, or `None` for the machine this process is running on.
+    host: Option<&'static str>,
+    /// Wrapped around the remote command, for hosts where ssh does not land in a usable shell.
+    /// `gamingpc` is a Windows box, so ssh arrives at cmd.exe and the Linux side is one hop
+    /// further in.
+    shell: Option<&'static str>,
+    /// The core benchmarks are pinned to, where pinning is available.
+    pin: Option<u8>,
+    /// What goes next to a number taken here.
+    caveat: &'static str,
+}
+
+/// The reference machines from `spec/15-benchmarks.md` 15.5.
+///
+/// `server1`, `server2` and `server3` are deliberately absent. They are shared cloud instances
+/// running under permanent load, they are useful for checking that something builds on a machine
+/// we do not control, and a timing taken on one of them would be noise wearing a result's
+/// clothing. Adding them here would make it too easy to publish that noise by accident.
+const MACHINES: &[Machine] = &[
+    Machine {
+        name: "m4",
+        host: None,
+        shell: None,
+        pin: None,
+        caveat: "a laptop, so a long suite will thermally throttle and the tail of it is not \
+                 comparable with the head",
+    },
+    Machine {
+        name: "gamingpc",
+        host: Some("gamingpc"),
+        shell: Some("wsl -d Ubuntu -- bash -c"),
+        pin: Some(4),
+        caveat: "WSL2, which is a virtual machine, and turbo is not pinned yet",
+    },
+];
+
+fn machine(name: &str) -> Result<&'static Machine> {
+    MACHINES.iter().find(|m| m.name == name).with_context(|| {
+        let known: Vec<&str> = MACHINES.iter().map(|m| m.name).collect();
+        format!(
+            "no reference machine named {name}. Known machines: {}",
+            known.join(", ")
+        )
+    })
+}
+
+fn list_machines() {
+    for machine in MACHINES {
+        let reachable = match machine.host {
+            None => "local".to_string(),
+            Some(host) => {
+                let ok = Command::new("ssh")
+                    .args([
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=8",
+                        host,
+                        "exit",
+                    ])
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if ok {
+                    "reachable".to_string()
+                } else {
+                    format!("unreachable via ssh {host}")
+                }
+            }
+        };
+        println!("{:<10} {:<28} {}", machine.name, reachable, machine.caveat);
+    }
+}
+
+fn bench(args: &BenchArgs) -> Result<()> {
+    let machine = machine(&args.machine)?;
+
+    let filter = args.filter.as_deref().unwrap_or("");
+    let Some(host) = machine.host else {
+        let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        command.args(["bench", "-p", &args.package]);
+        if !filter.is_empty() {
+            command.args(["--", filter]);
+        }
+        eprintln!(
+            "bench: running on {} locally, {}",
+            machine.name, machine.caveat
+        );
+        let status = command.status().context("running cargo bench")?;
+        if !status.success() {
+            bail!("cargo bench failed");
+        }
+        return Ok(());
+    };
+
+    // A remote run checks out a commit by hash, so the commit has to be somewhere the remote can
+    // fetch it from. Refusing here is better than benchmarking whatever the remote happens to have
+    // checked out and reporting it against the hash in the working tree.
+    let commit = git(&["rev-parse", "HEAD"])?;
+    if !git(&["status", "--porcelain"])?.is_empty() {
+        eprintln!(
+            "bench: the working tree has uncommitted changes and they will not be measured, \
+             because the remote checks out {commit} by hash"
+        );
+    }
+    if git(&["branch", "-r", "--contains", &commit])
+        .unwrap_or_default()
+        .is_empty()
+    {
+        bail!(
+            "commit {commit} is not on any remote branch, so {host} cannot fetch it. \
+             Push first, or run with --machine m4."
+        );
+    }
+
+    let pin = machine
+        .pin
+        .map_or(String::new(), |core| format!("taskset -c {core} "));
+    let filter_arg = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" -- {filter}")
+    };
+    let script = format!(
+        "set -e\n\
+         export PATH=\"$HOME/.cargo/bin:$PATH\"\n\
+         mkdir -p ~/katsu-bench-checkout\n\
+         cd ~/katsu-bench-checkout\n\
+         test -d katsu || git clone -q https://github.com/tamnd/katsu.git\n\
+         cd katsu\n\
+         git fetch -q origin\n\
+         git checkout -q --detach {commit}\n\
+         echo \"machine: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), \
+         $(nproc) threads\"\n\
+         echo \"load: $(cut -d' ' -f1-3 /proc/loadavg)\"\n\
+         echo \"toolchain: $(rustc --version)\"\n\
+         echo \"commit: $(git log --oneline -1)\"\n\
+         {pin}cargo bench -p {package}{filter_arg}\n",
+        package = args.package,
+    );
+
+    eprintln!(
+        "bench: running on {} at {commit}, {}",
+        machine.name, machine.caveat
+    );
+    run_remote(host, machine.shell, &script)
+}
+
+/// Ship a script to a remote host and run it.
+///
+/// The script is base64 encoded rather than quoted because `gamingpc` routes through cmd.exe on
+/// the way to a Linux shell, and getting a multi line script with quotes and pipes through two
+/// layers of unrelated quoting rules intact is not a problem worth solving twice.
+fn run_remote(host: &str, shell: Option<&str>, script: &str) -> Result<()> {
+    let encoded = base64(script.as_bytes());
+    let inner =
+        format!("echo {encoded} | base64 -d > /tmp/xtask-bench.sh; bash /tmp/xtask-bench.sh");
+    let remote = match shell {
+        Some(shell) => format!("{shell} \"{inner}\""),
+        None => inner,
+    };
+
+    let status = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host])
+        .arg(remote)
+        .status()
+        .with_context(|| format!("running ssh {host}"))?;
+    if !status.success() {
+        bail!("the benchmark run on {host} failed");
+    }
+    Ok(())
+}
+
+/// Standard base64, no line breaks.
+///
+/// Twelve lines against a dependency that would be in the tree forever for this one use.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn git(args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("git {} failed", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn check_layers() -> Result<()> {
@@ -151,4 +388,44 @@ fn check_layers() -> Result<()> {
          and it is a rule, not a suggestion.",
         violations.len()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MACHINES, base64, machine};
+
+    #[test]
+    fn base64_matches_the_reference_vectors() {
+        // RFC 4648 section 10, which exists precisely so that hand rolled encoders can be
+        // checked against something rather than against the author's confidence.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_handles_the_bytes_a_shell_script_actually_contains() {
+        // Newlines, quotes and the high bit, which is what a script with a stray non ASCII
+        // character in a comment looks like.
+        let script = "set -e\necho \"hello | world\"\n# \u{00e9}\n";
+        assert_eq!(
+            base64(script.as_bytes()),
+            "c2V0IC1lCmVjaG8gImhlbGxvIHwgd29ybGQiCiMgw6kK"
+        );
+    }
+
+    #[test]
+    fn the_machine_roster_is_addressable_by_name() {
+        for entry in MACHINES {
+            assert_eq!(machine(entry.name).unwrap().name, entry.name);
+        }
+        assert!(
+            machine("server3").is_err(),
+            "cloud boxes are not reference machines"
+        );
+    }
 }

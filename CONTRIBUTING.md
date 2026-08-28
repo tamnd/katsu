@@ -23,6 +23,8 @@ cargo test --workspace --all-features
 cargo run -p xtask -- layers
 ```
 
+If you touched anything on a hot path, also run the benchmarks on a reference machine with `cargo run -p xtask -- bench --machine gamingpc -p <crate>`, and put the before and after in the pull request. A benchmark taken on your own laptop with a browser open is not evidence and reviewers will say so.
+
 CI runs all four and a few more. The layer check is the one people hit first: dependencies point strictly downward through the stack in [`spec/03-architecture.md`](spec/03-architecture.md), and adding an upward edge fails the build with the edge named.
 
 ## House rules for code

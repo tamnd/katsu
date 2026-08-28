@@ -45,7 +45,22 @@ Integers get the top of the range rather than the bottom because a negative inte
 
 The pointer range asserts rather than masks. Current 64 bit platforms give userspace 48 bits of address and the cage in 7.2 is a 4 GB reservation well inside that, so a real heap pointer always fits. If a future platform hands out wider addresses we want a panic on the first allocation, not silently truncated pointers.
 
-Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. On an M series laptop, over batches of 1024 values, encoding an integer costs about 0.26 ns per value, a round trip through encode and decode about 0.05 ns per value, and the integer predicate about 0.06 ns per value, all of which is the compiler vectorising work that has no branches in it. The number to take from that is not the speed, it is that the tagging is not a serial dependency and does not stop the vectoriser.
+Benchmarks are in `crates/katsu-vm/benches/value.rs` and they exist as a regression guard rather than as a published result, for the reason document 15 gives about microbenchmarks. They run on both reference machines from document 15.5, because an encoding whose whole justification is an x86 hardware quirk should not be measured only on ARM. Nanoseconds per value, over batches of 1024:
+
+| Benchmark | Apple M4 | Core i9-13900K |
+|---|---|---|
+| encode `i32` | 0.26 | 0.28 |
+| encode double | 0.27 | 0.38 |
+| encode `f64` with the integer check | 0.52 | 0.94 |
+| decode, numeric dispatch over a mixed batch | 0.46 | 0.27 |
+| decode, `to_boolean` over a mixed batch | 0.55 | 1.01 |
+| decode, the `is_i32` predicate | 0.06 | 0.17 |
+| round trip, `i32` | 0.05 | 0.10 |
+| round trip, double | 0.56 | 0.45 |
+
+The number to take from this is not the speed, it is the shape. Everything here is well under a cycle per value on both machines, which means the compiler is vectorising the encode and decode work, which means the tagging did not introduce a serial dependency or a branch the predictor has to guess at. The day one of these rows becomes a whole cycle per value is the day something in the encoding started costing what it is not supposed to cost.
+
+The two machines disagree in both directions and that is worth keeping rather than smoothing over. x86 is ahead on numeric dispatch and on the double round trip, ARM is ahead on the predicates and the integer round trip. Neither difference is about the encoding, both are about how the two vector units handle a 64 bit compare and select, and a benchmark that reported only the machine that flattered us would have hidden that.
 
 ## 7.2 The cage
 
