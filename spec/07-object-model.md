@@ -152,6 +152,20 @@ Under the memory budget, N is chosen from the shape's transition history rather 
 
 Dictionary mode exists for objects that are used as hash maps, with thousands of properties or frequent deletes. Transitioning into dictionary mode is one way, it disables inline caching for that object, and it exists so that pathological programs degrade instead of exploding the shape tree.
 
+### 7.4.1 Three heap kinds before there are shapes, as built
+
+Shapes are M1 work and calls are M0 work, so the cage holds three kinds of object today with nothing to describe them. `crates/katsu-gc/src/function.rs` adds the second and the third, a closure and a context, to the string that was there already, and the question every pointer now has to answer is which of the three it points at.
+
+The answer is in the word every object already starts with, the one this section reserves for the shape. It is a slot, so by 7.2.1 its low bit says whether it holds a pointer or a small integer, and a shape is a pointer while a kind tag is a small integer. A tag written there today is therefore not something a shape can ever be mistaken for. When shapes arrive the tag does not have to move out of the way either, because the shape carries the same answer the tag does and the check becomes a read through the map rather than a compare against a constant.
+
+Zero is a string, and that assignment is not arbitrary. A freshly committed page is zero and the bump heap never reuses memory, so every string ever allocated already holds the right answer in that word without a single instruction being spent to put it there. Giving strings a real tag would have added a store to every string allocation to record what the memory already said.
+
+A closure is sixteen bytes: the kind tag, the index of the function it runs, the context it captured and its own name. The blueprint is not in it, because two closures over the same function share one blueprint and differ only in what they captured, which is the whole reason the closure is a separate object from the code. The name is in it rather than being looked up through the function index, because printing a function has to work after the unit that compiled it is gone, and that is the situation an embedder holding a value is always in.
+
+A context is a sixteen byte header, which is the tag, the enclosing context and a count with a word of padding after it, followed by one cell per captured variable. A cell is eight bytes and everything else in the cage that holds a value holds four, which is a real deviation from the memory story in 02.3 and is written down here rather than found later. A slot has exactly two things it can be, a small integer or a pointer into the cage, and a captured variable can be a double, or `undefined`, or `true`. Storing those in four bytes needs a heap number and a set of realm singletons to point at, and neither exists before M1. So the choice today is between eight byte cells and a captured `let x = 1.5` that cannot be stored at all. Cells go back to four bytes in M1, when there is something for a slot to point at.
+
+The padding word in the context header is not waste that rearranging could recover. Cells have to start on an eight byte boundary, and there is nothing else to put in front of them until a context needs a shape, which is the same M1 that takes the cells back down to four bytes.
+
 ## 7.5 Inline caches, with one description per cache
 
 The best documented modern design here is SpiderMonkey's CacheIR: rather than hand writing a stub for each cache case, an inline cache is a small program in a dedicated IR, and one description generates the interpreter's cache, the baseline stub, and the input the optimizing compiler uses for inlining decisions.

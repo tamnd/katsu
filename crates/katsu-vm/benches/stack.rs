@@ -23,13 +23,24 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use katsu_ir::Register;
-use katsu_vm::{Stack, Value};
+use katsu_vm::{Invocation, Stack, Value};
 
 /// The frame size a small function lowers to.
 const SMALL_FRAME: u16 = 8;
 
 /// How deep to go, so that the frame vector is not a single cache line.
 const DEPTH: usize = 100;
+
+/// A call of three arguments into a function that declares three, which is the shape most calls in
+/// real code have and the one where every argument is copied.
+const THREE: Invocation = Invocation {
+    arity: 3,
+    first: Register(0),
+    passed: 3,
+    function: 0,
+    return_pc: 0,
+    return_to: Register(0),
+};
 
 fn calls(c: &mut Criterion) {
     let mut group = c.benchmark_group("stack");
@@ -39,20 +50,34 @@ fn calls(c: &mut Criterion) {
         let mut stack = Stack::new().expect("should reserve");
         b.iter(|| {
             stack
-                .push(black_box(SMALL_FRAME), &[], 0, Register(0))
+                .push(black_box(SMALL_FRAME), &[], 0)
                 .expect("should have room");
             black_box(stack.pop());
         });
     });
 
-    // The same operation with arguments to copy, which is what a real call does. The difference
-    // between this and the one above is the argument copy and nothing else.
+    // What every call in a running program actually costs, which is the number the goal in spec 02
+    // cares about. The arguments come out of the caller's own registers and never leave the region,
+    // so the difference between this and the one above is the copy and the return bookkeeping.
+    group.bench_function("call_and_return", |b| {
+        let mut stack = Stack::new().expect("should reserve");
+        stack.push(SMALL_FRAME, &[], 0).expect("should have room");
+        b.iter(|| {
+            stack
+                .push_call(black_box(SMALL_FRAME), black_box(THREE))
+                .expect("should have room");
+            black_box(stack.pop());
+        });
+    });
+
+    // The same call with the arguments arriving from outside the region, which is what an embedder
+    // calling in does. Kept separate because it is a different path and a rarer one.
     let args = [Value::from_i32(1), Value::from_i32(2), Value::from_i32(3)];
     group.bench_function("push_pop_with_arguments", |b| {
         let mut stack = Stack::new().expect("should reserve");
         b.iter(|| {
             stack
-                .push(black_box(SMALL_FRAME), black_box(&args), 0, Register(0))
+                .push(black_box(SMALL_FRAME), black_box(&args), 0)
                 .expect("should have room");
             black_box(stack.pop());
         });
@@ -61,10 +86,11 @@ fn calls(c: &mut Criterion) {
     group.throughput(Throughput::Elements(DEPTH as u64));
     group.bench_function("recurse_and_unwind", |b| {
         let mut stack = Stack::new().expect("should reserve");
+        stack.push(SMALL_FRAME, &[], 0).expect("should have room");
         b.iter(|| {
             for _ in 0..DEPTH {
                 stack
-                    .push(SMALL_FRAME, &[], 0, Register(0))
+                    .push_call(SMALL_FRAME, THREE)
                     .expect("should have room");
             }
             for _ in 0..DEPTH {
@@ -83,9 +109,7 @@ fn registers(c: &mut Criterion) {
     // benchmark should not accidentally measure the one frame case.
     let mut stack = Stack::new().expect("should reserve");
     for _ in 0..DEPTH {
-        stack
-            .push(SMALL_FRAME, &[], 0, Register(0))
-            .expect("should have room");
+        stack.push(SMALL_FRAME, &[], 0).expect("should have room");
     }
 
     group.throughput(Throughput::Elements(1));

@@ -80,18 +80,64 @@ pub enum StackError {
 /// The bookkeeping for one live call, everything about a frame that is not a value.
 ///
 /// The interpreter reads and writes these directly, which is why the fields are public. There is
-/// nothing to encapsulate: a frame is four numbers and an invariant that the stack maintains.
+/// nothing to encapsulate: a frame is six numbers and an invariant that the stack maintains.
+///
+/// Three of the six describe this frame and three describe how to get back out of it. That split is
+/// worth noticing, because `return_pc` and `return_to` are about the caller and living on the callee
+/// is what makes a return one pop rather than a search.
+///
+/// The two words calls added, `function` and `context`, took the header from sixteen bytes to
+/// twenty four, and that is not free. On the 13900K a push and pop pair went from 6.40 ns to 7.71 ns
+/// when the only change was the two new fields, which is 22 percent of the cheapest call there is.
+/// The same change costs nothing measurable on the m4. Padding the header to thirty two bytes did
+/// not help, so this is the extra store and the load that reads across it rather than the multiply
+/// an odd element size costs. Spec 5.4.1 has the numbers and the way back down to sixteen bytes,
+/// which is a `u32` base and finding `size` and `return_to` somewhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Index into the value region where this frame's register zero lives.
     pub base: usize,
     /// How many value slots this frame owns, which is the blueprint's frame size.
     pub size: u16,
+    /// Which function in the loaded unit this frame is running.
+    ///
+    /// An index rather than a pointer, because the blueprints belong to the compiled unit the
+    /// caller owns and a frame outliving a borrow of one would be a lifetime nobody wants to thread
+    /// through the dispatch loop.
+    pub function: u32,
+    /// The environment this frame reads captured variables through, as raw slot bits.
+    ///
+    /// Zero when the function captured nothing and declared nothing worth capturing, which is the
+    /// common case: scope analysis only asks for a context when a nested function actually reads an
+    /// outer variable.
+    pub context: u32,
     /// The instruction in the caller to resume at when this frame returns.
     ///
     /// Meaningless for the bottom frame, which returns to the embedder rather than to bytecode.
     pub return_pc: u32,
     /// The register in the caller's frame that this frame's return value is written into.
+    pub return_to: Register,
+}
+
+/// What a call site tells the stack, other than how big the frame it needs is.
+///
+/// One struct rather than six parameters, because six of them next to each other are six chances to
+/// pass the argument count where the parameter count goes. Two of the fields are counts of the same
+/// thing seen from opposite sides and two are registers, so at a call site written out as positional
+/// arguments the compiler would agree with almost any ordering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Invocation {
+    /// How many parameters the callee declares.
+    pub arity: u16,
+    /// The caller's register the first argument is in.
+    pub first: Register,
+    /// How many arguments the call site actually passed.
+    pub passed: u16,
+    /// Which function in the loaded unit is being entered.
+    pub function: u32,
+    /// The instruction in the caller to resume at.
+    pub return_pc: u32,
+    /// The caller's register the returned value goes into.
     pub return_to: Register,
 }
 
@@ -174,9 +220,14 @@ impl Stack {
 
     /// Every value slot that belongs to a live frame.
     ///
-    /// This is the root set, and the reason the header is not stored inline. A collector walks this
-    /// slice and every element in it is a value, with no frame boundaries to respect and no words to
-    /// skip. See the note at the top of this module.
+    /// This is most of the root set, and the reason the header is not stored inline. A collector
+    /// walks this slice and every element in it is a value, with no frame boundaries to respect and
+    /// no words to skip. See the note at the top of this module.
+    ///
+    /// It stopped being all of the root set when frames grew a context. A frame's context is a heap
+    /// pointer that lives in the header rather than in a register, so a collector has to walk
+    /// [`Stack::frames`] for those as well. Nothing collects yet, so this is a note for M1 rather
+    /// than a bug: the pointer is here, it is just not in this slice.
     #[must_use]
     pub fn roots(&self) -> &[Value] {
         // SAFETY: slots below `top` belong to a live frame, every one of them was written by `push`
@@ -184,7 +235,7 @@ impl Stack {
         unsafe { std::slice::from_raw_parts(self.slots(), self.top) }
     }
 
-    /// Push a frame of `size` slots, filling it from `args`.
+    /// Push the outermost frame, filling it from `args`, which come from outside the stack.
     ///
     /// The first `args.len()` slots take the argument values, in the order the caller evaluated
     /// them, because the calling convention in spec 4.5 puts argument `n` in register `n`. Every
@@ -200,45 +251,112 @@ impl Stack {
     ///
     /// Returns [`StackError::Overflow`] if the frame would exceed the depth limit or run past the
     /// reservation, and [`StackError::Reserve`] if committing the pages for it fails.
-    pub fn push(
-        &mut self,
-        size: u16,
-        args: &[Value],
-        return_pc: u32,
-        return_to: Register,
-    ) -> Result<(), StackError> {
-        if self.frames.len() >= MAX_DEPTH {
-            return Err(StackError::Overflow);
-        }
-        let size_slots = usize::from(size);
+    pub fn push(&mut self, size: u16, args: &[Value], function: u32) -> Result<(), StackError> {
         debug_assert!(
-            args.len() <= size_slots,
+            args.len() <= usize::from(size),
             "a call passed {} arguments into a frame of {size} slots, which means lowering sized \
              the frame without counting the parameters",
             args.len()
         );
+        let base = self.reserve(size)?;
+        // SAFETY: `reserve` committed `base..base + size`, so every slot is mapped writable, and
+        // nothing else holds a reference into the region while this runs.
+        let slots =
+            unsafe { std::slice::from_raw_parts_mut(self.slots().add(base), usize::from(size)) };
+        let taken = args.len().min(slots.len());
+        let (arguments, rest) = slots.split_at_mut(taken);
+        arguments.copy_from_slice(&args[..taken]);
+        rest.fill(Value::UNDEFINED);
+        self.commit(base, size, function, 0, Register(0));
+        Ok(())
+    }
+
+    /// Push a frame for a call, taking the arguments out of the caller's own registers.
+    ///
+    /// The arguments never leave the region. They are copied from a run of the caller's registers
+    /// straight into the bottom of the new frame, which is the whole reason spec 4.5 makes the
+    /// register allocator put them in consecutive registers in the first place. Gathering them into
+    /// a vector on the way would be an allocation on the path every call in every program takes.
+    ///
+    /// The arity and the passed count are separate on purpose and the smaller one wins. A call that
+    /// passed too few arguments leaves the rest `undefined`, which is what JavaScript says. A call
+    /// that passed too many drops the extras, because registers above the parameters belong to the
+    /// callee as scratch and writing an argument into one would corrupt a temporary. They are not
+    /// lost forever in principle, they are what `arguments` and a rest parameter read, and neither
+    /// of those exists yet.
+    ///
+    /// # Errors
+    ///
+    /// As [`Stack::push`].
+    pub fn push_call(&mut self, size: u16, call: Invocation) -> Result<(), StackError> {
+        let caller = *self.frames.last().expect("a call happens inside a frame");
+        let taken = usize::from(call.passed.min(call.arity).min(size));
+        debug_assert!(
+            usize::from(call.first.0) + usize::from(call.passed) <= usize::from(caller.size),
+            "a call read {} arguments from register {} of a frame of {} slots",
+            call.passed,
+            call.first,
+            caller.size
+        );
+        let from = caller.base + usize::from(call.first.0);
+        let base = self.reserve(size)?;
+        // SAFETY: `from..from + taken` is inside the caller's frame and `base..base + size` is the
+        // frame just reserved, which starts at the old top and therefore cannot overlap the caller.
+        // Both are committed, and `&mut self` means nothing else is reading the region.
+        unsafe {
+            let slots = self.slots();
+            std::ptr::copy_nonoverlapping(slots.add(from), slots.add(base), taken);
+            std::slice::from_raw_parts_mut(slots.add(base + taken), usize::from(size) - taken)
+                .fill(Value::UNDEFINED);
+        }
+        self.commit(base, size, call.function, call.return_pc, call.return_to);
+        Ok(())
+    }
+
+    /// Make room for a frame of `size` slots and answer where it starts.
+    ///
+    /// Nothing is recorded here, because a frame that has been reserved but not filled is a frame
+    /// the root scanner must not see. The caller fills it and then calls [`Stack::commit`].
+    fn reserve(&mut self, size: u16) -> Result<usize, StackError> {
+        if self.frames.len() >= MAX_DEPTH {
+            return Err(StackError::Overflow);
+        }
         let base = self.top;
         let end = base
-            .checked_add(size_slots)
+            .checked_add(usize::from(size))
             .filter(|end| *end <= self.capacity())
             .ok_or(StackError::Overflow)?;
         self.commit_through(end)?;
+        Ok(base)
+    }
 
-        // SAFETY: `base..end` is inside the region and committed, so every slot is mapped writable,
-        // and nothing else holds a reference into the region while this runs.
-        let slots = unsafe { std::slice::from_raw_parts_mut(self.slots().add(base), size_slots) };
-        let (arguments, rest) = slots.split_at_mut(args.len());
-        arguments.copy_from_slice(args);
-        rest.fill(Value::UNDEFINED);
-
-        self.top = end;
+    /// Record a frame whose slots are now all initialised.
+    fn commit(
+        &mut self,
+        base: usize,
+        size: u16,
+        function: u32,
+        return_pc: u32,
+        return_to: Register,
+    ) {
+        self.top = base + usize::from(size);
         self.frames.push(Frame {
             base,
             size,
+            function,
+            context: 0,
             return_pc,
             return_to,
         });
-        Ok(())
+    }
+
+    /// Drop every frame, which is what an error reaching the embedder leaves behind.
+    ///
+    /// A thrown exception unwinds to the top in one step here because M0 has no `try` for it to stop
+    /// at. When there is one, this stays as the last resort for an error nothing caught.
+    pub fn unwind(&mut self) {
+        self.frames.clear();
+        self.top = 0;
     }
 
     /// Pop the innermost frame and return it, or `None` if there was nothing to pop.
@@ -360,13 +478,26 @@ fn round_up_to_chunk(bytes: usize) -> usize {
 mod tests {
     use katsu_ir::Register;
 
-    use super::{COMMIT_CHUNK, MAX_DEPTH, Stack, StackError};
+    use super::{COMMIT_CHUNK, Invocation, MAX_DEPTH, Stack, StackError};
     use crate::Value;
 
     /// A frame with no arguments, which is what most of these tests want.
+    /// A call that returns into register zero of instruction zero, for the tests that are only
+    /// about how the arguments land.
+    fn call(arity: u16, first: Register, passed: u16) -> Invocation {
+        Invocation {
+            arity,
+            first,
+            passed,
+            function: 0,
+            return_pc: 0,
+            return_to: Register(0),
+        }
+    }
+
     fn push(stack: &mut Stack, size: u16) {
         stack
-            .push(size, &[], 0, Register(0))
+            .push(size, &[], 0)
             .expect("the stack should have room");
     }
 
@@ -412,7 +543,7 @@ mod tests {
             Value::from_i32(20),
             Value::from_i32(30),
         ];
-        stack.push(6, &args, 0, Register(0)).expect("should push");
+        stack.push(6, &args, 0).expect("should push");
 
         assert_eq!(stack.get(Register(0)), Value::from_i32(10));
         assert_eq!(stack.get(Register(1)), Value::from_i32(20));
@@ -451,13 +582,52 @@ mod tests {
     #[test]
     fn a_frame_records_where_to_return_to() {
         let mut stack = Stack::new().expect("should reserve");
-        stack.push(2, &[], 7, Register(3)).expect("should push");
+        push(&mut stack, 4);
+        stack
+            .push_call(
+                2,
+                Invocation {
+                    arity: 0,
+                    first: Register(0),
+                    passed: 0,
+                    function: 5,
+                    return_pc: 7,
+                    return_to: Register(3),
+                },
+            )
+            .expect("should push");
         let frame = *stack.current().expect("a frame is running");
         assert_eq!(frame.return_pc, 7);
         assert_eq!(frame.return_to, Register(3));
+        assert_eq!(frame.function, 5);
         assert_eq!(frame.size, 2);
         assert_eq!(stack.pop(), Some(frame));
-        assert_eq!(stack.pop(), None);
+        assert_eq!(stack.depth(), 1);
+    }
+
+    #[test]
+    fn the_outermost_frame_returns_to_the_embedder_and_says_so() {
+        let mut stack = Stack::new().expect("should reserve");
+        push(&mut stack, 2);
+        let frame = *stack.current().expect("a frame is running");
+        assert_eq!(frame.return_pc, 0);
+        assert_eq!(frame.function, 0);
+        assert_eq!(frame.context, 0, "nothing has been captured yet");
+    }
+
+    #[test]
+    fn unwinding_leaves_a_stack_that_can_be_used_again() {
+        // What an uncaught exception does. There is no `try` yet, so an error goes all the way out
+        // and the interpreter has to be usable for the next program rather than carrying dead frames.
+        let mut stack = Stack::new().expect("should reserve");
+        for _ in 0..5 {
+            push(&mut stack, 3);
+        }
+        stack.unwind();
+        assert_eq!(stack.depth(), 0);
+        assert!(stack.roots().is_empty());
+        push(&mut stack, 3);
+        assert_eq!(stack.get(Register(0)), Value::UNDEFINED);
     }
 
     #[test]
@@ -503,11 +673,53 @@ mod tests {
         stack.set(Register(2), Value::from_i32(41));
         stack.set(Register(3), Value::from_i32(42));
 
-        let args = stack.range(Register(2), 2).to_vec();
-        stack.push(2, &args, 9, Register(0)).expect("should push");
+        stack
+            .push_call(3, call(2, Register(2), 2))
+            .expect("should push");
 
         assert_eq!(stack.get(Register(0)), Value::from_i32(41));
         assert_eq!(stack.get(Register(1)), Value::from_i32(42));
+        assert_eq!(
+            stack.get(Register(2)),
+            Value::UNDEFINED,
+            "a scratch register"
+        );
+    }
+
+    #[test]
+    fn a_call_that_passed_too_few_arguments_leaves_the_rest_undefined() {
+        let mut stack = Stack::new().expect("should reserve");
+        push(&mut stack, 2);
+        stack.set(Register(0), Value::from_i32(7));
+
+        stack
+            .push_call(3, call(3, Register(0), 1))
+            .expect("should push");
+
+        assert_eq!(stack.get(Register(0)), Value::from_i32(7));
+        assert_eq!(stack.get(Register(1)), Value::UNDEFINED);
+        assert_eq!(stack.get(Register(2)), Value::UNDEFINED);
+    }
+
+    #[test]
+    fn a_call_that_passed_too_many_arguments_drops_the_extras_rather_than_clobbering_a_temporary() {
+        // The registers above the parameters belong to the callee as scratch. Copying a fourth
+        // argument into the third register of a function that declares two parameters would put a
+        // value where the callee expects to find its own working space.
+        let mut stack = Stack::new().expect("should reserve");
+        push(&mut stack, 4);
+        for slot in 0..4 {
+            stack.set(Register(slot), Value::from_i32(100 + i32::from(slot)));
+        }
+
+        stack
+            .push_call(4, call(2, Register(0), 4))
+            .expect("should push");
+
+        assert_eq!(stack.get(Register(0)), Value::from_i32(100));
+        assert_eq!(stack.get(Register(1)), Value::from_i32(101));
+        assert_eq!(stack.get(Register(2)), Value::UNDEFINED);
+        assert_eq!(stack.get(Register(3)), Value::UNDEFINED);
     }
 
     #[test]
@@ -518,10 +730,7 @@ mod tests {
         for _ in 0..MAX_DEPTH {
             push(&mut stack, 1);
         }
-        assert!(matches!(
-            stack.push(1, &[], 0, Register(0)),
-            Err(StackError::Overflow)
-        ));
+        assert!(matches!(stack.push(1, &[], 0), Err(StackError::Overflow)));
         assert_eq!(stack.depth(), MAX_DEPTH);
 
         // And it keeps working afterwards, because nothing was left half pushed.
@@ -533,13 +742,13 @@ mod tests {
     #[test]
     fn a_frame_too_large_for_the_reservation_is_refused_rather_than_committed() {
         let mut stack = Stack::new().expect("should reserve");
-        assert!(matches!(stack.push(u16::MAX, &[], 0, Register(0)), Ok(())));
+        assert!(matches!(stack.push(u16::MAX, &[], 0), Ok(())));
         stack.pop();
         // The reservation is eight megabytes and a frame is at most sixty five thousand slots, so
         // exhausting it takes many frames rather than one. Pushing the largest frame there is until
         // it refuses gets there without depending on the exact reservation size.
         let mut pushed = 0;
-        while stack.push(u16::MAX, &[], 0, Register(0)).is_ok() {
+        while stack.push(u16::MAX, &[], 0).is_ok() {
             pushed += 1;
             assert!(pushed < MAX_DEPTH, "the reservation should run out first");
         }
