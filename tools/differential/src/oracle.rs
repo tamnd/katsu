@@ -33,12 +33,33 @@ use katsu_runtime::{Recorder, Runtime};
 
 use crate::observe::{Observation, kind_in};
 
-/// How long any one program gets before it is treated as hung.
+/// How long a program gets inside our own interpreter before it is treated as hung.
 ///
 /// The generator only emits loops with literal bounds, so nothing it produces should come close.
 /// Anything that does is a bug in the engine worth reporting as one, which is why a timeout is its
 /// own observation and not silently a failure to run.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long node gets, which is much longer, and not for the same reason.
+///
+/// This is not a budget for how long the program takes to run, it is a budget for how long a process
+/// takes to exist. Spawning node means the operating system opening a hundred and thirty nine
+/// megabytes of executable and shared libraries, and on a shared CI runner that is a genuinely slow
+/// operation the first time and an unpredictable one every time, because the runner has neighbours
+/// and, on Windows, an antivirus that reads the whole file before letting anything map it. Five
+/// seconds looks generous next to node's twenty four millisecond startup and is not generous at all
+/// next to a cold page cache on a machine somebody else is also using.
+///
+/// It was five seconds and it produced a false failure on the Windows runner: katsu printed the
+/// right answer for `console.log(0.1 + 0.2)`, node never got as far as printing anything, and the
+/// harness reported that as node breaking. A comparison harness whose reference implementation
+/// randomly fails to start is a harness that gets rerun until it passes, and a suite people rerun
+/// until it passes is a suite nobody reads.
+///
+/// Thirty seconds is still three orders of magnitude more than a hello world costs, so a genuinely
+/// hung node is still caught, just later. Catching a real hang thirty seconds late costs one run.
+/// Failing a green build because a shared runner stalled costs the harness its credibility.
+pub(crate) const NODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Anything that can say what it did with a program.
 pub(crate) trait Oracle {
@@ -164,7 +185,7 @@ impl Oracle for Node {
             Err(error) => return Observation::Broke(format!("cannot start node: {error}")),
         };
 
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + NODE_TIMEOUT;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -174,7 +195,7 @@ impl Oracle for Node {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Observation::Broke(format!("node did not finish in {TIMEOUT:?}"));
+                return Observation::Broke(format!("node did not finish in {NODE_TIMEOUT:?}"));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
