@@ -235,3 +235,175 @@ try {
   };
 }
 console.log(later());
+// A `finally` runs on every way out of the block it guards, so the first thing to check is that the
+// normal way out still runs it and still finishes with the value the block was going to produce.
+let sequence = '';
+try {
+  sequence += 'try ';
+} finally {
+  sequence += 'finally ';
+}
+sequence += 'after';
+console.log(sequence);
+// The same shape with a throw. The handler is outside this `try`, so the `finally` runs on the way
+// past and the value keeps travelling.
+let escaped = '';
+try {
+  try {
+    escaped += 'a';
+    throw 'thrown';
+  } finally {
+    escaped += 'b';
+  }
+} catch (e) {
+  escaped += 'c' + e;
+}
+console.log(escaped);
+// A `return` out of a protected block runs the `finally` before the caller sees the value, and the
+// value is the one the `return` named rather than whatever the body happened to leave behind.
+let sideEffect = 0;
+function returnsThroughAFinally() {
+  try {
+    return 'returned';
+  } finally {
+    sideEffect++;
+  }
+}
+console.log(returnsThroughAFinally(), sideEffect);
+// A `return` written in the body overrides the one that was on its way out, which is the case that
+// says the body is lowered against what is outside the construct and not inside it.
+function theFinallyWins() {
+  try {
+    return 'from the try';
+  } finally {
+    return 'from the finally';
+  }
+}
+console.log(theFinallyWins());
+// The same override for a throw. The pending exception is dropped and the new one travels instead.
+function theFinallyThrowsInstead() {
+  try {
+    throw 'from the try';
+  } finally {
+    throw 'from the finally';
+  }
+}
+try {
+  theFinallyThrowsInstead();
+} catch (e) {
+  console.log(e);
+}
+// A `break` and a `continue` both have to run the `finally` on their way out of the loop.
+let visited = '';
+let step = 0;
+while (step < 4) {
+  step++;
+  try {
+    if (step === 2) {
+      continue;
+    }
+    if (step === 3) {
+      break;
+    }
+    visited += 'body' + step + ' ';
+  } finally {
+    visited += 'fin' + step + ' ';
+  }
+}
+console.log(visited, step);
+// A `break` out of a switch clause goes through the `finally` in the clause it is leaving.
+function breaksOutOfASwitch(subject) {
+  let trace = '';
+  switch (subject) {
+    case 1:
+      try {
+        trace += 'one ';
+        break;
+      } finally {
+        trace += 'fin ';
+      }
+    default:
+      trace += 'default';
+  }
+  return trace;
+}
+console.log(breaksOutOfASwitch(1), '|', breaksOutOfASwitch(2));
+// Nested `finally` clauses chain, and the completion keeps travelling outwards through all of them
+// in the sequence the blocks were entered.
+function chains() {
+  let trace = '';
+  function inner() {
+    try {
+      try {
+        return 'value';
+      } finally {
+        trace += 'inner ';
+      }
+    } finally {
+      trace += 'outer';
+    }
+  }
+  const got = inner();
+  return got + ' ' + trace;
+}
+console.log(chains());
+// All three clauses together. The `catch` handles what the block throws and the `finally` runs
+// after whichever of the two paths was taken.
+function allThree(shouldThrow) {
+  let trace = '';
+  try {
+    trace += 'try ';
+    if (shouldThrow) {
+      throw 'boom';
+    }
+  } catch (e) {
+    trace += 'catch:' + e + ' ';
+  } finally {
+    trace += 'finally';
+  }
+  return trace;
+}
+console.log(allThree(false), '|', allThree(true));
+// A throw inside the `catch` is not caught by that same `catch`, and it still runs the `finally`
+// that is wrapped around both of them.
+function throwsFromTheHandler() {
+  let trace = '';
+  try {
+    try {
+      throw 'first';
+    } catch (e) {
+      trace += 'caught:' + e + ' ';
+      throw 'second';
+    } finally {
+      trace += 'finally ';
+    }
+  } catch (e) {
+    trace += 'outer:' + e;
+  }
+  return trace;
+}
+console.log(throwsFromTheHandler());
+// An empty protected block still runs its `finally`, which is the case lowering shortcuts.
+let ranAnyway = 0;
+try {
+} finally {
+  ranAnyway++;
+}
+console.log(ranAnyway);
+// A `finally` in a function that is called from inside another `finally` runs at the point of the
+// call and does not disturb the completion the outer one is carrying.
+function helper() {
+  try {
+    return 1;
+  } finally {
+    ranAnyway++;
+  }
+}
+function outerCarries() {
+  try {
+    return 'carried';
+  } finally {
+    helper();
+  }
+}
+console.log(outerCarries(), ranAnyway);

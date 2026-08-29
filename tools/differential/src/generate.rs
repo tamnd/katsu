@@ -364,17 +364,27 @@ impl Builder<'_> {
         format!("switch ({subject}) {{ {} }}", clauses.join(" "))
     }
 
-    /// `let c3 = 0; try { ... throw <expr>; } catch (e3) { c3 = e3; ... }`.
+    /// `let c3 = 0; try { ... throw <expr>; } catch (e3) { c3 = e3; ... } finally { c3 = c3 + 1; ... }`.
     ///
     /// The extra binding is what makes the whole thing observable. A generated handler mentions the
-    /// caught name only by accident, so without somewhere to put it the program would run both
-    /// paths and print the same thing either way, and a difference in where a throw landed would
-    /// never reach the output the harness compares.
+    /// caught name only by accident, so without somewhere to put it the program would run both paths
+    /// and print the same thing either way, and a difference in where a throw landed would never
+    /// reach the output the harness compares.
+    ///
+    /// Both clauses write to the same name, which is one binding rather than two and is also the
+    /// thing that puts their order in the output: a `catch` assigns the caught value and a `finally`
+    /// adds to whatever is there, so a run that took both paths reads differently from a run that
+    /// took either alone, and differently again if an engine ran them the other way round.
     ///
     /// The throw is drawn rather than always emitted, because a `try` that always fires never runs
     /// the path where the protected block finishes, and that is the path almost every real `try`
-    /// takes. The name goes out of scope at the closing brace like any other block binding, which
-    /// is why it is pushed and truncated by hand here instead of going through `block`.
+    /// takes. The caught name goes out of scope at the closing brace like any other block binding,
+    /// which is why it is pushed and truncated by hand here instead of going through `block`.
+    ///
+    /// Which of the two clauses are written is drawn as well, since the three shapes lower into
+    /// three different things. A `try` with no `catch` is only drawn when no throw was drawn with
+    /// it, because a throw nothing catches ends the program, and a generator that ends its programs
+    /// early stops testing everything written after the point it ended them.
     fn try_statement(&mut self, depth: usize) -> String {
         let held = format!("c{}", self.next);
         let caught = format!("e{}", self.next);
@@ -383,26 +393,51 @@ impl Builder<'_> {
         self.mutable.push(held.clone());
 
         let protected = self.block(depth + 1);
-        let throw = if self.random.chance(2) {
+        let throws = self.random.chance(2);
+        let throw = if throws {
             let value = self.expression(0);
             format!(" throw {value};")
         } else {
             String::new()
         };
+        // One of the two clauses is always written, because the grammar says so.
+        let wants_finally = self.random.chance(2);
+        let wants_catch = throws || !wants_finally || self.random.chance(2);
 
+        let catch = if wants_catch {
+            let body = self.nested_block(depth, Some(&caught));
+            format!(" catch ({caught}) {{ {held} = {caught}; {body} }}")
+        } else {
+            String::new()
+        };
+
+        let finally = if wants_finally {
+            let body = self.nested_block(depth, None);
+            format!(" finally {{ {held} = {held} + 1; {body} }}")
+        } else {
+            String::new()
+        };
+
+        format!("let {held} = 0; try {{ {protected}{throw} }}{catch}{finally}")
+    }
+
+    /// One generated statement, with everything it declared put back afterwards.
+    ///
+    /// A clause of a `try` is a scope of its own and the names in it stop at its closing brace, so
+    /// the generator has to forget them at the same point or it will write a later statement that
+    /// reads one of them and produce a program that is a `ReferenceError` in every engine.
+    fn nested_block(&mut self, depth: usize, bound: Option<&str>) -> String {
         let live = self.live.len();
         let mutable = self.mutable.len();
         let objects = self.objects.len();
-        self.live.push(caught.clone());
-        let handler = self.statement(depth + 1);
+        if let Some(name) = bound {
+            self.live.push(name.to_owned());
+        }
+        let body = self.statement(depth + 1);
         self.live.truncate(live);
         self.mutable.truncate(mutable);
         self.objects.truncate(objects);
-
-        format!(
-            "let {held} = 0; try {{ {protected}{throw} }} catch ({caught}) {{ {held} = {caught}; \
-             {handler} }}"
-        )
+        body
     }
 
     /// What to write after `case`.

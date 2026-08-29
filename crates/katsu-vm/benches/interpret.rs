@@ -83,7 +83,12 @@
 //! when something does throw, `throw_caught_three_frames_up` adds the unwinding, and the gap between
 //! those two is what one frame is worth. `engine_error_caught` is the same shape with a `TypeError`
 //! instead of a thrown number, so the cost of building the error object at the `catch` rather than
-//! at the throw is a difference between two measured numbers rather than a claim.
+//! at the throw is a difference between two measured numbers rather than a claim. The last three
+//! are the same three questions asked of `finally`, which has no opcode of its own and so is
+//! entirely a shape of lowering: `loop_inside_try_finally` against `loop_without_try` is what
+//! writing one costs when nothing goes wrong, `return_through_a_finally` is what the dispatch costs
+//! once a second completion kind can arrive, and `throw_through_a_finally` is what one of them in
+//! the path adds to an unwind.
 //!
 //! The call benchmarks come from source rather than from assembled bytecode, because a call is the
 //! one place where the cost depends on what lowering and scope analysis decided, and hand written
@@ -739,6 +744,58 @@ fn exceptions(c: &mut Criterion) {
     group.bench_function("engine_error_caught", |b| {
         let mut interpreter = Interpreter::new().expect("should reserve a stack");
         b.iter(|| black_box(interpreter.run(black_box(&engine))));
+    });
+
+    // What a `finally` costs on the path nearly every `finally` takes, which is the block finishing
+    // normally. Against `loop_without_try` this is the whole price of writing one: two `load_int`s
+    // and two jumps for the token and the entry into the body, then the `jump_if_false` that lets a
+    // normal completion out of the dispatch. No comparison is emitted at all, because nothing in
+    // the block returns or breaks, so the only other thing the token could have been is a throw.
+    let finally_normal = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ total = total + i; }} finally \
+         {{ i = i + 1; }} }}"
+    ));
+    group.bench_function("loop_inside_try_finally", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&finally_normal))));
+    });
+
+    // The control for the one below it. A `return` costs a call to measure at all, so the call is
+    // measured on its own here and the `finally` version is measured with the same call in it,
+    // which makes the price of routing a `return` a difference between two numbers rather than a
+    // number with a call buried in it.
+    let plain_return = program(&format!(
+        "function guarded(n) {{ return n; }} let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ \
+         total = total + guarded(i); i = i + 1; }}"
+    ));
+    group.bench_function("return_without_a_finally", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&plain_return))));
+    });
+
+    // The same shape with a `return` routed through the `finally`, which is the case that turns the
+    // dispatch from a single jump into a chain. The gap against the one above is what one extra
+    // completion kind is worth, and it is the number to look at before deciding whether a jump
+    // table would be worth building for a construct that mostly has two kinds.
+    let finally_return = program(&format!(
+        "function guarded(n) {{ try {{ return n; }} finally {{ n = n + 1; }} }} let total = 0; let \
+         i = 0; while (i < {ATTEMPTS}) {{ total = total + guarded(i); i = i + 1; }}"
+    ));
+    group.bench_function("return_through_a_finally", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&finally_return))));
+    });
+
+    // A throw travelling through a `finally` on its way to a handler outside it. Against
+    // `throw_caught_in_the_same_frame` this is what one `finally` in the path adds to an unwind,
+    // which is the prologue that sets the token plus the dispatch that puts the throw back.
+    let finally_throw = program(&format!(
+        "let total = 0; let i = 0; while (i < {ATTEMPTS}) {{ try {{ try {{ throw i; }} finally {{ \
+         total = total + 1; }} }} catch (e) {{ total = total + e; }} i = i + 1; }}"
+    ));
+    group.bench_function("throw_through_a_finally", |b| {
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        b.iter(|| black_box(interpreter.run(black_box(&finally_throw))));
     });
 
     group.finish();

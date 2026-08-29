@@ -246,10 +246,9 @@ impl Adapter<'_> {
 
     /// Adapt a `try` and its two or three parts.
     ///
-    /// `finally` needs a completion token to route a `return` or a `break` out of the protected
-    /// block through it, and that is the next piece of work rather than this one. It is refused by
-    /// its own name so that a program using it is told which half is missing, and the field is
-    /// carried on the tree anyway so that the shape does not change when it arrives.
+    /// All three are separate fields rather than two shapes, because the grammar allows a `catch`
+    /// alone, a `finally` alone and both, and lowering wants to know which of the three it has
+    /// rather than to work it out from a tree that has already picked a nesting.
     fn try_statement(
         &self,
         node: &oxc::TryStatement<'_>,
@@ -264,9 +263,6 @@ impl Adapter<'_> {
             Some(finalizer) => Some(self.block(finalizer, strict)?),
             None => None,
         };
-        if finally.is_some() {
-            return self.refuse("a finally clause", node.span);
-        }
         Ok(Stmt::new(
             span(node.span),
             StmtKind::Try {
@@ -1286,10 +1282,6 @@ mod tests {
         // This list is the M1 work list read backwards, and every line of it should disappear.
         assert_eq!(refused("t.js", "for (;;) {}"), "a for loop");
         assert_eq!(refused("t.js", "for (const x of xs) {}"), "a for of loop");
-        assert_eq!(
-            refused("t.js", "try { f(); } finally {}"),
-            "a finally clause"
-        );
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
         assert_eq!(refused("t.js", "let f = () => 1;"), "an arrow function");
@@ -1344,19 +1336,24 @@ mod tests {
     }
 
     #[test]
-    fn a_finally_clause_is_refused_by_its_own_name() {
-        // Refused rather than dropped, because a `finally` that quietly did not run would turn a
-        // program that releases a resource into a program that does not. Running one needs a
-        // completion token to route a `return` out of the protected block through it, and that is
-        // the next piece of work rather than this one.
-        assert_eq!(
-            refused("t.js", "try { f(); } finally { g(); }"),
-            "a finally clause"
-        );
-        assert_eq!(
-            refused("t.js", "try { f(); } catch (e) {} finally { g(); }"),
-            "a finally clause"
-        );
+    fn a_try_can_have_a_finally_with_or_without_a_catch() {
+        // Both shapes are legal and they lower differently, so the tree has to keep them apart
+        // rather than inventing a catch that rethrows for the one that does not have one.
+        let StmtKind::Try { catch, finally, .. } =
+            one("t.js", "try { f(); } finally { g(); }").kind
+        else {
+            panic!("expected a try");
+        };
+        assert!(catch.is_none());
+        assert_eq!(finally.expect("there is a finally").body.len(), 1);
+
+        let StmtKind::Try { catch, finally, .. } =
+            one("t.js", "try { f(); } catch (e) {} finally { g(); }").kind
+        else {
+            panic!("expected a try");
+        };
+        assert!(catch.is_some());
+        assert!(finally.is_some());
     }
 
     #[test]
