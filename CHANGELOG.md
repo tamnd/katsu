@@ -2,6 +2,88 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.2
+
+The second patch release of M1, five pull requests on from 0.1.1, and all five are control flow. Exceptions run, `finally` runs, strict mode takes names away before a program starts, every counting loop runs, and a `break` or a `continue` can name the loop it means. Between them these are the last pieces of statement level JavaScript that need nothing from the object model, so what stands in front of the rest of the language now is prototypes rather than more grammar.
+
+### Exceptions
+
+`throw` is one opcode, a `try` is no opcodes at all, and where a throw goes is decided by walking a handler table the frontend wrote, in #52. That is the trade the JVM takes and for the same reason: a `try` inside a hot loop is common and a throw inside one is not.
+
+Lowering pushes a table entry after it has finished the block that entry protects, so a nested `try` lands earlier in the table than the one around it, and "the first entry containing the throwing instruction" and "the innermost handler" become the same sentence rather than two rules that have to be kept in step. The range is half open and stops before the handler starts, which is what makes a `throw` written inside a `catch` not caught by the `catch` it is written in. The search crosses frames: a frame with no handler for the instruction it stopped at is popped, and the frame underneath resumes at the call that got it there.
+
+Three errors are not catchable, and it is a list one function checks rather than a flag on each variant: out of memory, an interrupt, and an opcode this build has not written yet. The first two are not catchable under node either, and the third is a gap in katsu rather than an event in the program, so letting a `catch` swallow one would turn a missing feature into a wrong answer. A stack overflow is catchable, because node reports it as a `RangeError` a `try` can take.
+
+An engine error stays a name and a message until something catches it and becomes an object with those two as own properties at the moment a handler takes it, so the allocation is paid at the `catch` rather than at the throw. It is not an `Error` yet in the sense that there is nothing for it to be an instance of, so `e.name` and `e.message` read correctly while `e instanceof Error` and `e.stack` wait on prototypes and source spans.
+
+### `finally`
+
+A `catch` runs on one way out of a block and a `finally` runs on all five, so it could not be another entry in the handler table, which only knows about throwing. What it is instead, in #53, is a body with one entry point reached from the normal path and from every abrupt one, and a dispatch after it that sends the completion on to wherever it was going. Two registers carry that: a token saying which of the five ways out this was, and a payload holding what the completion carries. A normal completion sets the token to zero and zero is falsy, so the dispatch is one `jump_if_false` on the path nearly every `finally` takes, and a throw needs no jump into the body at all because the handler entry names the body's prologue directly.
+
+The dispatch only asks about the completions that actually routed through, so a `try` and `finally` with nothing abrupt inside it has no comparison anywhere, and the last kind never needs a test because a token that is not zero and is not any of the kinds already asked about can only be the one remaining.
+
+The override rule fell out of the frame ordering rather than being written. The frame is pushed while the protected block is lowered and popped before the body is lowered, so a `return` written inside a `finally` is lowered against whatever is outside the construct and leaves rather than routing back into the body it is written in, which is what makes `try { return 1; } finally { return 2; }` answer two. Nesting needs nothing that knows about nesting either, since each dispatch arm re issues its completion through the same three functions an ordinary statement goes through. No opcode was added and the interpreter did not change by one line, which is what the instruction set spec predicted when it dropped `ReThrow`.
+
+### Strict mode takes names away
+
+`"use strict"; var public = 1;` and `"use strict"; eval = 42;` are both `SyntaxError`s before a line of either program runs, and until #54 we ran them happily. There are two rules here and they are not the same rule. Nine words stop being identifiers entirely, `implements`, `interface`, `let`, `package`, `private`, `protected`, `public`, `static` and `yield`, and reading one is enough, so `public;` on its own is an error even though there is nothing to bind. `eval` and `arguments` stay perfectly good names to read and are refused only where a program moves one, which is a `var`, a `let`, a `const`, a function name, a parameter, a catch parameter or an assignment target.
+
+Two words are missing from the nine on purpose. `enum` is reserved in both modes rather than only in strict code, so the parser rejects it before the adapter sees it, and `await` is not a strict mode reserved word at all since what makes it special is a module or an async function. A property name is never checked by either rule, so `o.public` stays legal. The function name is checked against the function's own strictness rather than the enclosing one, so `function eval() { "use strict"; }` is refused from a sloppy file, which is why that check sits after the body's directives have been read.
+
+Five test262 cases went straight from failures to passes, all five directive prologue tests that write a strict mode violation after a `throw` that must never be reached, so they only pass if the violation is found before anything runs.
+
+### Every counting loop
+
+`while` was the only loop this engine ran until #55, so `for (let i = 0; i < n; i++)` was refused by name and so was `do { } while (c)`. They are three layouts and not one layout with a flag, because the whole difference between them is where the test sits relative to the body. A `do while` puts the body at the top and its `continue` goes to the start of the test rather than to the back edge, since landing on the back edge would skip the condition and turn `do { continue; } while (false)` into an endless loop. A `for` is head, test, body, update, back edge, so its `continue` lands on the update, which is what makes a `continue` in a counting loop terminate when the same `continue` in the `while` it desugars to would not.
+
+Every part of a `for` head is optional and every part that is absent costs nothing. An absent test emits no comparison at all rather than a comparison against a constant, so `for (;;)` is a tighter loop than `while (true)` and needs no implicit return after it. The head opens one block scope covering the init, the test, the update and the body, and it is declared before its own initialiser is walked, which is the only reason `for (let i = i; ;)` is a dead zone error rather than a read of an outer `i`.
+
+One thing about loops is knowingly wrong and it is written down rather than left to be found. A `let` head gets one binding per call and not one per iteration, because environments here are per function, so `for (let i = 0; i < 2; i++)` with a closure made in each iteration gives `0 1` in node and `2 2` here. It reproduces on a `while` around a block too, so it is not something the loop work introduced, and fixing it needs block level environments.
+
+### Labels
+
+A label was refused by name until #56, so the only way out of a nested loop was a flag and a second test, and there was no way at all to leave a plain block early. This is a change to the frame stack rather than a new statement shape: a loop and a switch already push a frame that collects the jumps aimed at them, so a label written on one is handed to that frame instead of building a second one around it, a label on anything else pushes a frame that collects breaks and nothing else, and a jump searches outwards for the frame wearing the name rather than taking the nearest one.
+
+The case that needed more than a search is a labelled jump leaving through a `finally`, because by the time the dispatch after the body runs, the frame the jump was aimed at is gone. Each distinct labelled target routing through one `finally` gets a token value of its own, allocated per function and deduplicated, so two different labelled breaks through one `finally` end up in two different places and a `finally` with no labelled jump through it compares exactly the numbers it always did.
+
+Labels and variables turn out to be two namespaces that never meet, so `let x = 1; x: while (0);` is legal, and a duplicate label is an early error only when one encloses the other. Every rule was measured against node rather than remembered, and the three early error messages are node's word for word.
+
+### Where the numbers stand
+
+Exceptions, measured per loop iteration on `gamingpc-win` pinned to one performance core. The table is on that machine rather than the m4 because the m4 was indexing photos throughout the session and moved by more between reruns than several of the differences below.
+
+| Operation | gamingpc-win |
+|---|---|
+| An iteration of a plain loop, for scale | 14.29 ns |
+| The same iteration wrapped in a `try` that never fires | 15.14 ns |
+| The same iteration wrapped in a `finally` that always runs | 19.09 ns |
+| An iteration that throws a number and catches it in the same frame | 16.36 ns |
+| The same throw travelling through one `finally` on its way out | 27.76 ns |
+| A call and a `return`, for scale | 23.98 ns |
+| The same `return` routed through a `finally` | 41.57 ns |
+| A throw caught three frames up | 51.54 ns |
+| A caught `TypeError` instead of a caught number | 196.58 ns |
+
+Entering a `try` costs 0.85 ns, which is one `jump` per exit over the handler and one register of frame width, and both go away by lowering the handler out of line. A `finally` that never fires abruptly costs 4.80 ns over a plain loop, which is three instructions on the normal path plus two registers, and against 1.55 ns per instruction that is the whole of it, so nothing is hiding. It is about five times what a `catch` costs, and the reason is not the token, it is that a `catch` gets to be zero instructions on the path that does not throw and a `finally` cannot be.
+
+Two numbers are worth acting on. Routing a `return` through a `finally` costs 17.59 ns, and most of it is a `strict_equal` going through an inline cache and a general comparison in order to ask whether a small integer written one instruction ago equals a small integer constant. A compare against an immediate would answer that without either, and that opcode does not exist because nothing needed it before. And a caught `TypeError` is 180 ns more than a caught number, most of which is a `format!` and a `String` built at the throw site before anything knows whether a handler exists, which would move behind the same test that already defers the object.
+
+Unwinding got sharper on a machine that can be pinned. Three frames of distance costs 35.18 ns and three calls on the same machine in the same session are 33.30 ns of it, so a frame pop and a missed table is about 0.6 ns rather than the 3.4 ns the noisy m4 numbers suggested.
+
+### Where the conformance number stands
+
+It moved from 6.65% to 6.66%, which is 5,410 of the 81,225 cases attempted, and the shape of that is more useful than the figure. 75,807 cases stop on the same line of the suite's own harness, `throw new Test262Error(message)`. The wall used to be the `switch` above that line, then the `try` on it, and it has now moved along the line to the `new`. Each statement implemented moves it by one construct rather than knocking it down, and the one left needs constructors and therefore prototypes, so for the first time the answer is a piece of the object model rather than more grammar.
+
+Two of the five releases in this cut moved the number by nothing at all, and that was measured rather than assumed by building `main` into a separate target directory and running both. A filtered run of `language/statements/for` reports the same 75 passing with the loops implemented as without them, and `language/statements/labeled` reports the same 15 passing before and after labels. The suite does not get to see either piece of work until constructors land.
+
+### What the harness found
+
+Three of the five pull requests changed the differential generator, and the run is now seven thousand generated programs plus a nine file corpus, agreeing with node on every one across two runs at different seeds.
+
+The `try` production has two decisions in it that are what make its programs able to fail. The throw is drawn rather than always emitted, because a `try` that always fires never runs the path almost every real `try` takes, and the handler assigns the caught value to a binding declared outside the `try`, because a generated handler mentions the caught name only by accident and without somewhere to put it both paths would print the same thing. The loop production draws between all three forms, and only the `for` keeps its counter in the head, because its update runs on the way round even after a `continue` skipped the rest of the body. The label productions track two lists rather than one, because every labelled statement is something a `break` can name and only the ones on loops are something a `continue` can name.
+
+Labels also found a crash that predated them by two milestones. Annex B lets sloppy code write a function declaration as the single statement of an `if` or under a label, and node runs `if (c) function f(){}` while refusing it in strict mode. katsu panicked on all of them, because nothing declared the name and the scope pass then looked it up. It is refused by name now, which is an honest answer where a crash was telling the user nothing about their program.
+
 ## 0.1.1
 
 The first patch release of M1, three pull requests on from 0.1.0, and between them they replace the two biggest holes in the middle of the language. There is a `switch` and there are objects.
