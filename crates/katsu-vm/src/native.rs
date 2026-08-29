@@ -7,8 +7,9 @@
 //!
 //! # The calling convention
 //!
-//! A native takes the interpreter and a slice of arguments, and returns a value or an error. That is
-//! the whole of it, and each of the three parts is the way it is for a reason.
+//! A native takes the interpreter, the receiver it was called on, and a slice of arguments, and
+//! returns a value or an error. That is the whole of it, and each of the four parts is the way it is
+//! for a reason.
 //!
 //! It takes `&mut Interpreter` because everything a native does needs the isolate: allocating the
 //! string it returns, reading the string it was passed, printing a value. Handing it something
@@ -19,6 +20,14 @@
 //! length of the call, so the arguments are copied out of the caller's registers first. Eight of
 //! them fit without allocating, which covers every builtin worth writing, and the ninth spills to
 //! the heap for that one call.
+//!
+//! The receiver is an option and not a value, and the difference is the same one [`Frame::receiver`]
+//! makes: `None` means the call site supplied nothing rather than that it supplied `undefined`. A
+//! builtin is neither strict nor sloppy, so what a plain call to one means depends on the code that
+//! made the call, which is not something the native can see. Almost every native ignores it, and the
+//! ones that do not go through [`this_value`], which refuses by name rather than guessing.
+//!
+//! [`Frame::receiver`]: crate::stack::Frame::receiver
 //!
 //! The slice is exactly as long as the call site passed, which is not the same as what the native
 //! declares. JavaScript pads a short call with `undefined` and drops a long one's extras, and a
@@ -44,7 +53,25 @@ use crate::interpret::{Interpreter, RuntimeError};
 /// A plain function pointer and not a boxed closure, because a native closing over state would be
 /// state the collector cannot see and the AOT image cannot serialise. What a native needs to reach,
 /// it reaches through the interpreter it was handed.
-pub type NativeFn = fn(&mut Interpreter, &[Value]) -> Result<Value, RuntimeError>;
+pub type NativeFn = fn(&mut Interpreter, Option<Value>, &[Value]) -> Result<Value, RuntimeError>;
+
+/// The receiver a native was called on, for a native that cannot work without one.
+///
+/// `None` means a plain call, and what `this` is in one depends on whether the code that made the
+/// call is strict, which a builtin has no way to ask. Node answers `globalThis` for the sloppy case
+/// and there is no global object yet, so this refuses by name instead of picking one of the two
+/// answers and being wrong about half the calls.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Unsupported`] when nothing was supplied.
+pub fn this_value(receiver: Option<Value>, name: &str) -> Result<Value, RuntimeError> {
+    receiver.ok_or_else(|| {
+        RuntimeError::Unsupported(format!(
+            "{name} called on nothing needs globalThis, which is not implemented yet"
+        ))
+    })
+}
 
 /// One argument, padded with `undefined` the way a call in the language is.
 ///

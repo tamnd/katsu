@@ -40,6 +40,7 @@ const THREE: Invocation = Invocation {
     function: 0,
     return_pc: 0,
     return_to: Register(0),
+    receiver: Value::EMPTY,
 };
 
 fn calls(c: &mut Criterion) {

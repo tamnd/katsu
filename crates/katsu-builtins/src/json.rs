@@ -77,7 +77,11 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
 }
 
 /// `JSON.stringify(value, replacer, space)`.
-fn stringify(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn stringify(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let replacer = arg(args, 1);
     if interpreter.is_callable(replacer) {
         return Err(RuntimeError::Unsupported(
@@ -109,7 +113,11 @@ fn stringify(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, Run
 /// one of those programs would take "katsu has not written this yet" for "the input was not JSON",
 /// and would go down its error path with an answer that looks reasonable and is wrong.
 #[allow(clippy::unnecessary_wraps)]
-fn parse(_interpreter: &mut Interpreter, _args: &[Value]) -> Result<Value, RuntimeError> {
+fn parse(
+    _interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    _args: &[Value],
+) -> Result<Value, RuntimeError> {
     Err(RuntimeError::Unsupported(
         "JSON.parse is not supported yet, because it needs arrays".to_owned(),
     ))

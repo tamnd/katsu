@@ -44,7 +44,11 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
 /// `String()` with nothing at all is the empty string and not `"undefined"`, which is the one case
 /// where the missing argument is not simply `undefined` padded in. The specification says so
 /// explicitly and it is the reason [`arg`] is not enough on its own here.
-fn string(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn string(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let text = if args.is_empty() {
         String::new()
     } else {
