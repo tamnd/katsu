@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "tools/*", "xtask"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -13,20 +13,20 @@ authors = ["The katsu authors"]
 
 [workspace.dependencies]
 # Internal crates. One version number across the whole workspace, released in lockstep.
-katsu-aot = { version = "0.1.1", path = "crates/katsu-aot" }
-katsu-api = { version = "0.1.1", path = "crates/katsu-api" }
-katsu-builtins = { version = "0.1.1", path = "crates/katsu-builtins" }
-katsu-gc = { version = "0.1.1", path = "crates/katsu-gc" }
-katsu-ir = { version = "0.1.1", path = "crates/katsu-ir" }
-katsu-jit = { version = "0.1.1", path = "crates/katsu-jit" }
-katsu-loop = { version = "0.1.1", path = "crates/katsu-loop" }
-katsu-macros = { version = "0.1.1", path = "crates/katsu-macros" }
-katsu-node = { version = "0.1.1", path = "crates/katsu-node" }
-katsu-parse = { version = "0.1.1", path = "crates/katsu-parse" }
-katsu-platform = { version = "0.1.1", path = "crates/katsu-platform" }
-katsu-runtime = { version = "0.1.1", path = "crates/katsu-runtime" }
-katsu-stencils = { version = "0.1.1", path = "crates/katsu-stencils" }
-katsu-vm = { version = "0.1.1", path = "crates/katsu-vm" }
+katsu-aot = { version = "0.1.2", path = "crates/katsu-aot" }
+katsu-api = { version = "0.1.2", path = "crates/katsu-api" }
+katsu-builtins = { version = "0.1.2", path = "crates/katsu-builtins" }
+katsu-gc = { version = "0.1.2", path = "crates/katsu-gc" }
+katsu-ir = { version = "0.1.2", path = "crates/katsu-ir" }
+katsu-jit = { version = "0.1.2", path = "crates/katsu-jit" }
+katsu-loop = { version = "0.1.2", path = "crates/katsu-loop" }
+katsu-macros = { version = "0.1.2", path = "crates/katsu-macros" }
+katsu-node = { version = "0.1.2", path = "crates/katsu-node" }
+katsu-parse = { version = "0.1.2", path = "crates/katsu-parse" }
+katsu-platform = { version = "0.1.2", path = "crates/katsu-platform" }
+katsu-runtime = { version = "0.1.2", path = "crates/katsu-runtime" }
+katsu-stencils = { version = "0.1.2", path = "crates/katsu-stencils" }
+katsu-vm = { version = "0.1.2", path = "crates/katsu-vm" }
 
 # Frontend. See spec/04-frontend.md and open question Q9.
 oxc_allocator = "0.147.0"
