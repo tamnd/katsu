@@ -3,9 +3,9 @@
   "suite": "ac7b5f8c39c27b55176c20ead2a69b1402d0d1d3",
   "summary": {
     "total": 92709,
-    "passed": 5405,
+    "passed": 5410,
     "failed": 7,
-    "unsupported": 75813,
+    "unsupported": 75808,
     "skipped": 11484
   },
   "passing": [
@@ -134,6 +134,11 @@
     "language/comments/multi-line-html-close-extra.js (strict)",
     "language/comments/single-line-html-close-without-lt.js (sloppy)",
     "language/comments/single-line-html-close-without-lt.js (strict)",
+    "language/directive-prologue/10.1.1-2gs.js",
+    "language/directive-prologue/10.1.1-5gs.js",
+    "language/directive-prologue/10.1.1-8gs.js",
+    "language/directive-prologue/14.1-4gs.js",
+    "language/directive-prologue/14.1-5gs.js",
     "language/expressions/arrow-function/dflt-params-rest.js (sloppy)",
     "language/expressions/arrow-function/dflt-params-rest.js (strict)",
     "language/expressions/arrow-function/dstr/ary-ptrn-rest-init-ary.js (sloppy)",
