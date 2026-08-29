@@ -2,6 +2,65 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.3
+
+The third patch release of M1, three pull requests on from 0.1.2, and all three exist so that a program can measure itself and say what it found. `performance.now()` and `performance.timeOrigin` are there, `String()` and `JSON.stringify()` are there, and with those four names the `fib` workload in tamnd/katsu-bench runs end to end. This release is the first one that publishes a compute number about katsu, and the number is bad.
+
+### A program can time itself
+
+`performance.now()` and `performance.timeOrigin`, in #59. Not ECMAScript, it is the W3C High Resolution Time specification, and it is here for the same reason `console` is: from a program's point of view it is simply there, and every benchmark harness worth reading uses it rather than `Date.now()`, which is whole milliseconds off a wall clock that can move backwards under an NTP correction while the work being timed is still running.
+
+It takes two clocks and the pair is not redundant. Elapsed time comes from the monotonic clock, because that is the only one that cannot go backwards. The origin comes from the wall clock, because `timeOrigin` is defined as milliseconds since the Unix epoch and a monotonic clock has no epoch, its zero being the boot time on Linux and something undocumented on macOS. The two are read within nanoseconds of each other at startup so that `timeOrigin + now()` lands on `Date.now()`, and there is a test that asserts exactly that, because it is what catches an origin taken from the wrong clock.
+
+The origin is stamped from the first statement of `main`, before argument parsing and before the logger. That is a deliberate choice about what a program is allowed to see: it puts katsu's own startup inside katsu's own numbers rather than excluding it. An embedder that calls the library instead of the binary gets a lazy stamp on the first read, which is the right answer there for a different reason, since a host process that has been up for six hours has a process start that is not the runtime's beginning.
+
+Nothing is coarsened. Browsers round `performance.now()` to five microseconds because a high resolution timer in a page shared with an attacker is half a Spectre gadget, and that reasoning does not apply to a program you chose to run. Node does not coarsen either, measuring about 400 ns between consecutive calls, and katsu matches node.
+
+### A program can print what it computed
+
+`String()` and `JSON.stringify()`, in #62.
+
+`String(x)` does not carry its own copy of the conversion rules. `coerce_to_string` was split into the half that allocates and `text_of`, which is the rules, and `String(x)` and `'' + x` now go through the same `text_of`. These are one conversion in the language, the number to text half of it is the shortest round tripping decimal with ties broken towards even, and the differential harness has already caught us getting that wrong once. Two copies would eventually be two answers. There is a test that walks every value this build can produce and asserts the two agree on all of them, with `-0` in the list on purpose because it is the value most likely to make them diverge.
+
+The two cases where `String(x)` and `console.log(x)` are specified to differ are tested from both sides. `String(-0)` is `0` and the console prints `-0`, because a console that cannot tell you which zero you have is hiding the thing you turned it on to see. `String({a: 1})` is `[object Object]` and the console prints `{ a: 1 }`.
+
+Every rule in `JSON.stringify` was run under node v26.8.1 and copied down rather than remembered, which caught four things that are easy to get wrong from memory. The indent clamps at ten rather than being unbounded, in both its number and its string form. An empty object stays `{}` on one line even when an indent was asked for, and so does an object whose every property turned out to have no JSON spelling. A property whose value is `undefined` or a function takes its name with it, so a reader cannot tell it apart from a property that was never there. And a cycle is a `TypeError` reading "Converting circular structure to JSON", node's exact sentence, so a program matching on the message cannot tell which engine it is under. The cycle check is a stack of the objects currently being written rather than a set of the objects seen, which is the difference between a real cycle and the same object appearing twice side by side, and that distinction has its own test.
+
+### Refusing by name
+
+There is a new error variant, `Unsupported`, and it changes how gaps in the standard library get reported from here on. `NotImplemented` names an opcode and a function written in Rust has no opcode to point at, so until now a half built builtin had no way to say whose gap it was.
+
+`JSON.parse` is the first user. It is present and refuses instead of being absent, because a missing method arrives as `JSON.parse is not a function`, which is an ordinary JavaScript error that a program will feature detect around and a reader will take for a bug in their own code. It is deliberately not catchable, and that is the sharper half of the argument: wrapping `JSON.parse` in a `try` is how everybody writes it, because malformed input is the expected case, so a catchable gap of ours would be read as bad input and the program would go down its error path with an answer that looks reasonable and is wrong.
+
+### Where the numbers stand
+
+The first compute number this project has published about itself. `fib.js` from tamnd/katsu-bench, medians of five consecutive runs of each runtime on the same m4 in the same session, reported by the workload's own `performance.now()` timing rather than by wall clock around the process.
+
+| Runtime | fib(35) compute | Against katsu |
+|---|---|---|
+| katsu 0.1.3 | 1,055 ms | |
+| node v26.8.1 | 63 ms | 16.7x faster |
+| bun | 45 ms | 23.4x faster |
+| deno | 68 ms | 15.5x faster |
+
+That is the whole of it and it is not close. `fib` is a call benchmark wearing an arithmetic benchmark's clothes, one comparison and one addition per call and nothing else, so it punishes exactly the three things this build does not have, which are inline caches, shape guards and a JIT. Two of those are on the M1 list and the third is M3. The number is published rather than held back until it improves, because the 10x goal has to be measured from a real starting point and a baseline nobody publishes is a baseline nobody is held to.
+
+One of the six compute workloads runs, up from none. What the other five stop on is three known pieces of work rather than five: `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` fills the 4 GiB cage and dies because there is no collector.
+
+Startup is measured differently now and by the runtime itself, since `performance.now()` at the first line of a program is exactly the question "how long did this runtime take to get here". katsu reaches it in 0.52 ms against node's 36.2 ms and bun's 9.9 ms, medians of five with the cold first run dropped. The m4 was loaded during this session and every absolute in that sentence is higher than the same machine gives when it is quiet, which is why the ratio is the part to read.
+
+An attempt at microbenchmarking the two new builtins from JavaScript was made and thrown away rather than published. Twenty identical two hundred thousand iteration runs of the same loop, back to back in one process, ranged from 66 ns to 888 ns per iteration and came back down again, which is a busy laptop and not a finding. Those numbers belong on the pinned hardware the benchmark repository is being pointed at, and they will be taken there rather than guessed at here.
+
+### Where the conformance number stands
+
+6.66%, unchanged, and it was expected to be unchanged. 75,807 cases still stop on the `new` in `throw new Test262Error(message)` before they reach any line a builtin could answer, so a standard library addition cannot move this number until constructors land. That is the same wall the last two releases described and it has not moved because nothing in this cut was aimed at it.
+
+### Also
+
+The differential harness got a tenth corpus file, `serialization.js`, sixty assertions on `String` and `JSON.stringify` run against node directly. The generator does not emit either call, so the property based half of the harness would not have covered any of this on its own. A full run is 2,009 programs and 2,009 agreements.
+
+The node oracle in that harness now gets thirty seconds rather than five, in #61, and the reason is worth writing down because it is not the obvious one. Five seconds was never a budget for how long a program takes to run, it was a budget for how long a process takes to exist, and spawning node means the operating system opening a hundred and thirty nine megabytes of executable on a shared runner with an antivirus that reads the whole file first. It produced a false failure on Windows where katsu printed the right answer for `console.log(0.1 + 0.2)` and node never printed anything, and the harness reported that as node breaking. Catching a real hang thirty seconds late costs one run. Failing a green build because a shared runner stalled costs the harness its credibility.
+
 ## 0.1.2
 
 The second patch release of M1, five pull requests on from 0.1.1, and all five are control flow. Exceptions run, `finally` runs, strict mode takes names away before a program starts, every counting loop runs, and a `break` or a `continue` can name the loop it means. Between them these are the last pieces of statement level JavaScript that need nothing from the object model, so what stands in front of the rest of the language now is prototypes rather than more grammar.
