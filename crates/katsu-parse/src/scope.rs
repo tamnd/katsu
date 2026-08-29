@@ -320,6 +320,8 @@ struct Frame {
     loops: usize,
     /// The enclosing function's count of loops and switches together.
     breakables: usize,
+    /// How many labels were in scope outside this function, so they can be hidden and put back.
+    labels: usize,
 }
 
 /// One identifier occurrence, before slots exist.
@@ -345,6 +347,25 @@ struct Analyser {
     /// inside one is not, and both counters reset at a function boundary because a `break` cannot
     /// leave the function it was written in.
     breakables: usize,
+    /// The labels enclosing the statement being walked, innermost last.
+    ///
+    /// A stack rather than a set, because the two questions asked of it are whether a name is in it
+    /// at all, which decides an undefined label, and what the statement wearing that name is, which
+    /// decides whether a `continue` can aim at it. The names in it are unique by construction, since
+    /// a label nested inside another of the same name is an early error, so looking one up by name
+    /// is unambiguous wherever it is done.
+    labels: Vec<Label>,
+}
+
+/// One label in scope, and whether a `continue` is allowed to aim at it.
+struct Label {
+    name: String,
+    /// True if the statement the label names is a loop, looking through any labels in between.
+    ///
+    /// `break` works on any labelled statement and `continue` works only on a loop, which is why
+    /// this is recorded when the label goes on rather than worked out when a jump asks. By then the
+    /// statement it names is somewhere up the call stack rather than in hand.
+    iteration: bool,
 }
 
 impl Analyser {
@@ -428,9 +449,13 @@ impl Analyser {
             base: self.blocks.len(),
             loops: self.loops,
             breakables: self.breakables,
+            labels: self.labels.len(),
         });
         // A `break` cannot leave the function it was written in, so a function written inside a
-        // loop starts the count again rather than inheriting it.
+        // loop starts the count again rather than inheriting it. The labels outside are invisible
+        // for the same reason, which is what the frame's recorded length is for: a lookup only sees
+        // the labels added since, so `l: while (0) { function g() { break l; } }` is an undefined
+        // label in node and here rather than a jump out of a call.
         self.loops = 0;
         self.breakables = 0;
         self.push_block(span);
@@ -444,6 +469,7 @@ impl Analyser {
         self.blocks.truncate(frame.base);
         self.loops = frame.loops;
         self.breakables = frame.breakables;
+        self.labels.truncate(frame.labels);
     }
 
     fn push_block(&mut self, span: Span) {
@@ -588,7 +614,11 @@ impl Analyser {
                         self.hoist_vars(std::slice::from_ref(alternate))?;
                     }
                 }
-                StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+                // A label is in here because it is transparent to hoisting, since `x: var i = 1;`
+                // declares `i` in the function exactly as the same line without the label would.
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::Labeled { body, .. } => {
                     self.hoist_vars(std::slice::from_ref(body))?;
                 }
                 // The head is looked at as well as the body, because `for (var i = 0; ;)` declares
@@ -762,26 +792,9 @@ impl Analyser {
                 self.blocks.pop();
                 result?;
             }
-            // Both are early errors rather than runtime ones, and the messages are Node's word for
-            // word, because a program that fails to parse in one engine and parses in another is
-            // the most confusing kind of incompatibility there is.
-            StmtKind::Break => {
-                if self.breakables == 0 {
-                    return Err(ScopeError {
-                        span: statement.span,
-                        message: "Illegal break statement".to_owned(),
-                    });
-                }
-            }
-            StmtKind::Continue => {
-                if self.loops == 0 {
-                    return Err(ScopeError {
-                        span: statement.span,
-                        message: "Illegal continue statement: no surrounding iteration statement"
-                            .to_owned(),
-                    });
-                }
-            }
+            StmtKind::Labeled { label, body } => self.labeled(label, body)?,
+            StmtKind::Break(label) => self.jump(statement.span, label.as_ref(), true)?,
+            StmtKind::Continue(label) => self.jump(statement.span, label.as_ref(), false)?,
             StmtKind::Throw(value) => self.expression(value)?,
             StmtKind::Try {
                 block,
@@ -791,6 +804,93 @@ impl Analyser {
             StmtKind::Empty => {}
         }
         Ok(())
+    }
+
+    /// Walk a labelled statement, with its name in scope for the statement it names.
+    ///
+    /// The name goes on before the body is walked and comes off after, which is the whole of a
+    /// label's scope. It is not a binding and it goes nowhere near the block scopes, so `let x = 1;
+    /// x: while (0);` is two different `x`es and legal, which it is in node.
+    ///
+    /// A label nested inside another of the same name is an early error, and that is what keeps
+    /// every name in the stack unique and makes looking one up by name unambiguous. Two labels of
+    /// the same name side by side are fine, because the first is off the stack before the second
+    /// goes on.
+    fn labeled(&mut self, label: &Ident, body: &Stmt) -> Result<(), ScopeError> {
+        let base = self.frames.last().map_or(0, |frame| frame.labels);
+        if self.labels[base..]
+            .iter()
+            .any(|held| held.name == label.name)
+        {
+            return Err(ScopeError {
+                span: label.span,
+                message: format!("Label '{}' has already been declared", label.name),
+            });
+        }
+
+        self.labels.push(Label {
+            name: label.name.clone(),
+            iteration: is_iteration(body),
+        });
+        let result = self.statement(body);
+        self.labels.pop();
+        result
+    }
+
+    /// Find the label a `break` or a `continue` is aiming at, refusing one that names nothing.
+    ///
+    /// The search starts at the innermost function's own labels rather than at the bottom of the
+    /// stack, because a label outside the function a jump is written in is not a label that jump
+    /// can see.
+    fn label(&self, label: &Ident) -> Result<&Label, ScopeError> {
+        let base = self.frames.last().map_or(0, |frame| frame.labels);
+        self.labels[base..]
+            .iter()
+            .rev()
+            .find(|held| held.name == label.name)
+            .ok_or_else(|| ScopeError {
+                span: label.span,
+                message: format!("Undefined label '{}'", label.name),
+            })
+    }
+
+    /// Check that a `break` or a `continue` has somewhere legal to go.
+    ///
+    /// All three messages are early errors rather than runtime ones, and all three are Node's word
+    /// for word, because a program that fails to parse in one engine and parses in another is the
+    /// most confusing kind of incompatibility there is.
+    ///
+    /// The two jumps differ in what satisfies them. A `break` needs a loop or a switch, and with a
+    /// label it needs neither, because it aims at a statement and every kind of statement can be
+    /// labelled. That is the one jump that can leave a plain block, which is what `x: { break x; }`
+    /// is for. A `continue` needs a loop either way, and with a label it needs that label to be on
+    /// one.
+    fn jump(&mut self, span: Span, label: Option<&Ident>, leaving: bool) -> Result<(), ScopeError> {
+        let Some(label) = label else {
+            let open = if leaving { self.breakables } else { self.loops };
+            if open > 0 {
+                return Ok(());
+            }
+            return Err(ScopeError {
+                span,
+                message: if leaving {
+                    "Illegal break statement".to_owned()
+                } else {
+                    "Illegal continue statement: no surrounding iteration statement".to_owned()
+                },
+            });
+        };
+
+        if self.label(label)?.iteration || leaving {
+            return Ok(());
+        }
+        Err(ScopeError {
+            span,
+            message: format!(
+                "Illegal continue statement: '{}' does not denote an iteration statement",
+                label.name
+            ),
+        })
     }
 
     /// Walk what a list of bindings initialises itself to, and record each declared name.
@@ -1150,6 +1250,19 @@ impl Analyser {
     }
 }
 
+/// Whether a `continue` is allowed to aim at the statement a label names.
+///
+/// Labels stack, so `a: b: for (;;)` puts both names on the same loop and a `continue` is allowed
+/// to use either. That is why this looks through labels rather than only at the statement directly
+/// under the one being asked about.
+fn is_iteration(statement: &Stmt) -> bool {
+    match &statement.kind {
+        StmtKind::While { .. } | StmtKind::DoWhile { .. } | StmtKind::For { .. } => true,
+        StmtKind::Labeled { body, .. } => is_iteration(body),
+        _ => false,
+    }
+}
+
 /// The message every engine uses for a name declared twice, because it ends up in test
 /// expectations that were written against those engines.
 fn already_declared(name: &Ident) -> ScopeError {
@@ -1330,7 +1443,11 @@ mod tests {
                         variable_idents(&finally.body, out);
                     }
                 }
-                StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {}
+                // The label itself is deliberately not collected, because it is not a name in any
+                // scope and a test that treated it as one would be asserting the opposite of what
+                // the two namespaces mean.
+                StmtKind::Labeled { body, .. } => variable_idents(std::slice::from_ref(body), out),
+                StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Empty => {}
             }
         }
     }
@@ -2109,5 +2226,122 @@ mod tests {
 
         let (_, _, message) = refused("for (;;) {} break;");
         assert_eq!(message, "Illegal break statement");
+    }
+
+    #[test]
+    fn a_label_and_a_variable_of_the_same_name_never_meet() {
+        // Labels live in a namespace of their own, so the label here does not shadow the variable
+        // and the variable does not make the label a redeclaration. A pass that put labels in the
+        // scope chain would refuse this program, and Node runs it.
+        let source = "let x = 1; x: while (0) { x = 2; }";
+        let scopes = analysed(source);
+
+        // The declaration and the assignment are the first and the third occurrence, and both are
+        // the same local slot.
+        let declaration = resolved(&scopes, source, "x", 0).resolution;
+        assert!(matches!(declaration, Resolution::Local { .. }));
+        assert_eq!(resolved(&scopes, source, "x", 2).resolution, declaration);
+
+        // The second occurrence is the label, and it has no resolution at all, because it is not a
+        // name in any scope and there is nothing for it to resolve to.
+        assert!(!scopes.references.contains_key(&offset_of(source, "x", 1)));
+    }
+
+    #[test]
+    fn a_label_is_only_a_redeclaration_when_it_encloses_itself() {
+        // Two labels side by side are two separate statements, and the first one is out of scope
+        // by the time the second is read.
+        analysed("x: while (0); x: while (0);");
+        analysed("x: while (0) { } if (1) { x: while (0); }");
+
+        // Nested is the case that collides, directly or through anything in between.
+        assert_eq!(
+            refused("x: x: while (0);").2,
+            "Label 'x' has already been declared"
+        );
+        assert_eq!(
+            refused("x: while (0) { x: while (0); }").2,
+            "Label 'x' has already been declared"
+        );
+    }
+
+    #[test]
+    fn a_label_does_not_cross_a_function_boundary() {
+        // Neither outwards, so a jump inside a nested function cannot aim at a label around it,
+        // which is the rule that keeps a label from becoming a strange kind of return.
+        assert_eq!(
+            refused("l: while (0) { let f = function () { break l; }; }").2,
+            "Undefined label 'l'"
+        );
+
+        // Nor inwards, so a name a nested function used is gone once that function is.
+        assert_eq!(
+            refused("function f() { x: while (0) {} } break x;").2,
+            "Undefined label 'x'"
+        );
+
+        // And because it does not cross, the same name inside and outside is not a collision.
+        analysed("x: while (0) { let f = function () { x: while (0); }; }");
+    }
+
+    #[test]
+    fn a_jump_that_names_a_label_needs_that_label_to_be_in_scope() {
+        analysed("x: while (0) { break x; }");
+        analysed("x: { break x; }");
+
+        assert_eq!(refused("while (0) { break x; }").2, "Undefined label 'x'");
+
+        // Past the labelled statement is not inside it, whichever kind of jump it is.
+        assert_eq!(refused("x: while (0) {} break x;").2, "Undefined label 'x'");
+        assert_eq!(
+            refused("x: while (0) {} continue x;").2,
+            "Undefined label 'x'"
+        );
+    }
+
+    #[test]
+    fn continue_needs_its_label_to_name_a_loop_and_break_takes_anything() {
+        // A `break` aims at a statement and every statement can be labelled, so all of these are
+        // fine, including the ones that are nothing like a loop.
+        analysed("x: { break x; }");
+        analysed("x: if (1) { break x; }");
+        analysed("x: try { break x; } finally {}");
+
+        // A `continue` aims at an iteration, so the same shapes are all refused.
+        assert_eq!(
+            refused("x: { continue x; }").2,
+            "Illegal continue statement: 'x' does not denote an iteration statement"
+        );
+        assert_eq!(
+            refused("x: if (1) { continue x; }").2,
+            "Illegal continue statement: 'x' does not denote an iteration statement"
+        );
+
+        // A chain of labels all denote whatever the innermost one is on, so a `continue` may name
+        // any of them, and a chain that ends in something else denotes nothing for any of them.
+        analysed("a: b: while (0) { continue a; }");
+        analysed("a: b: do { continue a; } while (0);");
+        assert_eq!(
+            refused("a: b: { continue a; }").2,
+            "Illegal continue statement: 'a' does not denote an iteration statement"
+        );
+    }
+
+    #[test]
+    fn a_labelled_statement_is_walked_like_the_statement_it_names() {
+        // The label is not a scope, so a `var` under one still hoists to the function and a `let`
+        // still belongs to the block it is written in.
+        let source = "x: { var counted = 1; } counted;";
+        let scopes = analysed(source);
+        assert!(matches!(
+            resolved(&scopes, source, "counted", 1).resolution,
+            Resolution::Local { .. }
+        ));
+
+        // And a redeclaration under a label is refused exactly as it would be without one.
+        assert_eq!(
+            refused("x: { let a = 1; let a = 2; }").2,
+            "Identifier 'a' has already been declared"
+        );
     }
 }

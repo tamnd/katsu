@@ -136,6 +136,8 @@ pub(crate) fn program(seed: u64, statements: usize) -> Program {
         objects: Vec::new(),
         next: 0,
         loops: 0,
+        breakable: Vec::new(),
+        continuable: Vec::new(),
     };
 
     let mut body = Vec::new();
@@ -179,6 +181,17 @@ struct Builder<'a> {
     /// that runs, and a generator that emitted one would spend its run comparing two engines'
     /// syntax error messages instead of comparing what they compute.
     loops: usize,
+    /// The labels a `break` written here is allowed to name, innermost last.
+    ///
+    /// Every labelled statement is in here, because a `break` aims at a statement and every kind of
+    /// statement can be labelled.
+    breakable: Vec<String>,
+    /// The labels a `continue` written here is allowed to name, innermost last.
+    ///
+    /// Only the labels on loops, because naming anything else is an early error. The two lists are
+    /// kept apart rather than filtered on the way out, since what a label denotes is decided where
+    /// it is written and not where the jump is.
+    continuable: Vec<String>,
 }
 
 impl Builder<'_> {
@@ -188,18 +201,14 @@ impl Builder<'_> {
         // structure is the first level and the rest is width the generator pays for in program size.
         // A jump is drawn before the rest, because it is only legal some of the time and folding it
         // into the main draw would change what every other seed produces depending on where it was.
-        if self.loops > 0 && self.random.chance(8) {
-            return if self.random.chance(2) {
-                "break;".to_owned()
-            } else {
-                "continue;".to_owned()
-            };
+        if (self.loops > 0 || !self.breakable.is_empty()) && self.random.chance(8) {
+            return self.jump();
         }
 
         let choice = if depth >= 2 {
             self.random.below(4)
         } else {
-            self.random.below(9)
+            self.random.below(10)
         };
         match choice {
             0 | 1 => self.declaration(),
@@ -209,8 +218,64 @@ impl Builder<'_> {
             5 => self.branch(depth),
             6 => self.switch_statement(depth),
             7 => self.try_statement(depth),
+            8 => self.labelled_block(depth),
             _ => self.loop_statement(depth),
         }
+    }
+
+    /// A `break` or a `continue`, with a label about half the time there is one to name.
+    ///
+    /// The label is the point. An unlabelled jump leaves the nearest frame and a labelled one walks
+    /// out past however many frames are in between, so two engines can agree on every unlabelled
+    /// jump and still disagree the moment a name is involved. Both are drawn, because an engine
+    /// that got the labelled walk right by accidentally applying it to everything would pass a run
+    /// that only ever named a label.
+    ///
+    /// A labelled `continue` is as safe as an unlabelled one here for the same reason: the loop
+    /// forms this generator emits all move their counter somewhere a `continue` cannot skip, and
+    /// that holds for the outer loops a labelled `continue` can reach as well as the nearest one.
+    fn jump(&mut self) -> String {
+        // A `continue` needs a loop and a `break` needs a loop or a switch, so with only a labelled
+        // block open there is nothing unlabelled that would be legal.
+        let leaving = self.loops == 0 || self.random.chance(2);
+        let names = if leaving {
+            self.breakable.len()
+        } else {
+            self.continuable.len()
+        };
+        if names == 0 || (self.loops > 0 && self.random.chance(2)) {
+            return if leaving {
+                "break;".to_owned()
+            } else {
+                "continue;".to_owned()
+            };
+        }
+
+        let index = self.random.below(names);
+        let name = if leaving {
+            &self.breakable[index]
+        } else {
+            &self.continuable[index]
+        };
+        if leaving {
+            format!("break {name};")
+        } else {
+            format!("continue {name};")
+        }
+    }
+
+    /// A labelled block, which is a `break` target with no loop anywhere near it.
+    ///
+    /// This is the shape that separates leaving a statement from leaving an iteration. An engine
+    /// that treated a label as something only loops carry would have nowhere to send this jump, and
+    /// one that ran the rest of the block anyway would print the difference.
+    fn labelled_block(&mut self, depth: usize) -> String {
+        let name = format!("l{}", self.next);
+        self.next += 1;
+        self.breakable.push(name.clone());
+        let body = self.block(depth + 1);
+        self.breakable.pop();
+        format!("{name}: {{ {body} }}")
     }
 
     /// `let v3 = <expr>;`, and the name becomes visible to everything after it.
@@ -343,13 +408,35 @@ impl Builder<'_> {
         self.next += 1;
         let bound = self.random.below(4) + 1;
         let form = self.random.below(3);
+        // The label goes on before the body is built, because the body is where the jumps that can
+        // name it are drawn. A `do while` and a `while` are written as two statements, and the
+        // label belongs on the loop rather than on the declaration above it.
+        let label = self.random.chance(2).then(|| {
+            let label = format!("l{}", self.next);
+            self.next += 1;
+            self.breakable.push(label.clone());
+            self.continuable.push(label.clone());
+            format!("{label}: ")
+        });
         self.loops += 1;
         let body = self.block(depth + 1);
         self.loops -= 1;
+        if label.is_some() {
+            self.breakable.pop();
+            self.continuable.pop();
+        }
+
+        let label = label.unwrap_or_default();
         match form {
-            0 => format!("for (let {name} = 0; {name} < {bound}; {name}++) {{ {body} }}"),
-            1 => format!("let {name} = 0; do {{ {name}++; {body} }} while ({name} < {bound});"),
-            _ => format!("let {name} = 0; while ({name} < {bound}) {{ {name}++; {body} }}"),
+            0 => format!("{label}for (let {name} = 0; {name} < {bound}; {name}++) {{ {body} }}"),
+            1 => {
+                format!(
+                    "let {name} = 0; {label}do {{ {name}++; {body} }} while ({name} < {bound});"
+                )
+            }
+            _ => {
+                format!("let {name} = 0; {label}while ({name} < {bound}) {{ {name}++; {body} }}")
+            }
         }
     }
 

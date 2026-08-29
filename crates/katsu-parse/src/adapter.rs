@@ -226,17 +226,25 @@ impl Adapter<'_> {
 
             oxc::Statement::TryStatement(node) => self.try_statement(node, strict)?,
 
-            // A label can only be attached by a labelled statement, which is not in the subset, so
-            // a label here has nothing to name and refusing it costs nothing today.
-            oxc::Statement::BreakStatement(node) => match node.label {
-                Some(_) => return self.refuse("a labelled break", node.span),
-                None => Stmt::new(span(node.span), StmtKind::Break),
-            },
+            // A label is an identifier and it obeys the identifier spelling rules, so `break public`
+            // is refused in strict code even though the label is not a binding and could never be
+            // read. Whether the label names anything is scope analysis's question and not this one.
+            oxc::Statement::LabeledStatement(node) => {
+                self.reference(node.label.name.as_str(), node.label.span, strict)?;
+                let label = Ident::new(span(node.label.span), node.label.name.as_str());
+                let body = self.branch(&node.body, strict)?;
+                Stmt::new(span(node.span), StmtKind::Labeled { label, body })
+            }
 
-            oxc::Statement::ContinueStatement(node) => match node.label {
-                Some(_) => return self.refuse("a labelled continue", node.span),
-                None => Stmt::new(span(node.span), StmtKind::Continue),
-            },
+            oxc::Statement::BreakStatement(node) => {
+                let label = self.label(node.label.as_ref(), strict)?;
+                Stmt::new(span(node.span), StmtKind::Break(label))
+            }
+
+            oxc::Statement::ContinueStatement(node) => {
+                let label = self.label(node.label.as_ref(), strict)?;
+                Stmt::new(span(node.span), StmtKind::Continue(label))
+            }
 
             oxc::Statement::VariableDeclaration(node) => {
                 // `declare const x: number` describes something that exists elsewhere and emits no
@@ -313,6 +321,24 @@ impl Adapter<'_> {
                 cases,
             },
         ))
+    }
+
+    /// Adapt the label a `break` or a `continue` was written with, if it was written with one.
+    ///
+    /// The spelling rules apply here for the same reason they apply to the label on the statement,
+    /// which is that both of them are the same production in the grammar.
+    fn label(
+        &self,
+        label: Option<&oxc::LabelIdentifier<'_>>,
+        strict: bool,
+    ) -> Result<Option<Ident>, ParseError> {
+        match label {
+            None => Ok(None),
+            Some(label) => {
+                self.reference(label.name.as_str(), label.span, strict)?;
+                Ok(Some(Ident::new(span(label.span), label.name.as_str())))
+            }
+        }
     }
 
     /// Adapt a `for`, the three part one.
@@ -419,7 +445,7 @@ impl Adapter<'_> {
         })
     }
 
-    /// Adapt the statement in the arm of an `if` or the body of a `while`.
+    /// Adapt the statement in the arm of an `if`, the body of a loop or the body of a label.
     ///
     /// The grammar allows a single statement without braces there, and it can be a declaration in
     /// exactly one case that is already a syntax error in strict mode, so an erasing statement in
@@ -430,6 +456,15 @@ impl Adapter<'_> {
         statement: &oxc::Statement<'_>,
         strict: bool,
     ) -> Result<Box<Stmt>, ParseError> {
+        // A function declaration is not a statement, and the only reason one can stand here at all
+        // is Annex B, which is legacy web compatibility rather than the language proper. node takes
+        // `if (c) function f() {}` and `l: function f() {}` in sloppy code and refuses both in
+        // strict code. Refusing it by name in both is the honest answer until Annex B is looked at
+        // properly, and it is a strict improvement on what was here before, which was a panic in
+        // scope analysis, because nothing declared the name and resolving it found nothing.
+        if let oxc::Statement::FunctionDeclaration(node) = statement {
+            return self.refuse("a function declaration outside a block", node.span);
+        }
         let at = statement_span(statement);
         let adapted = self
             .statement(statement, strict)?
@@ -1021,7 +1056,6 @@ fn statement_name(statement: &oxc::Statement<'_>) -> &'static str {
         oxc::Statement::DebuggerStatement(_) => "debugger",
         oxc::Statement::ForInStatement(_) => "a for in loop",
         oxc::Statement::ForOfStatement(_) => "a for of loop",
-        oxc::Statement::LabeledStatement(_) => "a label",
         oxc::Statement::ThrowStatement(_) => "throw",
         oxc::Statement::TryStatement(_) => "try",
         oxc::Statement::WithStatement(_) => "with",
@@ -1447,7 +1481,6 @@ mod tests {
         // This list is the M1 work list read backwards, and every line of it should disappear.
         assert_eq!(refused("t.js", "for (const x in o) {}"), "a for in loop");
         assert_eq!(refused("t.js", "for (const x of xs) {}"), "a for of loop");
-        assert_eq!(refused("t.js", "outer: while (x) {}"), "a label");
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
         assert_eq!(refused("t.js", "let f = () => 1;"), "an arrow function");
@@ -1733,7 +1766,7 @@ mod tests {
             1,
             "a clause body is a list, not a block"
         );
-        assert!(matches!(cases[2].body[0].kind, StmtKind::Break));
+        assert!(matches!(cases[2].body[0].kind, StmtKind::Break(None)));
     }
 
     #[test]
@@ -1751,19 +1784,58 @@ mod tests {
     }
 
     #[test]
-    fn a_label_on_a_break_or_a_continue_is_refused_by_name() {
-        // The labels themselves are not in the subset yet, so a labelled jump has nothing to name.
-        // Refusing it costs nothing today and stops it silently becoming an unlabelled jump, which
-        // would run and go to the wrong place.
-        assert_eq!(refused("t.js", "l: while (a) { break l; }"), "a label");
+    fn a_label_carries_its_name_and_the_statement_it_names() {
+        let body = tree("t.js", "outer: while (a) { break outer; }");
+        let StmtKind::Labeled { label, body } = &body[0].kind else {
+            panic!("expected a labelled statement");
+        };
+        assert_eq!(label.name, "outer");
+        let StmtKind::While { body, .. } = &body.kind else {
+            panic!("expected the label to name the loop");
+        };
+        let StmtKind::Block(inner) = &body.kind else {
+            panic!("expected a block");
+        };
+        let StmtKind::Break(Some(target)) = &inner[0].kind else {
+            panic!("expected a labelled break");
+        };
+        assert_eq!(target.name, "outer");
+    }
+
+    #[test]
+    fn a_label_obeys_the_identifier_spelling_rules() {
+        // A label is not a binding and nothing can read it, but it is written with the identifier
+        // production, so strict mode takes the same nine words away from it that it takes away
+        // everywhere else. `eval` stays legal, because nothing here writes to anything.
+        let (_, _, message) = early("t.js", "\"use strict\"; public: while (a) {}");
+        assert_eq!(message, "Unexpected strict mode reserved word");
+        let (_, _, message) = early("t.js", "\"use strict\"; while (a) { break yield; }");
+        assert_eq!(message, "Unexpected strict mode reserved word");
+        assert!(parse("t.js", "\"use strict\"; eval: while (a) { break eval; }").is_ok());
+    }
+
+    #[test]
+    fn a_function_declaration_where_only_a_statement_belongs_is_refused_by_name() {
+        // Annex B lets sloppy code write a function declaration as the single statement of an `if`
+        // or under a label, and node runs all three of these. Nothing here declares the name yet,
+        // so what katsu used to do was walk into a body whose function had never been declared and
+        // panic. An honest unsupported message is the right answer until the hoisting rules that
+        // go with the form are written, because a crash tells a user nothing about their program.
         assert_eq!(
-            refused("t.js", "while (a) { break l; }"),
-            "a labelled break"
+            refused("t.js", "if (a) function f() {}"),
+            "a function declaration outside a block"
         );
         assert_eq!(
-            refused("t.js", "while (a) { continue l; }"),
-            "a labelled continue"
+            refused("t.js", "l: function f() {}"),
+            "a function declaration outside a block"
         );
+        assert_eq!(
+            refused("t.js", "while (a) function f() {}"),
+            "a function declaration outside a block"
+        );
+
+        // In a block it is an ordinary declaration and always was.
+        assert!(parse("t.js", "if (a) { function f() {} }").is_ok());
     }
 
     #[test]
