@@ -17,7 +17,7 @@ mod string;
 pub use atom::{Atom, AtomTable};
 pub use bump::{BumpHeap, Census, KindTotals, ObjectKind};
 pub use cage::{CAGE_SIZE, Cage, CageError, GUARD_SIZE, OBJECT_ALIGN, SMI_MAX, SMI_MIN, Slot};
-pub use function::{ClosureRef, ContextRef, NativeRef};
+pub use function::{AccessorPairRef, ClosureRef, ContextRef, NativeRef};
 pub use object::HeapKind;
 pub use ordinary::ObjectRef;
 pub use shape::{Attributes, ShapeRef};

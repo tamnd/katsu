@@ -58,7 +58,9 @@ use std::cmp::Ordering as Sorting;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use katsu_gc::{Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef};
+use katsu_gc::{
+    AccessorPairRef, Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef,
+};
 use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
 
@@ -159,6 +161,93 @@ impl From<StackError> for RuntimeError {
 struct Landing {
     function: u32,
     pc: usize,
+}
+
+/// What a property read found, which is not always a value.
+///
+/// A read of an accessor cannot answer with a value, because producing the value means calling a
+/// function, and calling a function is something only the loop can do. So the lookup reports what it
+/// found and the opcode decides what to do about it, which keeps every frame push in the one place
+/// that already knows how to push a frame.
+///
+/// Two variants and not three: a property with no getter has already been turned into `undefined` by
+/// the time this is built, because that decision needs nothing the caller knows and answering it
+/// here means the opcode has one case fewer to handle.
+#[derive(Clone, Copy, Debug)]
+enum Found {
+    /// A value, which is what every read finds until a program defines an accessor.
+    Value(Value),
+    /// A getter to call, and the object to call it on.
+    Getter {
+        /// The function to call, which is a closure or a native.
+        getter: Value,
+        /// Where the read started, which is `this` inside the getter. Not where the property was
+        /// found: a getter on a prototype answers for every object below it and can only do that by
+        /// being called on the one the read went through.
+        receiver: Value,
+    },
+}
+
+/// What a store did, which like a read is not always the obvious thing.
+///
+/// The refusals and the setter are kept apart from each other because they end in different places.
+/// A refusal is silence in sloppy mode and a `TypeError` in strict mode, and that decision belongs to
+/// the opcode because it is the opcode that knows which mode the code is in. A setter is a call, and
+/// that also belongs to the opcode, because the loop is the only thing that can push a frame.
+///
+/// The two refusals are separate because node says two different things, which was measured rather
+/// than assumed. A read only data property gives `Cannot assign to read only property 'x' of object
+/// '#<Object>'` and an accessor with no setter gives `Cannot set property x of #<Object> which has
+/// only a getter`, and neither sentence is a rewording of the other.
+#[derive(Clone, Copy, Debug)]
+enum Wrote {
+    /// The value is in the object.
+    Yes,
+    /// The property is a data property that will not take a write.
+    Refused,
+    /// The property is an accessor with no setter, so there is nothing to write through.
+    NoSetter,
+    /// Nothing was written yet, because the write is a call to this function.
+    Setter(Value),
+}
+
+/// A call the interpreter makes on a program's behalf rather than because one was written.
+///
+/// Accessors are the only source of these so far. Reading a property that turns out to be a getter
+/// is a call, and so is writing one that turns out to be a setter, and neither has an opcode of its
+/// own to carry the operands a call needs. Gathering them into a struct is so that a caller cannot
+/// swap the target and the receiver, which are both `Value` and would compile either way round.
+#[derive(Clone, Copy, Debug)]
+struct Call {
+    /// The function to call.
+    target: Value,
+    /// What `this` is inside it.
+    receiver: Value,
+    /// The caller's register the arguments start at, ignored when nothing is passed.
+    first: Register,
+    /// How many arguments start there.
+    passed: u16,
+    /// Where the answer goes, or [`Register::NOWHERE`] when nothing wants it.
+    return_to: Register,
+    /// The instruction in the caller to come back to.
+    return_pc: u32,
+}
+
+/// What making one of those calls did.
+///
+/// A JavaScript function suspends the caller and the loop has to pick up the callee, and a function
+/// written in Rust has already finished by the time this is built. Both are calls a program cannot
+/// tell apart, and both have to be possible here, because a getter can be either.
+enum Entered<'a> {
+    /// A frame was pushed and the loop has to switch to the function named here.
+    Frame {
+        /// Which function in the loaded unit was entered.
+        index: u32,
+        /// Its blueprint, which the loop keeps in a local.
+        callee: &'a FunctionBlueprint,
+    },
+    /// The callee was written in Rust, so it has already run and this is what it answered.
+    Answered(Value),
 }
 
 /// The word every back edge checks, in the isolate rather than in the frame.
@@ -562,21 +651,27 @@ impl Interpreter {
     ///
     /// `None` and not an empty vector for a non object, because a caller usually has something
     /// different to do with a number than with an object that happens to have no properties.
+    ///
+    /// The flags come back with each property because the value cannot be understood without them.
+    /// An accessor's slot holds a pair of functions rather than the property's value, and a caller
+    /// that treats it as a value gets a heap pointer it will do something wrong with. Every caller
+    /// today has to refuse when it meets one, and handing them the flags is what lets them notice.
     #[must_use]
-    pub fn own_properties(&self, value: Value) -> Option<Vec<(String, Value)>> {
+    pub fn own_properties(&self, value: Value) -> Option<Vec<(String, Value, Attributes)>> {
         let object = self.as_object(value)?;
         let cage = self.isolate.cage();
         Some(
             object
                 .enumerable(cage)
                 .into_iter()
-                .map(|(name, index)| {
+                .map(|(name, index, attributes)| {
                     let slot = object
                         .value_at(cage, index)
                         .expect("a name at this index means there is a value at it");
                     (
                         name.to_utf8_lossy(cage).into_owned(),
                         Value::from_bits(slot),
+                        attributes,
                     )
                 })
                 .collect(),
@@ -628,17 +723,88 @@ impl Interpreter {
     ///
     /// Takes `&mut self` for the reason [`Interpreter::global`] does, which is that a name given as
     /// text has to be interned before it can be compared against a name already on an object.
-    pub fn lookup(&mut self, object: Value, name: &str) -> Option<Value> {
-        let name = self.isolate.intern(name)?.as_string();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Unsupported`] when the name is found and it is an accessor. Reading
+    /// one means calling the getter, and a builtin cannot call a JavaScript function: the loop is the
+    /// only thing that can push a frame and a native has already left it. Refusing is the only
+    /// correct answer available. Answering with the pair would hand a native a heap pointer it would
+    /// treat as the property's value, and answering `undefined` would be a legal looking value that a
+    /// program would go on to use.
+    pub fn lookup(&mut self, object: Value, name: &str) -> Result<Option<Value>, RuntimeError> {
+        let Some(interned) = self.isolate.intern(name) else {
+            return Ok(None);
+        };
+        let interned = interned.as_string();
         let cage = self.isolate.cage();
         let mut holder = self.as_object(object);
         while let Some(current) = holder {
-            if let Some(bits) = current.get(cage, name) {
-                return Some(Value::from_bits(bits));
+            if let Some((index, attributes)) = current.find(cage, interned) {
+                if attributes.is_accessor() {
+                    return Err(Self::native_met_an_accessor(name));
+                }
+                let bits = current
+                    .value_at(cage, index)
+                    .expect("a property the shape has is a property the object has room for");
+                return Ok(Some(Value::from_bits(bits)));
             }
             holder = current.prototype(cage);
         }
-        None
+        Ok(None)
+    }
+
+    /// What a builtin says when the property it needed to read turns out to be an accessor.
+    ///
+    /// One message in one place, because every builtin that reads a property hits the same wall for
+    /// the same reason and they should all say so in the same words. It names the property, because
+    /// the whole value of refusing by name is that the person reading it knows which one.
+    #[cold]
+    #[inline(never)]
+    #[must_use]
+    pub fn native_met_an_accessor(name: &str) -> RuntimeError {
+        RuntimeError::Unsupported(format!(
+            "reading '{name}' means calling a getter, and a builtin written in Rust cannot call a \
+             JavaScript function yet"
+        ))
+    }
+
+    /// The two halves of an accessor pair, for a builtin that has to report them rather than call
+    /// them.
+    ///
+    /// `Object.getOwnPropertyDescriptor` needs this and it is the only thing that legitimately does.
+    /// Reporting a getter is not calling it, so this is allowed where [`Interpreter::lookup`] is not.
+    ///
+    /// Returns `(None, None)` for anything that is not a pair, which a caller reaches only by asking
+    /// about a property whose attributes did not say it was an accessor.
+    #[must_use]
+    pub fn accessor_halves(&self, pair: Value) -> (Option<Value>, Option<Value>) {
+        let cage = self.isolate.cage();
+        let Some(pair) = pair.to_slot(cage).and_then(AccessorPairRef::from_slot) else {
+            return (None, None);
+        };
+        (
+            pair.getter(cage).map(|slot| Value::from_slot(slot, cage)),
+            pair.setter(cage).map(|slot| Value::from_slot(slot, cage)),
+        )
+    }
+
+    /// Put a getter and a setter in the heap, for a builtin that is defining an accessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the pair.
+    pub fn accessor_pair(
+        &mut self,
+        getter: Option<Value>,
+        setter: Option<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let cage = self.isolate.cage();
+        let getter = getter.and_then(|value| value.to_slot(cage));
+        let setter = setter.and_then(|value| value.to_slot(cage));
+        let pair = AccessorPairRef::new(self.isolate.heap_mut(), getter, setter)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(pair.slot(), self.isolate.cage()))
     }
 
     /// The own property `name`, with what it is allowed to do, or `None` if there is not one.
@@ -1205,7 +1371,13 @@ impl Interpreter {
                     let Some(caller) = self.stack.current().copied() else {
                         return Ok(value);
                     };
-                    self.stack.set(frame.return_to, value);
+                    // A setter is called for what it does and its return value is specified to be
+                    // discarded, so the frame it returns into has nowhere to put one. The test is
+                    // here rather than in a second opcode because it is false for every call a
+                    // program writes and a branch that is never taken costs nothing.
+                    if frame.return_to != Register::NOWHERE {
+                        self.stack.set(frame.return_to, value);
+                    }
                     function = caller.function;
                     blueprint = unit.function(function).blueprint;
                     constants = unit.function(function).constants.as_slice();
@@ -1221,8 +1393,33 @@ impl Interpreter {
                 Op::GetProp { dst, obj, key, .. } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let value = guard!(self.property(object, name, blueprint, key));
-                    self.stack.set(dst, value);
+                    match guard!(self.property(object, name, blueprint, key)) {
+                        Found::Value(value) => self.stack.set(dst, value),
+                        // A read that is a call. The getter takes no arguments, so `args` points at
+                        // a register nothing is copied from, and its answer goes where the read's
+                        // answer was going to go. Nothing else about this is special: the frame is
+                        // an ordinary frame and the getter returns through the ordinary return.
+                        Found::Getter { getter, receiver } => {
+                            let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                            let call = Call {
+                                target: getter,
+                                receiver,
+                                first: dst,
+                                passed: 0,
+                                return_to: dst,
+                                return_pc,
+                            };
+                            match guard!(self.enter(call, unit)) {
+                                Entered::Frame { index, callee } => {
+                                    function = index;
+                                    blueprint = callee;
+                                    constants = unit.function(index).constants.as_slice();
+                                    pc = 0;
+                                }
+                                Entered::Answered(value) => self.stack.set(dst, value),
+                            }
+                        }
+                    }
                 }
 
                 // A store either writes a property the object has or adds one it does not, and until
@@ -1244,11 +1441,42 @@ impl Interpreter {
                         raise!(Self::nothing_to_write(object, blueprint, key));
                     }
                     match self.as_object(object) {
-                        Some(target) => {
-                            if !self.assign(target, name, new)? && blueprint.strict {
+                        Some(target) => match guard!(self.assign(target, name, new)) {
+                            Wrote::Yes => {}
+                            Wrote::Refused if blueprint.strict => {
                                 raise!(self.read_only(target, blueprint, key));
                             }
-                        }
+                            Wrote::NoSetter if blueprint.strict => {
+                                raise!(self.only_a_getter(target, blueprint, key));
+                            }
+                            Wrote::Refused | Wrote::NoSetter => {}
+                            // A write that is a call. The one argument is the value being assigned,
+                            // which is already in a register, so it is passed where it sits. The
+                            // answer goes nowhere: a setter's return value is specified to be
+                            // discarded, and the value of the assignment expression is the value
+                            // that went in rather than anything the setter said about it.
+                            Wrote::Setter(setter) => {
+                                let return_pc =
+                                    u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                                let call = Call {
+                                    target: setter,
+                                    receiver: object,
+                                    first: value,
+                                    passed: 1,
+                                    return_to: Register::NOWHERE,
+                                    return_pc,
+                                };
+                                match guard!(self.enter(call, unit)) {
+                                    Entered::Frame { index, callee } => {
+                                        function = index;
+                                        blueprint = callee;
+                                        constants = unit.function(index).constants.as_slice();
+                                        pc = 0;
+                                    }
+                                    Entered::Answered(_) => {}
+                                }
+                            }
+                        },
                         None if blueprint.strict => {
                             raise!(self.nowhere_to_write(object, blueprint, key));
                         }
@@ -1271,7 +1499,22 @@ impl Interpreter {
                 } => {
                     let object = self.stack.get(obj);
                     let name = self.name_at(constants, key);
-                    let target = guard!(self.property(object, name, blueprint, key));
+                    let target = match guard!(self.property(object, name, blueprint, key)) {
+                        Found::Value(value) => value,
+                        // `o.x()` where `x` is a getter is two calls, and the second one cannot be
+                        // set up until the first has returned. The loop has no way to hold a call
+                        // that is waiting on another call, because the only thing it resumes into
+                        // is the instruction after the one it left, so this refuses by name rather
+                        // than calling the getter and then losing its answer.
+                        Found::Getter { .. } => {
+                            let key = Self::constant_name(blueprint, key);
+                            raise!(RuntimeError::Unsupported(format!(
+                                "calling '{key}', which is a getter, needs the result of the \
+                                 getter to become the callee and the interpreter has nowhere to \
+                                 keep a call that is waiting on another call"
+                            )));
+                        }
+                    };
                     let Some(closure) = self.as_closure(target) else {
                         if let Some(native) = self.as_native(target) {
                             let value = guard!(self.call_native(native, Some(object), args, argc));
@@ -1541,7 +1784,8 @@ impl Interpreter {
             | HeapKind::Native
             | HeapKind::Object
             | HeapKind::Shape
-            | HeapKind::Properties => None,
+            | HeapKind::Properties
+            | HeapKind::AccessorPair => None,
         }
     }
 
@@ -1559,7 +1803,8 @@ impl Interpreter {
             | HeapKind::Context
             | HeapKind::Object
             | HeapKind::Shape
-            | HeapKind::Properties => None,
+            | HeapKind::Properties
+            | HeapKind::AccessorPair => None,
         }
     }
 
@@ -1580,7 +1825,8 @@ impl Interpreter {
             | HeapKind::Context
             | HeapKind::Native
             | HeapKind::Shape
-            | HeapKind::Properties => None,
+            | HeapKind::Properties
+            | HeapKind::AccessorPair => None,
         }
     }
 
@@ -1608,6 +1854,52 @@ impl Interpreter {
         };
         let arguments: SmallVec<[Value; 8]> = SmallVec::from_slice(self.stack.range(first, count));
         call(self, receiver, &arguments)
+    }
+
+    /// Make a call the program did not write, which today means calling an accessor.
+    ///
+    /// The two halves are the two halves of `Op::Call`, moved out of the loop because there are now
+    /// three places that need them and duplicating a frame push three times is how the receiver ends
+    /// up being wrong in one of them. `Op::Call` and `Op::CallMethod` are deliberately left alone:
+    /// they are the hot opcodes, and they carry the arity and the frame size straight from the
+    /// operand into the push without going through a struct first.
+    ///
+    /// A getter that is not a function throws in the same words a call to a non function throws in.
+    /// That happens when a program hands `Object.defineProperty` a `get` that is not callable, which
+    /// the definition itself is specified to reject, so it is a message that should be unreachable
+    /// rather than one nobody wrote.
+    ///
+    /// # Errors
+    ///
+    /// A stack overflow from the push, whatever a native throws, or a `TypeError` for a target that
+    /// cannot be called.
+    fn enter<'a>(&mut self, call: Call, unit: &'a Unit) -> Result<Entered<'a>, RuntimeError> {
+        let Some(closure) = self.as_closure(call.target) else {
+            if let Some(native) = self.as_native(call.target) {
+                let value =
+                    self.call_native(native, Some(call.receiver), call.first, call.passed)?;
+                return Ok(Entered::Answered(value));
+            }
+            let text = self.display(call.target);
+            return Err(RuntimeError::Type(format!("{text} is not a function")));
+        };
+        let index = closure.function(self.isolate.cage());
+        let captured = closure.captured(self.isolate.cage());
+        let callee = unit.function(index).blueprint;
+        self.stack.push_call(
+            callee.frame_size,
+            Invocation {
+                arity: callee.arity,
+                first: call.first,
+                passed: call.passed,
+                function: index,
+                return_pc: call.return_pc,
+                return_to: call.return_to,
+                receiver: call.receiver,
+            },
+        )?;
+        self.set_frame_context(captured);
+        Ok(Entered::Frame { index, callee })
     }
 
     /// The interned name a name operand holds.
@@ -1700,18 +1992,61 @@ impl Interpreter {
         name: StringRef,
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<Found, RuntimeError> {
         if object.is_undefined() || object.is_null() {
             return Err(Self::nothing_to_read(object, blueprint, key));
         }
         let Some(record) = self.as_object(object) else {
-            return Ok(Value::UNDEFINED);
+            return Ok(Found::Value(Value::UNDEFINED));
         };
         let cage = self.isolate.cage();
-        if let Some(bits) = record.get(cage, name) {
-            return Ok(Value::from_bits(bits));
+        if let Some((index, attributes)) = record.find(cage, name) {
+            let bits = record
+                .value_at(cage, index)
+                .expect("a property the shape has is a property the object has room for");
+            return Ok(self.found(bits, attributes, object));
         }
-        Ok(self.inherited(record, name))
+        Ok(self.inherited(record, name, object))
+    }
+
+    /// What a lookup found, once the flags have been consulted.
+    ///
+    /// The flags are consulted rather than the bits, because an accessor pair is a heap pointer and
+    /// there is nothing in a heap pointer that says which kind of thing it points at without a load.
+    /// This is the payoff for putting the bit in the shape: an inline cache that has matched a shape
+    /// has established the answer in the comparison it already made, so the fast path this is
+    /// standing in for will not run the test at all.
+    #[inline]
+    fn found(&self, bits: u64, attributes: Attributes, receiver: Value) -> Found {
+        if !attributes.is_accessor() {
+            return Found::Value(Value::from_bits(bits));
+        }
+        self.getter_of(Value::from_bits(bits), receiver)
+    }
+
+    /// The getter half of a pair, or `undefined` when the property has no getter.
+    ///
+    /// A property with only a setter reads as `undefined` and does not throw, which is the language
+    /// saying that a write only property is still readable and simply has nothing to say.
+    ///
+    /// The receiver is where the read started rather than where the property was found. One getter
+    /// defined on a prototype answers for every object below it, and it can only do that by being
+    /// called on the object the read went through.
+    #[cold]
+    #[inline(never)]
+    fn getter_of(&self, pair: Value, receiver: Value) -> Found {
+        let cage = self.isolate.cage();
+        let getter = pair
+            .to_slot(cage)
+            .and_then(AccessorPairRef::from_slot)
+            .and_then(|pair| pair.getter(cage));
+        match getter {
+            Some(getter) => Found::Getter {
+                getter: Value::from_slot(getter, cage),
+                receiver,
+            },
+            None => Found::Value(Value::UNDEFINED),
+        }
     }
 
     /// Keep looking above an object for a name that is not on it.
@@ -1725,16 +2060,19 @@ impl Interpreter {
     /// return a `Result`. The one property read that does throw is a read off `undefined` or `null`,
     /// and that is answered by the caller before there is an object to start walking from.
     #[inline(never)]
-    fn inherited(&self, object: ObjectRef, name: StringRef) -> Value {
+    fn inherited(&self, object: ObjectRef, name: StringRef, receiver: Value) -> Found {
         let cage = self.isolate.cage();
         let mut holder = object.prototype(cage);
         while let Some(current) = holder {
-            if let Some(bits) = current.get(cage, name) {
-                return Value::from_bits(bits);
+            if let Some((index, attributes)) = current.find(cage, name) {
+                let bits = current
+                    .value_at(cage, index)
+                    .expect("a property the shape has is a property the object has room for");
+                return self.found(bits, attributes, receiver);
             }
             holder = current.prototype(cage);
         }
-        Value::UNDEFINED
+        Found::Value(Value::UNDEFINED)
     }
 
     /// What `this` is in the frame that is running.
@@ -1779,17 +2117,19 @@ impl Interpreter {
 
     /// Write one property, which is an ordinary assignment and not a definition.
     ///
-    /// `Ok(false)` means the language refused the write rather than that anything went wrong. The
-    /// caller turns that into silence or into a `TypeError` depending on whether the code is strict,
-    /// which is the one place in the language where the two modes disagree about a store that
-    /// reached a real object.
+    /// A [`Wrote::Refused`] or a [`Wrote::NoSetter`] means the language would not take the write
+    /// rather than that anything went wrong. The caller turns either into silence or into a
+    /// `TypeError` depending on whether the code is strict, which is the one place in the language
+    /// where the two modes disagree about a store that reached a real object.
     ///
     /// Whether the write is allowed is decided by the first copy of the name on the prototype chain
     /// and not by the object it started from, which is the part that is easy to get wrong. A read
     /// only property on a prototype makes an assignment to every object below it fail, even though
     /// none of those objects has the property, because the chain is searched before the write and
-    /// what is found there decides the answer. Once the search says yes, the write is still to the
-    /// object itself: there are no setters, so nothing goes further up than the check did.
+    /// what is found there decides the answer. A setter found on the chain is called instead, on the
+    /// object the write started from rather than on the one it was found on, and no own property is
+    /// added. Only when the search finds nothing, or finds a plain writable property, does the write
+    /// land on the object itself.
     ///
     /// A name that is nowhere on the chain is allowed and adds an own property, which is what an
     /// object literal built by assignment does on every line.
@@ -1803,41 +2143,79 @@ impl Interpreter {
         target: ObjectRef,
         name: StringRef,
         value: Value,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<Wrote, RuntimeError> {
         if let Some((index, attributes)) = target.find(self.isolate.cage(), name) {
+            if attributes.is_accessor() {
+                let bits = target
+                    .value_at(self.isolate.cage(), index)
+                    .expect("a property the shape has is a property the object has room for");
+                return Ok(self.setter_of(Value::from_bits(bits)));
+            }
             if !attributes.is_writable() {
-                return Ok(false);
+                return Ok(Wrote::Refused);
             }
             target.write_at(self.isolate.heap_mut(), index, value.to_bits());
-            return Ok(true);
+            return Ok(Wrote::Yes);
         }
-        if !self.writable_above(target, name) {
-            return Ok(false);
+        match self.settable_above(target, name) {
+            Wrote::Yes => {}
+            other => return Ok(other),
         }
         target
             .set(self.isolate.heap_mut(), name, value.to_bits())
             .ok_or(RuntimeError::OutOfMemory)?;
-        Ok(true)
+        Ok(Wrote::Yes)
     }
 
-    /// Whether the prototype chain above `object` lets a new property of this name be added.
+    /// The setter half of a pair, or a refusal when the property has no setter.
     ///
-    /// True when the name is nowhere above, which is the ordinary answer, and true when the first
-    /// copy of it found is writable. False only for a read only property somewhere above, which
-    /// stops the write even though the object being written to does not have the property at all.
+    /// A property with only a getter refuses the write. It is silent in sloppy mode like any other
+    /// refusal and it says something different from a read only property in strict mode, which is why
+    /// it is its own answer rather than the ordinary refusal.
+    #[cold]
+    #[inline(never)]
+    fn setter_of(&self, pair: Value) -> Wrote {
+        let cage = self.isolate.cage();
+        let setter = pair
+            .to_slot(cage)
+            .and_then(AccessorPairRef::from_slot)
+            .and_then(|pair| pair.setter(cage));
+        match setter {
+            Some(setter) => Wrote::Setter(Value::from_slot(setter, cage)),
+            None => Wrote::NoSetter,
+        }
+    }
+
+    /// What the prototype chain above `object` says about adding a property of this name.
+    ///
+    /// [`Wrote::Yes`] when the name is nowhere above, which is the ordinary answer, and when the
+    /// first copy of it found is a writable data property. A read only property above refuses the
+    /// write even though the object being written to does not have the property at all, and a setter
+    /// above is called instead of the property being added, which is the mechanism that lets one
+    /// setter on a prototype receive the writes of every object under it.
     ///
     /// Out of line, because a store to a name the object already has never reaches it.
     #[inline(never)]
-    fn writable_above(&self, object: ObjectRef, name: StringRef) -> bool {
+    fn settable_above(&self, object: ObjectRef, name: StringRef) -> Wrote {
         let cage = self.isolate.cage();
         let mut holder = object.prototype(cage);
         while let Some(current) = holder {
-            if let Some((_, attributes)) = current.find(cage, name) {
-                return attributes.is_writable();
+            if let Some((index, attributes)) = current.find(cage, name) {
+                if attributes.is_accessor() {
+                    let bits = current
+                        .value_at(cage, index)
+                        .expect("a property the shape has is a property the object has room for");
+                    return self.setter_of(Value::from_bits(bits));
+                }
+                return if attributes.is_writable() {
+                    Wrote::Yes
+                } else {
+                    Wrote::Refused
+                };
             }
             holder = current.prototype(cage);
         }
-        true
+        Wrote::Yes
     }
 
     /// What a strict mode assignment to a property that will not take one says.
@@ -1865,6 +2243,33 @@ impl Interpreter {
         };
         RuntimeError::Type(format!(
             "Cannot assign to read only property '{key}' of object '{what}'"
+        ))
+    }
+
+    /// What a strict mode assignment to a getter with no setter says.
+    ///
+    /// A different sentence from [`Interpreter::read_only`] and not a variation on it. Node does not
+    /// quote the property name here and does quote it there, and it writes `of #<Object>` here
+    /// against `of object '#<Object>'` there. Both were measured. The one thing the two share is how
+    /// the object is named, which is the same rule about reaching this realm's `Object.prototype`.
+    ///
+    /// Out of line and cold, for the reason [`Interpreter::read_only`] is.
+    #[cold]
+    #[inline(never)]
+    fn only_a_getter(
+        &self,
+        target: ObjectRef,
+        blueprint: &FunctionBlueprint,
+        key: katsu_ir::ConstIndex,
+    ) -> RuntimeError {
+        let key = Self::constant_name(blueprint, key);
+        let what = if self.inherits_object_prototype(target) {
+            "#<Object>"
+        } else {
+            "[object Object]"
+        };
+        RuntimeError::Type(format!(
+            "Cannot set property {key} of {what} which has only a getter"
         ))
     }
 
@@ -1975,11 +2380,29 @@ impl Interpreter {
         cycles.enter(slot);
         let entries: Vec<String> = names
             .into_iter()
-            .map(|(name, index)| {
+            .map(|(name, index, attributes)| {
                 let value = object
                     .value_at(cage, index)
                     .expect("a name at this index means there is a value at it");
                 let key = inspect::key(&name.to_utf8_lossy(cage));
+                // An accessor prints as what it is rather than as what it would say, because
+                // printing an object is not supposed to run any of the program's code. Node makes
+                // the same choice and prints `[Getter]`, and it is the right one: a getter can throw,
+                // can loop, and can change the object being printed underneath the printer.
+                if attributes.is_accessor() {
+                    let (getter, setter) = self.accessor_halves(Value::from_bits(value));
+                    let what = match (getter.is_some(), setter.is_some()) {
+                        (true, true) => "[Getter/Setter]",
+                        (true, false) => "[Getter]",
+                        (false, true) => "[Setter]",
+                        // Both halves absent, which `{get: undefined, set: undefined}` legally
+                        // makes. Node prints `undefined` for this one, not a fourth bracketed word,
+                        // which was measured. It reads as the value a read of the property would
+                        // give, and a read of a property with no getter does give `undefined`.
+                        (false, false) => "undefined",
+                    };
+                    return format!("{key}: {what}");
+                }
                 let value = self.inspect(
                     Value::from_bits(value),
                     depth - 1,
@@ -2041,7 +2464,8 @@ impl Interpreter {
             | HeapKind::Native
             | HeapKind::Object
             | HeapKind::Shape
-            | HeapKind::Properties => None,
+            | HeapKind::Properties
+            | HeapKind::AccessorPair => None,
         }
     }
 
@@ -2119,7 +2543,13 @@ impl Interpreter {
         match kind {
             Some(HeapKind::String) => "string",
             Some(HeapKind::Closure | HeapKind::Native) => "function",
-            Some(HeapKind::Object | HeapKind::Context | HeapKind::Shape | HeapKind::Properties)
+            Some(
+                HeapKind::Object
+                | HeapKind::Context
+                | HeapKind::Shape
+                | HeapKind::Properties
+                | HeapKind::AccessorPair,
+            )
             | None => "object",
         }
     }

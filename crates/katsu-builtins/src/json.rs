@@ -203,7 +203,7 @@ fn write(
 fn object(
     interpreter: &Interpreter,
     value: Value,
-    properties: Vec<(String, Value)>,
+    properties: Vec<(String, Value, Attributes)>,
     indent: &str,
     depth: usize,
     open: &mut Vec<u64>,
@@ -222,7 +222,13 @@ fn object(
     let inner = depth + 1;
     let mut written = 0usize;
     out.push('{');
-    for (name, property) in properties {
+    for (name, property, attributes) in properties {
+        // `JSON.stringify` is specified to call a getter and write what it answers, so an accessor
+        // is not something this can skip or write the pair of. It refuses by name, because a builtin
+        // written in Rust cannot call a JavaScript function yet.
+        if attributes.is_accessor() {
+            return Err(Interpreter::native_met_an_accessor(&name));
+        }
         // Written to a scratch buffer first because a property whose value has no JSON spelling
         // leaves nothing behind at all, not even its name, and by the time that is known the name and
         // the separator would already be in the output.
