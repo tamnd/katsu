@@ -108,6 +108,13 @@ enum Stop {
 }
 
 fn main() -> ExitCode {
+    // First, before anything else in the process does any work. This is the origin that
+    // `performance.timeOrigin` reports and that `performance.now()` counts from, so every line
+    // after it is startup that a program timing itself can see. Moving it below the argument parse
+    // or below the logger would quietly exclude that work from our own numbers, which is the kind of
+    // flattering measurement this project exists to not make.
+    katsu_runtime::start_clock();
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()

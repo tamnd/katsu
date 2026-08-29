@@ -10,7 +10,9 @@ use std::fmt;
 
 use katsu_vm::{Interpreter, RuntimeError};
 
-pub use katsu_vm::{Discard, Interrupt, Isolate, Output, Recorder, Standard, Stream, Value};
+pub use katsu_vm::{
+    Discard, Interrupt, Isolate, Output, Recorder, Standard, Stream, Value, start_clock,
+};
 
 /// Anything that went wrong that a caller can act on.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +90,7 @@ impl Runtime {
         // interpreter, not this.
         katsu_builtins::install_globals(&mut interpreter)?;
         katsu_builtins::install_console(&mut interpreter)?;
+        katsu_builtins::install_performance(&mut interpreter)?;
         Ok(Runtime { interpreter })
     }
 

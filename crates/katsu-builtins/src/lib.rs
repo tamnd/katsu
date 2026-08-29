@@ -7,9 +7,11 @@
 
 mod console;
 mod globals;
+mod performance;
 
 pub use console::install as install_console;
 pub use globals::install as install_globals;
+pub use performance::install as install_performance;
 
 /// Whether ECMA-402, the internationalization API, is compiled into this build.
 ///
