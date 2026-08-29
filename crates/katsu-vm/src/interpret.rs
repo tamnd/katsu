@@ -58,7 +58,7 @@ use std::cmp::Ordering as Sorting;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use katsu_gc::{ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef};
+use katsu_gc::{Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef};
 use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
 
@@ -327,6 +327,25 @@ impl Interpreter {
     ///
     /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the names or the object.
     pub fn host_object(&mut self, entries: &[(&str, Value)]) -> Result<Value, RuntimeError> {
+        self.host_object_with(entries, Attributes::DEFAULT)
+    }
+
+    /// The same, with a say in what the properties are allowed to do.
+    ///
+    /// [`Attributes::BUILTIN`] is the one every namespace object in the language is built with, and
+    /// it is not a detail. `Math` and `JSON` hold nothing enumerable, so `Object.keys(JSON)` is empty
+    /// and `console.log(Math)` prints an empty object rather than the whole standard library, and a
+    /// `for in` over anything does not walk into them. `console` is the exception and keeps the
+    /// default, because its methods really are enumerable own properties in Node.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpreter::host_object`].
+    pub fn host_object_with(
+        &mut self,
+        entries: &[(&str, Value)],
+        attributes: Attributes,
+    ) -> Result<Value, RuntimeError> {
         let mut named = Vec::with_capacity(entries.len());
         for (name, value) in entries {
             let atom = self.isolate.intern(name).ok_or(RuntimeError::OutOfMemory)?;
@@ -335,7 +354,7 @@ impl Interpreter {
         let object = self.new_object(named.len())?;
         for (name, value) in named {
             object
-                .set(self.isolate.heap_mut(), name, value)
+                .define(self.isolate.heap_mut(), name, value, attributes)
                 .ok_or(RuntimeError::OutOfMemory)?;
         }
         Ok(Value::from_slot(object.slot(), self.isolate.cage()))
@@ -549,12 +568,11 @@ impl Interpreter {
         let cage = self.isolate.cage();
         Some(
             object
-                .names(cage)
+                .enumerable(cage)
                 .into_iter()
-                .enumerate()
-                .map(|(index, name)| {
+                .map(|(name, index)| {
                     let slot = object
-                        .value_at(cage, u32::try_from(index).unwrap_or(u32::MAX))
+                        .value_at(cage, index)
                         .expect("a name at this index means there is a value at it");
                     (
                         name.to_utf8_lossy(cage).into_owned(),
@@ -563,6 +581,113 @@ impl Interpreter {
                 })
                 .collect(),
         )
+    }
+
+    /// Whether this value is an ordinary object, meaning something a property can be defined on.
+    ///
+    /// False for a function, which in this build is a native or a closure and not an object, and
+    /// false for every primitive. A builtin asks this when the specification says "if Type(O) is not
+    /// Object, throw", because the message it throws names the builtin and so cannot come from here.
+    /// Ordinary in the specification's sense, meaning an object with the standard behaviour, which
+    /// is every object this build can make.
+    #[must_use]
+    pub fn is_ordinary_object(&self, value: Value) -> bool {
+        self.as_object(value).is_some()
+    }
+
+    /// `ToBoolean`, for a builtin reading a flag out of an object a program wrote.
+    #[must_use]
+    pub fn is_truthy(&self, value: Value) -> bool {
+        self.truthy(value)
+    }
+
+    /// `SameValue`, which is `===` with the two cases it gets wrong for this purpose put right.
+    ///
+    /// `NaN` is the same value as `NaN` and positive zero is not the same value as negative zero,
+    /// which is the opposite of what `===` says about both. The specification uses this and not `===`
+    /// when it asks whether redefining a non writable property is actually changing it, so a
+    /// `defineProperty` that writes the same `NaN` back is allowed and one that turns a positive zero
+    /// into a negative one is not.
+    #[must_use]
+    pub fn same_value(&self, left: Value, right: Value) -> bool {
+        if let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) {
+            if left.is_nan() && right.is_nan() {
+                return true;
+            }
+            return left == right && left.is_sign_negative() == right.is_sign_negative();
+        }
+        self.strict_equal(left, right)
+    }
+
+    /// Read a property the way a program would, walking the prototype chain.
+    ///
+    /// `None` means the name is nowhere on the chain, which is a different answer from `undefined`
+    /// being found there. A property descriptor needs that distinction and `.` throws it away:
+    /// `{}` and `{value: undefined}` describe different properties, so a builtin reading a
+    /// descriptor cannot use the operator a program would use.
+    ///
+    /// Takes `&mut self` for the reason [`Interpreter::global`] does, which is that a name given as
+    /// text has to be interned before it can be compared against a name already on an object.
+    pub fn lookup(&mut self, object: Value, name: &str) -> Option<Value> {
+        let name = self.isolate.intern(name)?.as_string();
+        let cage = self.isolate.cage();
+        let mut holder = self.as_object(object);
+        while let Some(current) = holder {
+            if let Some(bits) = current.get(cage, name) {
+                return Some(Value::from_bits(bits));
+            }
+            holder = current.prototype(cage);
+        }
+        None
+    }
+
+    /// The own property `name`, with what it is allowed to do, or `None` if there is not one.
+    ///
+    /// Own and not inherited, which is the question `Object.getOwnPropertyDescriptor` asks and the
+    /// one [`Interpreter::lookup`] does not.
+    pub fn own_descriptor(&mut self, object: Value, name: &str) -> Option<(Value, Attributes)> {
+        let name = self.isolate.intern(name)?.as_string();
+        let object = self.as_object(object)?;
+        let cage = self.isolate.cage();
+        let (index, attributes) = object.find(cage, name)?;
+        let bits = object.value_at(cage, index)?;
+        Some((Value::from_bits(bits), attributes))
+    }
+
+    /// Define a property, which is not the same operation as assigning to one.
+    ///
+    /// Assignment asks the prototype chain for permission and this does not, assignment cannot change
+    /// what a property is allowed to do and this can, and assignment on a read only property fails
+    /// where this succeeds. Everything a program can reach this through goes past a set of rules
+    /// first, in `Object.defineProperty`, and none of those rules are here: this puts the value and
+    /// the three flags where it is told to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Type`] if `object` is not an object. Every builtin that gets here has
+    /// already checked that and thrown a message naming itself, so this is the answer for a caller
+    /// that did not, and it is deliberately not one of the messages Node prints. Returns
+    /// [`RuntimeError::OutOfMemory`] if the heap has no room for the name or the new shape.
+    pub fn define_property(
+        &mut self,
+        object: Value,
+        name: &str,
+        value: Value,
+        attributes: Attributes,
+    ) -> Result<(), RuntimeError> {
+        let Some(target) = self.as_object(object) else {
+            return Err(RuntimeError::Type(
+                "Cannot define a property on a value that is not an object".to_owned(),
+            ));
+        };
+        let name = self
+            .isolate
+            .intern(name)
+            .ok_or(RuntimeError::OutOfMemory)?
+            .as_string();
+        target
+            .define(self.isolate.heap_mut(), name, value.to_bits(), attributes)
+            .ok_or(RuntimeError::OutOfMemory)
     }
 
     /// Run a blueprint from its first instruction and return the value it returns.
@@ -1115,9 +1240,9 @@ impl Interpreter {
                     }
                     match self.as_object(object) {
                         Some(target) => {
-                            target
-                                .set(self.isolate.heap_mut(), name, new.to_bits())
-                                .ok_or(RuntimeError::OutOfMemory)?;
+                            if !self.assign(target, name, new)? && blueprint.strict {
+                                raise!(self.read_only(target, blueprint, key));
+                            }
                         }
                         None if blueprint.strict => {
                             raise!(self.nowhere_to_write(object, blueprint, key));
@@ -1603,6 +1728,97 @@ impl Interpreter {
         Value::UNDEFINED
     }
 
+    /// Write one property, which is an ordinary assignment and not a definition.
+    ///
+    /// `Ok(false)` means the language refused the write rather than that anything went wrong. The
+    /// caller turns that into silence or into a `TypeError` depending on whether the code is strict,
+    /// which is the one place in the language where the two modes disagree about a store that
+    /// reached a real object.
+    ///
+    /// Whether the write is allowed is decided by the first copy of the name on the prototype chain
+    /// and not by the object it started from, which is the part that is easy to get wrong. A read
+    /// only property on a prototype makes an assignment to every object below it fail, even though
+    /// none of those objects has the property, because the chain is searched before the write and
+    /// what is found there decides the answer. Once the search says yes, the write is still to the
+    /// object itself: there are no setters, so nothing goes further up than the check did.
+    ///
+    /// A name that is nowhere on the chain is allowed and adds an own property, which is what an
+    /// object literal built by assignment does on every line.
+    ///
+    /// The object's own properties are searched first and separately, and the write goes straight to
+    /// the index that search returned rather than looking the name up a second time. That is the
+    /// common case by a long way, it is the one `prop_store` measures, and doing it this way is what
+    /// keeps the cost of obeying attributes down to the attribute check itself.
+    fn assign(
+        &mut self,
+        target: ObjectRef,
+        name: StringRef,
+        value: Value,
+    ) -> Result<bool, RuntimeError> {
+        if let Some((index, attributes)) = target.find(self.isolate.cage(), name) {
+            if !attributes.is_writable() {
+                return Ok(false);
+            }
+            target.write_at(self.isolate.heap_mut(), index, value.to_bits());
+            return Ok(true);
+        }
+        if !self.writable_above(target, name) {
+            return Ok(false);
+        }
+        target
+            .set(self.isolate.heap_mut(), name, value.to_bits())
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(true)
+    }
+
+    /// Whether the prototype chain above `object` lets a new property of this name be added.
+    ///
+    /// True when the name is nowhere above, which is the ordinary answer, and true when the first
+    /// copy of it found is writable. False only for a read only property somewhere above, which
+    /// stops the write even though the object being written to does not have the property at all.
+    ///
+    /// Out of line, because a store to a name the object already has never reaches it.
+    #[inline(never)]
+    fn writable_above(&self, object: ObjectRef, name: StringRef) -> bool {
+        let cage = self.isolate.cage();
+        let mut holder = object.prototype(cage);
+        while let Some(current) = holder {
+            if let Some((_, attributes)) = current.find(cage, name) {
+                return attributes.is_writable();
+            }
+            holder = current.prototype(cage);
+        }
+        true
+    }
+
+    /// What a strict mode assignment to a property that will not take one says.
+    ///
+    /// Node names the object as well as the property, and it names it two different ways: an
+    /// ordinary object is `#<Object>` and one that inherits from nothing is `[object Object]`. Both
+    /// were measured rather than guessed, and the rule that tells them apart is the same one that
+    /// decides whether an object can be converted to text at all, which is whether the chain reaches
+    /// this realm's `Object.prototype`.
+    ///
+    /// Out of line and cold, for the reason [`Interpreter::nothing_to_read`] is.
+    #[cold]
+    #[inline(never)]
+    fn read_only(
+        &self,
+        target: ObjectRef,
+        blueprint: &FunctionBlueprint,
+        key: katsu_ir::ConstIndex,
+    ) -> RuntimeError {
+        let key = Self::constant_name(blueprint, key);
+        let what = if self.inherits_object_prototype(target) {
+            "#<Object>"
+        } else {
+            "[object Object]"
+        };
+        RuntimeError::Type(format!(
+            "Cannot assign to read only property '{key}' of object '{what}'"
+        ))
+    }
+
     /// What reading a property of `undefined` or `null` says, which is what Node says word for word.
     ///
     /// Out of line and cold, so that the formatting and the allocation it costs are not code sitting
@@ -1678,7 +1894,10 @@ impl Interpreter {
             return inspect::circular(cycles.number(slot));
         }
         let cage = self.isolate.cage();
-        let names = object.names(cage);
+        // What is visible rather than what is there. Node hides non enumerable properties unless it
+        // is asked for them, which is what makes it possible to put a method on a prototype without
+        // it turning up in the printed form of every object that inherits it.
+        let names = object.enumerable(cage);
         // An object that inherits from nothing says so, and the tag counts towards the width the
         // same way a back reference does, so an object with it breaks onto several lines earlier
         // than the same object without it. That was measured against node rather than assumed.
@@ -1707,10 +1926,9 @@ impl Interpreter {
         cycles.enter(slot);
         let entries: Vec<String> = names
             .into_iter()
-            .enumerate()
-            .map(|(index, name)| {
+            .map(|(name, index)| {
                 let value = object
-                    .value_at(cage, u32::try_from(index).unwrap_or(u32::MAX))
+                    .value_at(cage, index)
                     .expect("a name at this index means there is a value at it");
                 let key = inspect::key(&name.to_utf8_lossy(cage));
                 let value = self.inspect(
@@ -1923,28 +2141,42 @@ impl Interpreter {
     /// `Object.prototype.toString` rather than from the object.
     ///
     /// The test is whether the chain reaches this realm's `Object.prototype`, and not whether a
-    /// property called `toString` is on it, because there is nothing on it yet: a method there would
-    /// be enumerable, and there is no way to say otherwise until property attributes land. Reaching
-    /// `Object.prototype` and finding a `toString` are the same question for every object this build
-    /// can make, since nothing else can put one there. When there is a real method to find, this
+    /// property called `toString` is on it, because there is nothing on it yet. A method there needs
+    /// a receiver to be called with, and `this` is `undefined` everywhere in this build, so nothing
+    /// can put one there and reaching `Object.prototype` and finding a `toString` are the same
+    /// question for every object this build can make. When there is a real method to find, this
     /// becomes a real lookup and a real call, and the answer stops being a constant.
     ///
     /// An object converts to `[object Object]` and not to what `console.log` shows, because this is
     /// `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and the two
     /// differing is a real distinction in the language rather than an inconsistency.
     fn object_to_text(&self, object: ObjectRef) -> Result<String, RuntimeError> {
+        if self.inherits_object_prototype(object) {
+            return Ok("[object Object]".to_owned());
+        }
+        Err(RuntimeError::Type(
+            "Cannot convert object to primitive value".to_owned(),
+        ))
+    }
+
+    /// Whether an object inherits from this realm's `Object.prototype`.
+    ///
+    /// Two unrelated questions turn out to be this one. Whether an object can be converted to text
+    /// is whether it can reach a `toString`, and how Node names an object in a `TypeError` is
+    /// `#<Object>` for one that inherits and `[object Object]` for one that does not. Both are
+    /// really asking whether the thing is an ordinary object or one built by `Object.create(null)`,
+    /// so they ask it in one place.
+    fn inherits_object_prototype(&self, object: ObjectRef) -> bool {
         let cage = self.isolate.cage();
         let top = self.isolate.object_prototype_if_built();
         let mut holder = Some(object);
         while let Some(current) = holder {
             if Some(current) == top {
-                return Ok("[object Object]".to_owned());
+                return true;
             }
             holder = current.prototype(cage);
         }
-        Err(RuntimeError::Type(
-            "Cannot convert object to primitive value".to_owned(),
-        ))
+        false
     }
 
     /// The text of a primitive, meaning everything that is not on the heap.

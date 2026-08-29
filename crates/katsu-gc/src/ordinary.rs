@@ -42,22 +42,29 @@
 //! no prototype word of its own and asking one for its prototype is a load of the shape and a load
 //! out of it.
 //!
+//! # Where the attributes are
+//!
+//! Also not here, and also in the shape, for the same kind of reason. Each shape node adds one
+//! property, so the three flags that property carries belong on the node that added it. What that
+//! means for this file is that a property is a name and a set of flags in the shape and an eight
+//! byte value here, and nothing in the layout below changed to make attributes work.
+//!
 //! # What is not here
 //!
-//! No attributes, so nothing is read only, non enumerable or an accessor. That is the reason there
-//! is nothing installed on `Object.prototype` yet: a method there would show up in `console.log` and
-//! in enumeration, because there is no way to say that it should not. No delete, which is the one
-//! operation a transition tree genuinely does not want and which needs the dictionary mode that
-//! every engine falls back to. No indexed properties. No setters, which is why a write always makes
-//! an own property and never goes up the chain. Each of those is its own piece of work and each of
-//! them is in M1.
+//! No accessors, so a property is always a value rather than a pair of functions. That is waiting on
+//! receivers rather than on anything in this file: a getter is called with the object it was read
+//! from, and `this` is `undefined` everywhere in this build. No delete, which is the one operation a
+//! transition tree genuinely does not want and which needs the dictionary mode that every engine
+//! falls back to. No indexed properties. No setters, for the same reason there are no getters, which
+//! is why a write always makes an own property and never goes up the chain. Each of those is its own
+//! piece of work and each of them is in M1.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
 use crate::object::{
     HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u32_at, write_u64,
 };
-use crate::shape::ShapeRef;
+use crate::shape::{Attributes, ShapeRef};
 use crate::string::StringRef;
 
 /// Where the shape goes, which is the word every object in the cage starts with.
@@ -160,11 +167,29 @@ impl ObjectRef {
         self.value_at(cage, index)
     }
 
+    /// Where `name` sits on this object itself and what it is allowed to do.
+    ///
+    /// Own properties only, like [`ObjectRef::get`], and for the same reason. This is what the
+    /// interpreter asks at each step of a chain walk when it is deciding whether a write is allowed,
+    /// because that decision is about the flags of the first copy of the name it meets rather than
+    /// about the object it started from.
+    #[must_use]
+    pub fn find(self, cage: &Cage, name: StringRef) -> Option<(u32, Attributes)> {
+        self.shape(cage).find(cage, name)
+    }
+
     /// Store `value` under `name`, adding the property if the object does not have it.
     ///
     /// This is where an object grows a shape. Adding a property takes a transition, and taking the
     /// same transition from the same shape twice reaches the same node, so the millionth object
-    /// built like the first shares its layout.
+    /// built like the first shares its layout. A property that is added arrives with
+    /// [`Attributes::DEFAULT`], which is what an assignment and a literal produce, and a property
+    /// that is already there keeps the flags it has.
+    ///
+    /// It does not check whether the property is writable, and that is deliberate rather than
+    /// missing. Refusing a write is a language decision with a strict mode rule attached to it and a
+    /// prototype chain to walk first, so it belongs to the interpreter, and this is the layer that
+    /// knows where bytes are. Every caller in the runtime asks [`ObjectRef::find`] first.
     ///
     /// Both allocations happen before anything about the object changes, so an object whose heap ran
     /// out is the object it was rather than one with a shape claiming a property it has no room for.
@@ -177,8 +202,58 @@ impl ObjectRef {
             self.write(heap, index, value);
             return Some(());
         }
+        self.add(heap, shape, name, value, Attributes::DEFAULT)
+    }
+
+    /// Put `name` on this object with exactly `attributes`, whether or not it is already there.
+    ///
+    /// This is `[[DefineOwnProperty]]` for a data property, minus the part that decides whether the
+    /// change is allowed, which needs the old flags and a `TypeError` and is therefore the
+    /// interpreter's. Redefining a property that is already there and giving it different flags is
+    /// the expensive case, because it rebuilds the layout from the root of the transition tree, and
+    /// `shape.rs` says why that is the honest answer rather than a shortcut being avoided.
+    ///
+    /// Returns `None` if the heap is full.
+    #[must_use]
+    pub fn define(
+        self,
+        heap: &mut BumpHeap,
+        name: StringRef,
+        value: u64,
+        attributes: Attributes,
+    ) -> Option<()> {
+        let shape = self.shape(heap.cage());
+        let Some((index, existing)) = shape.find(heap.cage(), name) else {
+            return self.add(heap, shape, name, value, attributes);
+        };
+        if existing != attributes {
+            let reshaped = shape.redefine(heap, index, attributes)?;
+            // SAFETY: the object is in the cage and its first word is inside it, and `&mut BumpHeap`
+            // means nothing else is reading the cage.
+            unsafe {
+                write_u32_at(
+                    heap.cage(),
+                    self.offset(),
+                    SHAPE_OFFSET,
+                    reshaped.slot().to_bits(),
+                );
+            }
+        }
+        self.write(heap, index, value);
+        Some(())
+    }
+
+    /// Add a property this object does not have, which is the half of a store that grows a shape.
+    fn add(
+        self,
+        heap: &mut BumpHeap,
+        shape: ShapeRef,
+        name: StringRef,
+        value: u64,
+        attributes: Attributes,
+    ) -> Option<()> {
         let index = shape.count(heap.cage());
-        let grown = shape.transition(heap, name)?;
+        let grown = shape.transition(heap, name, attributes)?;
         self.reserve(heap, index)?;
         // SAFETY: the object is in the cage and its first word is inside it, and `&mut BumpHeap`
         // means nothing else is reading the cage.
@@ -203,6 +278,30 @@ impl ObjectRef {
     #[must_use]
     pub fn names(self, cage: &Cage) -> Vec<StringRef> {
         self.shape(cage).names(cage)
+    }
+
+    /// Every property anything walking this object is allowed to see: its name and where it is.
+    ///
+    /// What `console.log`, `JSON.stringify`, `Object.keys` and `for in` want, as against
+    /// [`ObjectRef::names`], which is what `Object.getOwnPropertyNames` wants. Two methods rather
+    /// than one with a flag, because the two have different callers and mixing them up is a bug that
+    /// shows up as a builtin method appearing in someone's printed output.
+    ///
+    /// The index comes back with the name rather than being the position in this list, because a
+    /// hidden property still occupies a slot. Counting the visible ones and using that as an index
+    /// would read the wrong value for every property after the first hidden one, which is the sort of
+    /// bug that stays invisible until a builtin is installed next to a real property.
+    #[must_use]
+    pub fn enumerable(self, cage: &Cage) -> Vec<(StringRef, u32)> {
+        self.shape(cage)
+            .entries(cage)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (name, attributes))| {
+                let index = u32::try_from(index).ok()?;
+                attributes.is_enumerable().then_some((name, index))
+            })
+            .collect()
     }
 
     /// The value of the property at `index`, or `None` if the index is past the end.
@@ -300,6 +399,16 @@ impl ObjectRef {
             );
         }
         Some(())
+    }
+
+    /// Write the value of a property whose index is already known.
+    ///
+    /// For a caller that has just asked [`ObjectRef::find`] where a name is and does not want to ask
+    /// again. The index has to have come from this object, because it is a position in this object's
+    /// layout and nothing checks that it is one. Writing past the end is not unsafe, it just puts the
+    /// value somewhere no name points at, which is a silently lost write and worse than a crash.
+    pub fn write_at(self, heap: &mut BumpHeap, index: u32, value: u64) {
+        self.write(heap, index, value);
     }
 
     /// Write the value of the property at `index`, which [`ObjectRef::reserve`] has made room for.
@@ -401,7 +510,9 @@ impl Properties {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_OVERFLOW, HEADER_SIZE, ObjectRef, PROPERTIES_HEADER, VALUE_SIZE};
+    use super::{
+        Attributes, FIRST_OVERFLOW, HEADER_SIZE, ObjectRef, PROPERTIES_HEADER, VALUE_SIZE,
+    };
     use crate::bump::{BumpHeap, ObjectKind};
     use crate::cage::Slot;
     use crate::object::HeapKind;
@@ -600,6 +711,95 @@ mod tests {
             totals.reserved_bytes,
             (PROPERTIES_HEADER + (FIRST_OVERFLOW as usize) * VALUE_SIZE) as u64
         );
+    }
+
+    #[test]
+    fn a_property_can_be_added_with_flags_of_its_own() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 2);
+        let shown = name(&mut heap, "shown");
+        let hidden = name(&mut heap, "hidden");
+        object.set(&mut heap, shown, 1).expect("should have room");
+        object
+            .define(&mut heap, hidden, 2, Attributes::BUILTIN)
+            .expect("should have room");
+        assert_eq!(object.get(heap.cage(), hidden), Some(2));
+        assert_eq!(texts(&heap, object), ["shown", "hidden"]);
+        assert_eq!(
+            object
+                .enumerable(heap.cage())
+                .into_iter()
+                .map(|(name, _)| name.to_utf8_lossy(heap.cage()).into_owned())
+                .collect::<Vec<String>>(),
+            ["shown"],
+            "a non enumerable property is on the object and not in the walk of it"
+        );
+    }
+
+    #[test]
+    fn redefining_a_property_changes_its_flags_and_keeps_its_value_in_place() {
+        // The case that rebuilds the shape from the root. The value must survive it, and so must
+        // every other property's index, because the rebuild does not move anything.
+        let mut heap = heap();
+        let object = empty(&mut heap, 3);
+        let names: Vec<StringRef> = ["a", "b", "c"]
+            .into_iter()
+            .map(|text| name(&mut heap, text))
+            .collect();
+        for (index, &name) in names.iter().enumerate() {
+            object
+                .set(&mut heap, name, index as u64)
+                .expect("should have room");
+        }
+        object
+            .define(&mut heap, names[0], 99, Attributes::NONE)
+            .expect("should have room");
+        assert_eq!(object.get(heap.cage(), names[0]), Some(99));
+        assert_eq!(object.get(heap.cage(), names[1]), Some(1));
+        assert_eq!(object.get(heap.cage(), names[2]), Some(2));
+        assert_eq!(texts(&heap, object), ["a", "b", "c"]);
+        assert_eq!(
+            object.find(heap.cage(), names[0]),
+            Some((0, Attributes::NONE))
+        );
+    }
+
+    #[test]
+    fn a_plain_assignment_leaves_the_flags_of_a_property_alone() {
+        // What separates `set` from `define`. An assignment to a property that exists is not a
+        // redefinition of it, so a non enumerable property that gets written stays non enumerable,
+        // and the object does not change shape.
+        let mut heap = heap();
+        let object = empty(&mut heap, 1);
+        let x = name(&mut heap, "x");
+        object
+            .define(&mut heap, x, 1, Attributes::BUILTIN)
+            .expect("should have room");
+        let shape = object.shape(heap.cage());
+        object.set(&mut heap, x, 2).expect("should have room");
+        assert_eq!(object.get(heap.cage(), x), Some(2));
+        assert_eq!(object.find(heap.cage(), x), Some((0, Attributes::BUILTIN)));
+        assert_eq!(object.shape(heap.cage()), shape);
+    }
+
+    #[test]
+    fn defining_a_property_that_is_already_the_way_it_is_asked_for_is_a_write() {
+        // The cheap half of `define`: same flags means no rebuild, so the shape does not move and
+        // nothing is allocated.
+        let mut heap = heap();
+        let object = empty(&mut heap, 1);
+        let x = name(&mut heap, "x");
+        object
+            .define(&mut heap, x, 1, Attributes::NONE)
+            .expect("should have room");
+        let shape = object.shape(heap.cage());
+        let before = heap.census().totals(ObjectKind::Shape).count;
+        object
+            .define(&mut heap, x, 2, Attributes::NONE)
+            .expect("should have room");
+        assert_eq!(object.shape(heap.cage()), shape);
+        assert_eq!(heap.census().totals(ObjectKind::Shape).count, before);
+        assert_eq!(object.get(heap.cage(), x), Some(2));
     }
 
     #[test]

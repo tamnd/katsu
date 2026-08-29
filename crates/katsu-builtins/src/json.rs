@@ -50,7 +50,7 @@
 
 use std::fmt::Write as _;
 
-use katsu_vm::{Interpreter, RuntimeError, Value, arg};
+use katsu_vm::{Attributes, Interpreter, RuntimeError, Value, arg};
 
 /// The largest indent node will use, whether it was asked for in spaces or in text.
 ///
@@ -67,7 +67,12 @@ const MAX_INDENT: u8 = 10;
 pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
     let stringify = interpreter.native_function("stringify", stringify)?;
     let parse = interpreter.native_function("parse", parse)?;
-    let json = interpreter.host_object(&[("stringify", stringify), ("parse", parse)])?;
+    // Non enumerable, like every namespace object in the language. `console.log(JSON)` prints an
+    // empty object in Node rather than listing the two functions, and `Object.keys(JSON)` is empty.
+    let json = interpreter.host_object_with(
+        &[("stringify", stringify), ("parse", parse)],
+        Attributes::BUILTIN,
+    )?;
     interpreter.define_global("JSON", json)
 }
 

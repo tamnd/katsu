@@ -21,8 +21,10 @@ use katsu_vm::{Interpreter, RuntimeError, Value};
 /// Bind the value properties of the global object.
 ///
 /// All three are writable in sloppy mode in no engine anybody ships, and the specification marks
-/// them writable false, enumerable false, configurable false. There are no property attributes yet,
-/// so they go in as plain bindings and the attributes arrive with the object model.
+/// them writable false, enumerable false, configurable false. Property attributes exist now and
+/// these still do not carry any, because the global scope is not an ordinary object here: it is a
+/// separate table of bindings, and giving it the object model is the same piece of work as making
+/// `globalThis` real.
 ///
 /// # Errors
 ///

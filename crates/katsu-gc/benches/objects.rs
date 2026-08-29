@@ -25,7 +25,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use katsu_gc::{AtomTable, BumpHeap, ObjectRef, ShapeRef, StringRef};
+use katsu_gc::{AtomTable, Attributes, BumpHeap, ObjectRef, ShapeRef, StringRef};
 
 /// How many properties the lookup benchmarks put on an object.
 ///
@@ -282,12 +282,15 @@ fn transitions(c: &mut Criterion) {
                 let root = ShapeRef::root(&mut heap, None).unwrap();
                 let names = names(&mut heap, width);
                 for name in &names {
-                    root.transition(&mut heap, *name).unwrap();
+                    root.transition(&mut heap, *name, Attributes::DEFAULT)
+                        .unwrap();
                 }
                 // The first name added is the last child in the list, because a new child goes on
                 // the front. That makes this the full walk rather than the lucky one.
                 let first = names[0];
-                b.iter(|| black_box(root.transition(&mut heap, black_box(first))));
+                b.iter(|| {
+                    black_box(root.transition(&mut heap, black_box(first), Attributes::DEFAULT))
+                });
             },
         );
     }
@@ -301,7 +304,9 @@ fn transitions(c: &mut Criterion) {
             let names = names(&mut heap, count);
             let mut shape = root;
             for name in &names {
-                shape = shape.transition(&mut heap, *name).unwrap();
+                shape = shape
+                    .transition(&mut heap, *name, Attributes::DEFAULT)
+                    .unwrap();
             }
             let first = names[0];
             b.iter(|| black_box(shape.index_of(heap.cage(), black_box(first))));

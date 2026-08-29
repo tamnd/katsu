@@ -34,11 +34,10 @@
 //! both of those need prototype chains. Until then this is a plain object holding a function, and
 //! the observable difference is confined to reflection over it rather than to using it.
 //!
-//! The specification marks `now` writable, enumerable and configurable, and `timeOrigin` readonly
-//! and non configurable. There are no property attributes yet, so both go in as plain properties and
-//! the attributes arrive with the object model.
+//! The specification marks `now` writable, enumerable and configurable, and `timeOrigin` read only
+//! and non configurable, and both go in that way.
 
-use katsu_vm::{Interpreter, RuntimeError, Value};
+use katsu_vm::{Attributes, Interpreter, RuntimeError, Value};
 
 /// Put `performance` in the global scope.
 ///
@@ -52,7 +51,15 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
     // missing feature: `timeOrigin` is a constant for the life of the process by definition, so a
     // getter would be a function that returns the same number forever.
     let origin = Value::from_f64(katsu_vm::origin_ms());
-    let performance = interpreter.host_object(&[("now", now), ("timeOrigin", origin)])?;
+    let performance = interpreter.host_object(&[("now", now)])?;
+    // Read only and not configurable, which is what the specification says and what a number that
+    // cannot change for the life of the process should be anyway.
+    interpreter.define_property(
+        performance,
+        "timeOrigin",
+        origin,
+        Attributes::new(false, true, false),
+    )?;
     interpreter.define_global("performance", performance)
 }
 
