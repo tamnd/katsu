@@ -26,6 +26,7 @@
 use katsu_ir::FunctionBlueprint;
 
 use crate::Value;
+use crate::cache::Caches;
 
 /// What resolving one function against a heap produced.
 ///
@@ -61,6 +62,8 @@ pub struct Loaded<'a> {
     pub name: Value,
     /// Where each of this function's nested functions ended up in the flat list.
     pub children: Vec<u32>,
+    /// One inline cache per access site in this function, shared by every frame running it.
+    pub caches: Caches,
 }
 
 /// Every function one compilation produced, flattened and indexed.
@@ -90,6 +93,7 @@ impl<'a> Unit<'a> {
             constants: resolved.constants,
             name: resolved.name,
             children: Vec::new(),
+            caches: Caches::new(root.cache_slots),
         }];
         let mut at = 0;
         while at < functions.len() {
@@ -108,6 +112,7 @@ impl<'a> Unit<'a> {
                     constants: resolved.constants,
                     name: resolved.name,
                     children: Vec::new(),
+                    caches: Caches::new(child.cache_slots),
                 });
             }
             functions[at].children = children;
