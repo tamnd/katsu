@@ -162,29 +162,54 @@ struct Lowerer<'a> {
     max_target: u32,
     /// Where the function ends, which is the position the epilogue is attributed to.
     end: u32,
-    /// The loops and switches the statement being lowered is inside, innermost last.
+    /// The loops, switches and `finally` clauses the statement being lowered is inside, innermost
+    /// last.
+    ///
+    /// One stack rather than two, because whether a `break` has to run a `finally` on its way out is
+    /// a question about the order the two were entered in and nothing else. A `break` inside a
+    /// `finally`'s protected block leaves through the `finally`, and a `break` inside a loop written
+    /// inside that block does not, and only the interleaving says which is which.
     enclosing: Vec<Enclosing>,
 }
 
-/// A construct `break` can leave and, if it is a loop, that `continue` can go round again.
-///
-/// Both lists hold jumps that have been emitted with no target yet. A `break` cannot know where the
-/// end of the construct is, because the rest of the body has not been lowered, and a `continue`
-/// deliberately does not jump straight back to the top even though the top is known: it aims at the
-/// back edge instruction at the bottom of the loop, so that every iteration passes through the
-/// counter the tiering decision is going to read.
-struct Enclosing {
-    /// True for a loop, false for a switch, which is the whole difference `continue` cares about.
-    loops: bool,
-    /// Jumps waiting for the instruction after the construct.
-    breaks: Vec<usize>,
-    /// Jumps waiting for the back edge, empty for a switch.
-    continues: Vec<usize>,
+/// Something a `break`, a `continue` or a `return` has to deal with on its way out.
+enum Enclosing {
+    /// A construct `break` can leave and, if it is a loop, that `continue` can go round again.
+    ///
+    /// Both lists hold jumps that have been emitted with no target yet. A `break` cannot know where
+    /// the end of the construct is, because the rest of the body has not been lowered, and a
+    /// `continue` deliberately does not jump straight back to the top even though the top is known:
+    /// it aims at the back edge instruction at the bottom of the loop, so that every iteration
+    /// passes through the counter the tiering decision is going to read.
+    Breakable {
+        /// True for a loop, false for a switch, which is the whole difference `continue` cares
+        /// about.
+        loops: bool,
+        /// Jumps waiting for the instruction after the construct.
+        breaks: Vec<usize>,
+        /// Jumps waiting for the back edge, empty for a switch.
+        continues: Vec<usize>,
+    },
+    /// A `finally` body that every way out of the block it guards has to pass through first.
+    Finally {
+        /// Holds which of the five completions the body was reached by.
+        token: Register,
+        /// Holds the value that completion is carrying, which is a thrown value or a returned one.
+        payload: Register,
+        /// Jumps into the body, from the normal path and from every abrupt one.
+        entries: Vec<usize>,
+        /// Whether a `return` routed through here, and so whether the dispatch has to ask about one.
+        returns: bool,
+        /// Whether a `break` routed through here.
+        breaks: bool,
+        /// Whether a `continue` routed through here.
+        continues: bool,
+    },
 }
 
 impl Enclosing {
     fn loop_() -> Self {
-        Self {
+        Self::Breakable {
             loops: true,
             breaks: Vec::new(),
             continues: Vec::new(),
@@ -192,13 +217,42 @@ impl Enclosing {
     }
 
     fn switch() -> Self {
-        Self {
+        Self::Breakable {
             loops: false,
             breaks: Vec::new(),
             continues: Vec::new(),
         }
     }
+
+    /// Take the two jump lists out of a frame a loop or a switch pushed.
+    ///
+    /// Both callers pushed a `Breakable` a few lines earlier and popped it themselves, so the other
+    /// variant is not reachable here, and saying that once is better than saying it at both.
+    fn jumps(self) -> (Vec<usize>, Vec<usize>) {
+        match self {
+            Self::Breakable {
+                breaks, continues, ..
+            } => (breaks, continues),
+            Self::Finally { .. } => {
+                unreachable!("a loop and a switch pop the frame they pushed")
+            }
+        }
+    }
 }
+
+/// Which way a `finally` body was reached, in the register the dispatch after it reads.
+///
+/// A normal completion is zero because zero is falsy, so the path almost every `finally` takes gets
+/// out of the dispatch on one `jump_if_false` with nothing compared.
+const COMPLETION_NORMAL: i32 = 0;
+/// The block threw and nothing between it and here caught it.
+const COMPLETION_THROW: i32 = 1;
+/// The block returned, and the value it returned is in the payload register.
+const COMPLETION_RETURN: i32 = 2;
+/// The block broke out of a loop or a switch that is outside this `finally`.
+const COMPLETION_BREAK: i32 = 3;
+/// The block continued a loop that is outside this `finally`.
+const COMPLETION_CONTINUE: i32 = 4;
 
 impl<'a> Lowerer<'a> {
     fn new(scopes: &'a Scopes, function: FunctionId, name: String, span: Span) -> Self {
@@ -796,7 +850,7 @@ impl<'a> Lowerer<'a> {
                     self.emit(at, Op::LoadUndefined { dst: register });
                     register
                 };
-                self.emit(at, Op::Return { src });
+                self.return_value(at, src);
                 self.release(mark);
             }
             StmtKind::If {
@@ -831,24 +885,8 @@ impl<'a> Lowerer<'a> {
                 discriminant,
                 cases,
             } => self.switch(at, discriminant, cases)?,
-            StmtKind::Break => {
-                let jump = self.emit(at, Op::Jump { target: UNPATCHED });
-                self.enclosing
-                    .last_mut()
-                    .expect("scope analysis rejected a break with nothing to leave")
-                    .breaks
-                    .push(jump);
-            }
-            StmtKind::Continue => {
-                let jump = self.emit(at, Op::Jump { target: UNPATCHED });
-                self.enclosing
-                    .iter_mut()
-                    .rev()
-                    .find(|frame| frame.loops)
-                    .expect("scope analysis rejected a continue with no loop around it")
-                    .continues
-                    .push(jump);
-            }
+            StmtKind::Break => self.break_out(at),
+            StmtKind::Continue => self.continue_on(at),
             StmtKind::Throw(value) => {
                 let mark = self.next_temp;
                 let src = self.expr(value)?;
@@ -865,6 +903,134 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Emit a `return`, or send it through the `finally` clauses that have to run before it.
+    ///
+    /// The value is moved into the innermost `finally`'s payload register rather than being carried
+    /// in whatever temporary the expression landed in, because the finally body is about to run and
+    /// is allowed to use every temporary above the two this construct reserved.
+    fn return_value(&mut self, at: u32, src: Register) {
+        let Some(index) = self.innermost_finally() else {
+            self.emit(at, Op::Return { src });
+            return;
+        };
+        let Enclosing::Finally { payload, .. } = self.enclosing[index] else {
+            unreachable!("innermost_finally only ever answers with a finally")
+        };
+        self.emit(at, Op::Move { dst: payload, src });
+        self.route(at, index, COMPLETION_RETURN);
+    }
+
+    /// Emit a `break`, or send it through a `finally` that is in the way.
+    ///
+    /// Only the innermost frame is looked at, because whatever it is, it is what the `break` reaches
+    /// first. A `finally` there sends the break on after its body has run, and a loop or a switch
+    /// there is the thing being left.
+    fn break_out(&mut self, at: u32) {
+        let index = self
+            .enclosing
+            .len()
+            .checked_sub(1)
+            .expect("scope analysis rejected a break with nothing to leave");
+        if matches!(self.enclosing[index], Enclosing::Finally { .. }) {
+            self.route(at, index, COMPLETION_BREAK);
+            return;
+        }
+        let jump = self.emit(at, Op::Jump { target: UNPATCHED });
+        let Enclosing::Breakable { breaks, .. } = &mut self.enclosing[index] else {
+            unreachable!("the frame was checked one line ago")
+        };
+        breaks.push(jump);
+    }
+
+    /// Emit a `continue`, or send it through a `finally` that is in the way.
+    ///
+    /// A switch is walked past because a `continue` inside one belongs to the loop around it, and a
+    /// `finally` is not, because its body runs whatever the `continue` is aimed at.
+    fn continue_on(&mut self, at: u32) {
+        let index = self
+            .enclosing
+            .iter()
+            .rposition(|frame| {
+                matches!(
+                    frame,
+                    Enclosing::Finally { .. } | Enclosing::Breakable { loops: true, .. }
+                )
+            })
+            .expect("scope analysis rejected a continue with no loop around it");
+        if matches!(self.enclosing[index], Enclosing::Finally { .. }) {
+            self.route(at, index, COMPLETION_CONTINUE);
+            return;
+        }
+        let jump = self.emit(at, Op::Jump { target: UNPATCHED });
+        let Enclosing::Breakable { continues, .. } = &mut self.enclosing[index] else {
+            unreachable!("the frame was checked one line ago")
+        };
+        continues.push(jump);
+    }
+
+    /// Which `finally` an abrupt completion written here reaches first, if any.
+    fn innermost_finally(&self) -> Option<usize> {
+        self.enclosing
+            .iter()
+            .rposition(|frame| matches!(frame, Enclosing::Finally { .. }))
+    }
+
+    /// Jump into a `finally` body, saying which completion is being carried into it.
+    ///
+    /// The token is what the dispatch after the body reads to decide where to send the completion
+    /// on, and recording the kind on the frame is what keeps that dispatch to the completions that
+    /// can actually arrive rather than all four.
+    fn route(&mut self, at: u32, index: usize, kind: i32) {
+        let Enclosing::Finally { token, .. } = self.enclosing[index] else {
+            unreachable!("the caller checked the frame")
+        };
+        self.emit(
+            at,
+            Op::LoadInt {
+                dst: token,
+                value: kind,
+            },
+        );
+        let jump = self.emit(at, Op::Jump { target: UNPATCHED });
+        let Enclosing::Finally {
+            entries,
+            returns,
+            breaks,
+            continues,
+            ..
+        } = &mut self.enclosing[index]
+        else {
+            unreachable!("the caller checked the frame")
+        };
+        entries.push(jump);
+        match kind {
+            COMPLETION_RETURN => *returns = true,
+            COMPLETION_BREAK => *breaks = true,
+            COMPLETION_CONTINUE => *continues = true,
+            _ => unreachable!("only an abrupt completion is routed"),
+        }
+    }
+
+    /// Lower a `try` and whichever of its two clauses are written.
+    ///
+    /// `try B catch C finally F` is lowered as `try { try B catch C } finally F`, which is how the
+    /// standard defines it and is why there is no arm here for all three at once. It also gets the
+    /// table order right for free: the inner entry is pushed first, so a throw in `B` finds `C` and
+    /// a throw in `C` finds `F`.
+    fn try_statement(
+        &mut self,
+        at: u32,
+        block: &Block,
+        catch: Option<&Catch>,
+        finally: Option<&Block>,
+    ) -> Result<(), LowerError> {
+        let Some(finally) = finally else {
+            let catch = catch.expect("the grammar requires a catch when there is no finally");
+            return self.try_catch(at, block, catch);
+        };
+        self.try_finally(at, block, catch, finally)
+    }
+
     /// Lower a `try` and its `catch`.
     ///
     /// Nothing is emitted for entering the protected block, which is the point of a handler table:
@@ -875,40 +1041,230 @@ impl<'a> Lowerer<'a> {
     /// The entry goes into the table after the block it protects has been lowered, which is what
     /// puts a nested `try` in front of the one around it and makes first match the same thing as
     /// innermost match.
-    fn try_statement(
-        &mut self,
-        at: u32,
-        block: &Block,
-        catch: Option<&Catch>,
-        finally: Option<&Block>,
-    ) -> Result<(), LowerError> {
-        debug_assert!(
-            finally.is_none(),
-            "the adapter refuses a finally clause by name"
-        );
-        let _ = finally;
-
+    fn try_catch(&mut self, at: u32, block: &Block, catch: &Catch) -> Result<(), LowerError> {
         let start = self.here();
         self.body(&block.body)?;
         let end = self.here();
         let over = self.emit(at, Op::Jump { target: UNPATCHED });
 
-        if let Some(catch) = catch {
-            let target = self.here();
-            let register = self.catch_clause(catch)?;
-            // An empty protected block cannot throw, so it gets no entry rather than an entry that
-            // could never fire. `verify` rejects an empty range for the same reason.
-            if start < end {
-                self.blueprint.handlers.push(Handler {
-                    start,
-                    end,
-                    target,
-                    register,
-                });
-            }
+        let target = self.here();
+        let register = self.catch_clause(catch)?;
+        // An empty protected block cannot throw, so it gets no entry rather than an entry that
+        // could never fire. `verify` rejects an empty range for the same reason.
+        if start < end {
+            self.blueprint.handlers.push(Handler {
+                start,
+                end,
+                target,
+                register,
+            });
         }
         self.patch(over);
         Ok(())
+    }
+
+    /// Lower a `try` with a `finally`, which is where a completion becomes a value in a register.
+    ///
+    /// A `catch` runs on one way out of a block and a `finally` runs on all five, so it cannot be
+    /// another entry in the handler table: the table only knows about throwing. What it is instead
+    /// is a body with one entry point, reached from every way out of the guarded block, and a
+    /// dispatch after it that sends the completion on to wherever it was going.
+    ///
+    /// Two registers carry that across the body. The token says which of the five ways out this was
+    /// and the payload holds what the completion is carrying, which is a thrown value or a returned
+    /// one. A throw needs no jump because the handler table already lands on the prologue that sets
+    /// the token, and a normal completion sets the token to zero, which is falsy, so the dispatch
+    /// takes one instruction on the path nearly every `finally` takes.
+    ///
+    /// The frame is popped before the body is lowered, which is not an ordering detail. It is what
+    /// makes `try { return 1; } finally { return 2; }` answer two: the `return` inside the body is
+    /// lowered against whatever is outside this construct, so it leaves rather than routing back
+    /// into the body it is written in, and the pending completion is dropped because the dispatch is
+    /// never reached.
+    fn try_finally(
+        &mut self,
+        at: u32,
+        block: &Block,
+        catch: Option<&Catch>,
+        finally: &Block,
+    ) -> Result<(), LowerError> {
+        let mark = self.next_temp;
+        let token = self.alloc();
+        let payload = self.alloc();
+
+        let start = self.here();
+        self.enclosing.push(Enclosing::Finally {
+            token,
+            payload,
+            entries: Vec::new(),
+            returns: false,
+            breaks: false,
+            continues: false,
+        });
+        let result = match catch {
+            Some(catch) => self.try_catch(at, block, catch),
+            None => self.body(&block.body),
+        };
+        let end = self.here();
+        let Some(Enclosing::Finally {
+            entries,
+            returns,
+            breaks,
+            continues,
+            ..
+        }) = self.enclosing.pop()
+        else {
+            unreachable!("the finally frame was pushed")
+        };
+        result?;
+
+        // A guarded block with no instructions in it has no way out but the normal one, so the
+        // token, the handler entry and the dispatch would all be machinery around a body that just
+        // runs. `try {} finally { f(); }` is a call and nothing else.
+        if start == end {
+            self.release(mark);
+            return self.body(&finally.body);
+        }
+
+        self.emit(
+            at,
+            Op::LoadInt {
+                dst: token,
+                value: COMPLETION_NORMAL,
+            },
+        );
+        let over = self.emit(at, Op::Jump { target: UNPATCHED });
+
+        // The handler target, which is one instruction and then a fall through into the body. The
+        // search has already put the thrown value in the payload register, so there is nothing to
+        // move and nothing to jump to.
+        let handler = self.here();
+        self.emit(
+            at,
+            Op::LoadInt {
+                dst: token,
+                value: COMPLETION_THROW,
+            },
+        );
+        self.blueprint.handlers.push(Handler {
+            start,
+            end,
+            target: handler,
+            register: payload,
+        });
+
+        let body = self.here();
+        self.patch_to(over, body);
+        for jump in entries {
+            self.patch_to(jump, body);
+        }
+        self.body(&finally.body)?;
+
+        self.dispatch(at, token, payload, returns, breaks, continues);
+        self.release(mark);
+        Ok(())
+    }
+
+    /// Send a completion on from the end of a `finally` body to wherever it was going.
+    ///
+    /// Every arm ends the run of instructions it is in, by returning, throwing or jumping, so the
+    /// arms are laid out one after another with no jump between them and the instruction after the
+    /// last of them is where a normal completion carries on.
+    ///
+    /// A throw is always one of the arms, because the handler entry over the guarded block always
+    /// exists by the time this runs. The other three are here only if something actually routed
+    /// through, which is what keeps the usual `try` and `finally` down to two instructions of
+    /// dispatch rather than a chain of comparisons about completions that cannot arrive.
+    fn dispatch(
+        &mut self,
+        at: u32,
+        token: Register,
+        payload: Register,
+        returns: bool,
+        breaks: bool,
+        continues: bool,
+    ) {
+        let mut kinds = vec![COMPLETION_THROW];
+        if returns {
+            kinds.push(COMPLETION_RETURN);
+        }
+        if breaks {
+            kinds.push(COMPLETION_BREAK);
+        }
+        if continues {
+            kinds.push(COMPLETION_CONTINUE);
+        }
+
+        let done = self.emit(
+            at,
+            Op::JumpIfFalse {
+                cond: token,
+                target: UNPATCHED,
+            },
+        );
+        let last = kinds.pop().expect("a throw is always one of them");
+        let mut tests = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            let inner = self.next_temp;
+            let want = self.alloc();
+            self.emit(
+                at,
+                Op::LoadInt {
+                    dst: want,
+                    value: kind,
+                },
+            );
+            let matched = self.alloc();
+            let cache = self.cache();
+            self.emit(
+                at,
+                Op::StrictEqual {
+                    dst: matched,
+                    lhs: token,
+                    rhs: want,
+                    cache,
+                },
+            );
+            let jump = self.emit(
+                at,
+                Op::JumpIfTrue {
+                    cond: matched,
+                    target: UNPATCHED,
+                },
+            );
+            self.release(inner);
+            tests.push((kind, jump));
+        }
+
+        // The last kind needs no test, because the token is not zero and every other kind has been
+        // asked about and jumped away.
+        self.completion(at, last, payload);
+        for (kind, jump) in tests {
+            self.patch(jump);
+            self.completion(at, kind, payload);
+        }
+        self.patch(done);
+    }
+
+    /// Emit the one completion a dispatch arm carries.
+    ///
+    /// A return, a break and a continue go through the same three functions an ordinary statement
+    /// goes through, which is what makes a `finally` inside a `finally` work without anything here
+    /// knowing about nesting: the completion is re issued as if it had been written just outside
+    /// this construct, so the next one out picks it up the same way this one did.
+    ///
+    /// A throw does not need that, because the `throw` instruction is inside whatever range guards
+    /// this code and the table finds the next handler on its own.
+    fn completion(&mut self, at: u32, kind: i32, payload: Register) {
+        match kind {
+            COMPLETION_THROW => {
+                self.emit(at, Op::Throw { src: payload });
+            }
+            COMPLETION_RETURN => self.return_value(at, payload),
+            COMPLETION_BREAK => self.break_out(at),
+            COMPLETION_CONTINUE => self.continue_on(at),
+            _ => unreachable!("a normal completion never reaches a dispatch arm"),
+        }
     }
 
     /// Lower the body of a `catch`, and say which register the thrown value has to arrive in.
@@ -961,11 +1317,12 @@ impl<'a> Lowerer<'a> {
         self.enclosing.push(Enclosing::loop_());
         let result = self.statement(body);
         let frame = self.enclosing.pop().expect("the loop frame was pushed");
+        let (breaks, continues) = frame.jumps();
         result?;
 
         // Every `continue` lands here, on the back edge itself rather than past it, so a loop that
         // is mostly continues still counts its iterations and still gets to a hotter tier.
-        for jump in frame.continues {
+        for jump in continues {
             self.patch(jump);
         }
         let profile = self.cache();
@@ -977,7 +1334,7 @@ impl<'a> Lowerer<'a> {
             },
         );
         self.patch(exit);
-        for jump in frame.breaks {
+        for jump in breaks {
             self.patch(jump);
         }
         Ok(())
@@ -1056,13 +1413,14 @@ impl<'a> Lowerer<'a> {
             }
         }
         let frame = self.enclosing.pop().expect("the switch frame was pushed");
+        let (breaks, _) = frame.jumps();
         result?;
 
         match default_target {
             Some(target) => self.patch_to(miss, target),
             None => self.patch(miss),
         }
-        for jump in frame.breaks {
+        for jump in breaks {
             self.patch(jump);
         }
         Ok(())
@@ -2838,6 +3196,150 @@ mod tests {
             load_int r0, 1
             throw r0
             ",
+        );
+    }
+
+    #[test]
+    fn a_finally_that_only_the_normal_path_reaches_costs_two_instructions_of_dispatch() {
+        // The shape the overwhelming majority of `finally` clauses have. Nothing inside the block
+        // returns or breaks or continues, so the only completions that can arrive are normal and
+        // throw, and the dispatch is the `jump_if_false` that lets the normal one out plus the
+        // `throw` that is the only other thing it could have been. There is no comparison at all,
+        // because a token that is not zero can only be the one remaining kind.
+        let blueprint = lowered("try { f(); } finally { g(); }");
+        assert_code(
+            &code(&blueprint),
+            "
+            load_global r2, k0, ic0
+            call r2, r2, r3, 0, ic1
+            load_int r0, 0
+            jump @5
+            load_int r0, 1
+            load_global r2, k1, ic2
+            call r2, r2, r3, 0, ic3
+            jump_if_false r0, @9
+            throw r1
+            load_undefined r0
+            return r0
+            ",
+        );
+        assert_eq!(blueprint.handlers.len(), 1);
+        let handler = blueprint.handlers[0];
+        assert_eq!(
+            (handler.start.0, handler.end.0, handler.target.0),
+            (0, 2, 4),
+            "the range covers the block and lands on the instruction that sets the token"
+        );
+        assert_eq!(
+            handler.register,
+            katsu_ir::Register(1),
+            "the search stores the thrown value in the payload register the dispatch rethrows"
+        );
+    }
+
+    #[test]
+    fn a_finally_around_a_return_asks_about_the_return_as_well() {
+        // One more kind can arrive, so the dispatch grows the one comparison that tells the two
+        // abrupt kinds apart, and the `return` inside the block becomes a move into the payload and
+        // a jump into the body rather than a `return` instruction.
+        let blueprint = lowered("function f() { try { return 1; } finally { g(); } }");
+        let inner = &blueprint.blueprints[0];
+        assert_code(
+            &code(inner),
+            "
+            load_int r2, 1
+            move r1, r2
+            load_int r0, 2
+            jump @7
+            load_int r0, 0
+            jump @7
+            load_int r0, 1
+            load_global r2, k0, ic0
+            call r2, r2, r3, 0, ic1
+            jump_if_false r0, @15
+            load_int r2, 1
+            strict_equal r3, r0, r2, ic2
+            jump_if_true r3, @14
+            return r1
+            throw r1
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn a_try_catch_finally_is_lowered_as_a_try_catch_inside_a_try_finally() {
+        // Which is how the standard defines it, and it gets the table order right on its own: the
+        // catch's entry is pushed when its protected block finishes, and the finally's when the
+        // whole `try` and `catch` finishes, so a throw in the block finds the catch and a throw in
+        // the catch finds the finally.
+        let blueprint = lowered("try { f(); } catch (e) { g(); } finally { h(); }");
+        assert_eq!(blueprint.handlers.len(), 2);
+        let [catch, finally] = [blueprint.handlers[0], blueprint.handlers[1]];
+        assert!(
+            finally.start <= catch.start && catch.end <= finally.end,
+            "the catch's range is inside the finally's, {catch:?} and {finally:?}"
+        );
+        assert!(
+            catch.target < finally.end,
+            "the finally's range covers the catch clause too, {catch:?} and {finally:?}"
+        );
+    }
+
+    #[test]
+    fn a_finally_around_an_empty_block_is_just_its_body() {
+        // Nothing can throw and nothing can leave, so the token, the table entry and the dispatch
+        // would all be machinery around a body that simply runs. `try {} finally { f(); }` is a
+        // call and nothing else.
+        let blueprint = lowered("try {} finally { f(); }");
+        assert!(blueprint.handlers.is_empty());
+        assert_code(
+            &code(&blueprint),
+            "
+            load_global r0, k0, ic0
+            call r0, r0, r1, 0, ic1
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn a_break_inside_a_finally_leaves_the_loop_rather_than_routing_back_in() {
+        // The frame is popped before the body is lowered, so a `break` written in the body is
+        // lowered against the loop outside the construct. Getting this backwards is what would turn
+        // `try { } finally { break; }` into a loop that never ends.
+        let blueprint = lowered("while (f()) { try { g(); } finally { break; } }");
+        assert!(
+            !code(&blueprint).contains("strict_equal"),
+            "the break left rather than routing through the dispatch, {}",
+            code(&blueprint)
+        );
+    }
+
+    #[test]
+    fn a_return_through_two_finallys_is_re_issued_by_the_inner_dispatch() {
+        // Nesting needs nothing that knows about nesting. The inner dispatch emits the return the
+        // same way an ordinary statement would, and because the outer frame is still on the stack
+        // at that point, it routes into the outer body on its own.
+        let blueprint =
+            lowered("function f() { try { try { return 1; } finally { g(); } } finally { h(); } }");
+        let inner = &blueprint.blueprints[0];
+        assert_eq!(inner.handlers.len(), 2, "one entry each, {}", code(inner));
+        let [first, second] = [inner.handlers[0], inner.handlers[1]];
+        let listing = code(inner);
+        assert!(
+            listing.contains(&format!(
+                "move r{}, r{}",
+                second.register.0, first.register.0
+            )),
+            "the inner arm hands the returned value to the outer payload, {listing}"
+        );
+        assert_eq!(
+            listing.matches("return r").count(),
+            2,
+            "one return for the outer dispatch's arm and one for the implicit end, {listing}"
         );
     }
 
