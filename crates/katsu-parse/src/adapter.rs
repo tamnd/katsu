@@ -58,6 +58,25 @@ pub(crate) fn adapt(path: &str, program: &oxc::Program<'_>) -> Result<Module, Pa
     })
 }
 
+/// The words that stop being identifiers once the code is strict.
+///
+/// They are reserved for a language that was never written, which is why they are only reserved in
+/// the mode that could afford to reserve them. `enum` is missing on purpose: it is reserved in both
+/// modes, so the parser rejects it before we get here and with a different message. `await` is
+/// missing for the opposite reason, since what makes it special is a module or an async function
+/// and not strictness, and neither exists in the subset yet.
+const STRICT_RESERVED: [&str; 9] = [
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
+    "yield",
+];
+
 /// Carries what an error message needs: the file it came from and the text to find a line in.
 struct Adapter<'a> {
     path: &'a str,
@@ -74,6 +93,49 @@ impl Adapter<'_> {
             column,
             construct,
         })
+    }
+
+    /// Report a rule the language checks before anything runs, pointing at where it was broken.
+    fn early<T>(&self, message: &str, span: oxc::Span) -> Result<T, ParseError> {
+        let (line, column) = line_and_column(self.source, span.start);
+        Err(ParseError::EarlyError {
+            path: self.path.to_owned(),
+            line,
+            column,
+            message: message.to_owned(),
+        })
+    }
+
+    /// Check a name being read, which in strict mode cannot be one of the reserved words.
+    ///
+    /// Reading is the weaker of the two positions and so this is the weaker of the two checks. A
+    /// reserved word is not an identifier at all in strict code, so `public;` on its own is a
+    /// `SyntaxError` before anything runs, while `eval` and `arguments` are ordinary names to read
+    /// and only stop being ordinary when something writes to one or binds one.
+    ///
+    /// A property is not a name in this sense and is not checked anywhere, which is why `o.public`
+    /// and `{ public: 1 }` are both fine in strict code. The two never meet because a property name
+    /// is adapted at its own site rather than through here.
+    fn reference(&self, name: &str, span: oxc::Span, strict: bool) -> Result<(), ParseError> {
+        if strict && STRICT_RESERVED.contains(&name) {
+            return self.early("Unexpected strict mode reserved word", span);
+        }
+        Ok(())
+    }
+
+    /// Check a name being bound or written, which is the position with both rules in it.
+    ///
+    /// `eval` and `arguments` are the two names strict mode will not let a program move, because
+    /// the whole point of the mode is that a reader can tell what a name refers to, and rebinding
+    /// either of those takes that away. Everything a `var`, a `let`, a `const`, a function name, a
+    /// parameter, a catch parameter and an assignment target has in common is that it moves a name,
+    /// which is why they all arrive here.
+    fn writable(&self, name: &str, span: oxc::Span, strict: bool) -> Result<(), ParseError> {
+        self.reference(name, span, strict)?;
+        if strict && (name == "eval" || name == "arguments") {
+            return self.early("Unexpected eval or arguments in strict mode", span);
+        }
+        Ok(())
     }
 
     /// Adapt a list of statements, dropping the ones that erase to nothing.
@@ -280,7 +342,7 @@ impl Adapter<'_> {
     /// pattern is refused here for the same reason it is refused in a declaration.
     fn catch(&self, handler: &oxc::CatchClause<'_>, strict: bool) -> Result<Catch, ParseError> {
         let param = match handler.param.as_ref() {
-            Some(param) => Some(self.binding_name(&param.pattern)?),
+            Some(param) => Some(self.binding_name(&param.pattern, strict)?),
             None => None,
         };
         Ok(Catch {
@@ -335,7 +397,7 @@ impl Adapter<'_> {
 
         let mut bindings = Vec::with_capacity(node.declarations.len());
         for declarator in &node.declarations {
-            let name = self.binding_name(&declarator.id)?;
+            let name = self.binding_name(&declarator.id, strict)?;
             let init = match declarator.init.as_ref() {
                 Some(init) => Some(self.expression(init, strict)?),
                 None => None,
@@ -357,9 +419,14 @@ impl Adapter<'_> {
     ///
     /// The type annotation hanging off the pattern is not read anywhere in this function, which is
     /// what erasure looks like in practice.
-    fn binding_name(&self, pattern: &oxc::BindingPattern<'_>) -> Result<Ident, ParseError> {
+    fn binding_name(
+        &self,
+        pattern: &oxc::BindingPattern<'_>,
+        strict: bool,
+    ) -> Result<Ident, ParseError> {
         match pattern {
             oxc::BindingPattern::BindingIdentifier(node) => {
+                self.writable(node.name.as_str(), node.span, strict)?;
                 Ok(Ident::new(span(node.span), node.name.as_str()))
             }
             oxc::BindingPattern::ObjectPattern(node) => {
@@ -417,13 +484,20 @@ impl Adapter<'_> {
             if let Some(initializer) = parameter.initializer.as_ref() {
                 return self.refuse("a default parameter value", expression_span(initializer));
             }
-            params.push(self.binding_name(&parameter.pattern)?);
+            params.push(self.binding_name(&parameter.pattern, strict)?);
         }
 
-        let name = node
-            .id
-            .as_ref()
-            .map(|id| Ident::new(span(id.span), id.name.as_str()));
+        // The name is checked against the function's own strictness rather than the enclosing
+        // strictness, which is why this waits until after the directives have been read. A sloppy
+        // `function eval() { "use strict"; }` is a `SyntaxError` even though nothing outside it is
+        // strict, because the name is part of what the directive turned strict.
+        let name = match node.id.as_ref() {
+            Some(id) => {
+                self.writable(id.name.as_str(), id.span, strict)?;
+                Some(Ident::new(span(id.span), id.name.as_str()))
+            }
+            None => None,
+        };
 
         Ok(Some(Func {
             span: span(node.span),
@@ -455,10 +529,13 @@ impl Adapter<'_> {
             oxc::Expression::NullLiteral(node) => Expr::new(span(node.span), ExprKind::Null),
             oxc::Expression::ThisExpression(node) => Expr::new(span(node.span), ExprKind::This),
 
-            oxc::Expression::Identifier(node) => Expr::new(
-                span(node.span),
-                ExprKind::Ident(Ident::new(span(node.span), node.name.as_str())),
-            ),
+            oxc::Expression::Identifier(node) => {
+                self.reference(node.name.as_str(), node.span, strict)?;
+                Expr::new(
+                    span(node.span),
+                    ExprKind::Ident(Ident::new(span(node.span), node.name.as_str())),
+                )
+            }
 
             oxc::Expression::UnaryExpression(node) => Expr::new(
                 span(node.span),
@@ -696,10 +773,13 @@ impl Adapter<'_> {
         strict: bool,
     ) -> Result<Target, ParseError> {
         match target {
-            oxc::SimpleAssignmentTarget::AssignmentTargetIdentifier(node) => Ok(Target {
-                span: span(node.span),
-                kind: TargetKind::Ident(Ident::new(span(node.span), node.name.as_str())),
-            }),
+            oxc::SimpleAssignmentTarget::AssignmentTargetIdentifier(node) => {
+                self.writable(node.name.as_str(), node.span, strict)?;
+                Ok(Target {
+                    span: span(node.span),
+                    kind: TargetKind::Ident(Ident::new(span(node.span), node.name.as_str())),
+                })
+            }
 
             oxc::SimpleAssignmentTarget::StaticMemberExpression(node) => Ok(Target {
                 span: span(node.span),
@@ -980,6 +1060,21 @@ mod tests {
             panic!("expected an unsupported construct, got {error:?}");
         };
         construct
+    }
+
+    /// Parse and adapt, expecting an early error, and report where it was and what it said.
+    fn early(path: &str, source: &str) -> (u32, u32, String) {
+        let error = parse(path, source).expect_err("should be refused");
+        let ParseError::EarlyError {
+            line,
+            column,
+            message,
+            ..
+        } = error
+        else {
+            panic!("expected an early error, got {error:?}");
+        };
+        (line, column, message)
     }
 
     /// The initialiser of the first binding of a single declaration.
@@ -1410,6 +1505,120 @@ mod tests {
             panic!("expected a function");
         };
         assert!(function.strict, "its own directive turns it on");
+    }
+
+    #[test]
+    fn the_nine_strict_reserved_words_are_not_identifiers_in_strict_code() {
+        // These are the words ECMAScript reserved for a language nobody ended up writing. All nine
+        // were run through node before this test was written and all nine give the same message,
+        // which is the message asserted here because somebody's expectations depend on it.
+        for word in [
+            "implements",
+            "interface",
+            "let",
+            "package",
+            "private",
+            "protected",
+            "public",
+            "static",
+            "yield",
+        ] {
+            let (_, _, message) = early("t.js", &format!("'use strict'; var {word} = 1;"));
+            assert_eq!(
+                message, "Unexpected strict mode reserved word",
+                "for {word}"
+            );
+
+            parse("t.js", &format!("var {word} = 1;"))
+                .unwrap_or_else(|error| panic!("{word} is a fine name in sloppy code: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_strict_reserved_word_is_refused_wherever_a_name_can_go() {
+        // Reading one is enough. There is nothing to write and nothing to bind in `public;`, and
+        // it is still a `SyntaxError`, because the word is not an identifier at all.
+        for source in [
+            "'use strict'; public;",
+            "'use strict'; public = 1;",
+            "'use strict'; var public = 1;",
+            "'use strict'; function public() {}",
+            "'use strict'; function f(public) {}",
+            "'use strict'; try { f(); } catch (public) {}",
+            "'use strict'; public++;",
+            "'use strict'; f(public);",
+        ] {
+            let (_, _, message) = early("t.js", source);
+            assert_eq!(
+                message, "Unexpected strict mode reserved word",
+                "for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_and_arguments_are_refused_where_a_name_moves_and_nowhere_else() {
+        // The rule is narrower than the reserved word rule and the two are worth keeping apart.
+        // Strict mode stops a program moving these two names so that a reader can tell what they
+        // refer to, so binding one or writing to one is an error and reading one is not.
+        for name in ["eval", "arguments"] {
+            for source in [
+                format!("'use strict'; var {name} = 1;"),
+                format!("'use strict'; {name} = 42;"),
+                format!("'use strict'; {name} += 1;"),
+                format!("'use strict'; {name}++;"),
+                format!("'use strict'; function {name}() {{}}"),
+                format!("'use strict'; function f({name}) {{}}"),
+                format!("'use strict'; try {{ f(); }} catch ({name}) {{}}"),
+            ] {
+                let (_, _, message) = early("t.js", &source);
+                assert_eq!(
+                    message, "Unexpected eval or arguments in strict mode",
+                    "for {source}"
+                );
+            }
+
+            // Reading is allowed and stays a runtime question. Node answers `x = arguments;` with
+            // a `ReferenceError` when it runs, not a `SyntaxError` before it does.
+            parse("t.js", &format!("'use strict'; var x = {name};"))
+                .unwrap_or_else(|error| panic!("reading {name} is legal: {error}"));
+
+            parse("t.js", &format!("var {name} = 1;"))
+                .unwrap_or_else(|error| panic!("{name} is a fine name in sloppy code: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_property_named_after_a_reserved_word_is_left_alone() {
+        // A property is not a name in the sense the rule cares about, so the two checks must never
+        // see one. They cannot, because a property name is adapted at its own site.
+        parse(
+            "t.js",
+            "'use strict'; var o = { public: 1, static: 2 }; o.public;",
+        )
+        .expect("property names are not identifiers");
+    }
+
+    #[test]
+    fn a_function_name_is_checked_against_the_functions_own_strictness() {
+        // Nothing outside this function is strict and the name is still refused, because the
+        // directive inside it is what makes the name a problem. This is why the check waits until
+        // after the directives have been read rather than using the enclosing value.
+        let (_, _, message) = early("t.js", "function eval() { 'use strict'; }");
+        assert_eq!(message, "Unexpected eval or arguments in strict mode");
+
+        let (_, _, message) = early("t.js", "function f(eval) { 'use strict'; }");
+        assert_eq!(message, "Unexpected eval or arguments in strict mode");
+
+        parse("t.js", "function eval() {}").expect("sloppy code can still call it eval");
+    }
+
+    #[test]
+    fn the_refusal_points_at_the_word_rather_than_the_statement() {
+        // A message with the wrong column in it is worse than no column, because it sends the
+        // reader to a line and then to the wrong place on it.
+        let (line, column, _) = early("t.js", "'use strict';\nvar public = 1;");
+        assert_eq!((line, column), (2, 5));
     }
 
     #[test]
