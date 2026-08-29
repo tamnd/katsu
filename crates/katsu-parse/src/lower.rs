@@ -43,12 +43,14 @@
 //! functions with many blocks rather than anything incorrect.
 
 use katsu_ir::{
-    BlueprintIndex, CacheIndex, CodeOffset, ConstIndex, FunctionBlueprint, Handler, Op, Register,
+    AccessorHalf, BlueprintIndex, CacheIndex, CodeOffset, ConstIndex, FunctionBlueprint, Handler,
+    Op, Register,
 };
 
 use crate::ast::{
     AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, ForInit, Func,
-    Ident, LogicalOp, Module, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    Ident, LogicalOp, Module, PropertyKind, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp,
+    UpdateOp,
 };
 use crate::scope::{BindingKind, FunctionId, Reference, Resolution, Scopes};
 
@@ -1956,16 +1958,37 @@ impl<'a> Lowerer<'a> {
                     let value = self.expr(&property.value)?;
                     self.release(mark);
                     let key = self.constant(&property.name.name);
-                    let cache = self.cache();
-                    self.emit(
-                        property.span.start,
-                        Op::SetProp {
+                    // Every property in a literal defines rather than assigns. A store would ask
+                    // the prototype chain for permission, so a setter on `Object.prototype` would
+                    // run and the object would come out without the property, and a store cannot
+                    // replace an accessor with a value the way `{get x() {}, x: 5}` has to.
+                    //
+                    // An accessor half gets no inline cache. There is nothing for one to remember,
+                    // because the shape it produces depends on what the property already was.
+                    let op = match property.kind {
+                        PropertyKind::Value => {
+                            let cache = self.cache();
+                            Op::DefineValue {
+                                obj: register,
+                                key,
+                                value,
+                                cache,
+                            }
+                        }
+                        PropertyKind::Getter => Op::DefineAccessor {
                             obj: register,
                             key,
                             value,
-                            cache,
+                            half: AccessorHalf::Getter,
                         },
-                    );
+                        PropertyKind::Setter => Op::DefineAccessor {
+                            obj: register,
+                            key,
+                            value,
+                            half: AccessorHalf::Setter,
+                        },
+                    };
+                    self.emit(property.span.start, op);
                 }
                 Ok(register)
             }
@@ -2681,9 +2704,29 @@ mod tests {
             "
             new_object r0, 2
             load_int r1, 1
-            set_prop r0, k0, r1, ic0
+            define_value r0, k0, r1, ic0
             load_int r1, 2
-            set_prop r0, k1, r1, ic1
+            define_value r0, k1, r1, ic1
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn an_accessor_in_a_literal_is_defined_rather_than_stored_one_half_at_a_time() {
+        // Two instructions under one name, because the two halves are two entries in the source and
+        // joining them is the object model's job. They define rather than store so that no setter
+        // up the prototype chain is consulted, which a store would have to do.
+        let blueprint = lowered("let o = { get a() { return 1; }, set a(v) {} };");
+        assert_code(
+            &code(&blueprint),
+            "
+            new_object r0, 2
+            new_closure r1, fn0
+            define_accessor r0, k0, r1, get
+            new_closure r1, fn1
+            define_accessor r0, k0, r1, set
             load_undefined r1
             return r1
             ",
@@ -2737,15 +2780,16 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_name_is_two_stores_and_the_second_one_wins() {
-        // Falls out of lowering to stores rather than to an instruction that takes a list, and it
-        // is the behaviour the language specifies, so it is worth a test rather than a comment.
+    fn a_duplicate_name_is_two_definitions_and_the_second_one_wins() {
+        // Falls out of lowering property by property rather than to an instruction that takes a
+        // list, and it is the behaviour the language specifies, so it is worth a test rather than a
+        // comment.
         let blueprint = lowered("let o = { a: 1, a: 2 };");
         let text = code(&blueprint);
         assert_eq!(
-            text.matches("set_prop").count(),
+            text.matches("define_value").count(),
             2,
-            "both stores are emitted, {text}"
+            "both definitions are emitted, {text}"
         );
     }
 

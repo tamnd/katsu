@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use katsu_gc::{
     AccessorPairRef, Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef,
 };
-use katsu_ir::{Constant, FunctionBlueprint, Op, Register};
+use katsu_ir::{AccessorHalf, Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
 
 use crate::inspect;
@@ -853,6 +853,52 @@ impl Interpreter {
             .ok_or(RuntimeError::OutOfMemory)
     }
 
+    /// Define one half of an accessor written in an object literal.
+    ///
+    /// The two halves of `{get x() {}, set x(v) {}}` are two entries in the source and one property
+    /// in the result, so the second half to arrive has to find the first and join it rather than
+    /// replace it. Anything else that is already sitting under that name is replaced outright,
+    /// including a data property, because a literal defines its properties in source order and the
+    /// last mention of a name is the one that survives.
+    ///
+    /// Both flags are true. That is the difference between the notation and `Object.defineProperty`,
+    /// where every flag a descriptor does not mention defaults to false.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the pair or the new shape.
+    fn define_half(
+        &mut self,
+        object: Value,
+        name: StringRef,
+        function: Value,
+        half: AccessorHalf,
+    ) -> Result<(), RuntimeError> {
+        let Some(target) = self.as_object(object) else {
+            return Ok(());
+        };
+        let cage = self.isolate.cage();
+        let existing = target
+            .find(cage, name)
+            .filter(|(_, attributes)| attributes.is_accessor())
+            .and_then(|(index, _)| target.value_at(cage, index))
+            .map(Value::from_bits);
+        let (getter, setter) = existing.map_or((None, None), |pair| self.accessor_halves(pair));
+        let (getter, setter) = match half {
+            AccessorHalf::Getter => (Some(function), setter),
+            AccessorHalf::Setter => (getter, Some(function)),
+        };
+        let pair = self.accessor_pair(getter, setter)?;
+        target
+            .define(
+                self.isolate.heap_mut(),
+                name,
+                pair.to_bits(),
+                Attributes::accessor(true, true),
+            )
+            .ok_or(RuntimeError::OutOfMemory)
+    }
+
     /// Run a blueprint from its first instruction and return the value it returns.
     ///
     /// The frame is popped whether the body returned or threw, so an error leaves the interpreter
@@ -1470,6 +1516,43 @@ impl Interpreter {
                         }
                         None => {}
                     }
+                }
+
+                // A property of an object literal. The object is the one being built a few
+                // instructions ago, so it is always an object and the nullish checks that guard a
+                // store have nothing to do here.
+                Op::DefineValue {
+                    obj, key, value, ..
+                } => {
+                    let object = self.stack.get(obj);
+                    let name = self.name_at(constants, key);
+                    let new = self.stack.get(value);
+                    if let Some(target) = self.as_object(object) {
+                        guard!(
+                            target
+                                .define(
+                                    self.isolate.heap_mut(),
+                                    name,
+                                    new.to_bits(),
+                                    Attributes::DEFAULT
+                                )
+                                .ok_or(RuntimeError::OutOfMemory)
+                        );
+                    }
+                }
+
+                // Half an accessor in an object literal, with the same reasoning as above about the
+                // object being known good.
+                Op::DefineAccessor {
+                    obj,
+                    key,
+                    value,
+                    half,
+                } => {
+                    let object = self.stack.get(obj);
+                    let name = self.name_at(constants, key);
+                    let function = self.stack.get(value);
+                    guard!(self.define_half(object, name, function, half));
                 }
 
                 // A property read and a call, kept in one opcode so that the receiver is not lost
@@ -5604,6 +5687,60 @@ mod tests {
         assert_eq!(
             interpreter.display(value),
             "{ log: [Function: log], version: 6 }"
+        );
+    }
+
+    #[test]
+    fn the_two_halves_of_an_accessor_in_a_literal_become_one_property() {
+        // The setter runs on a write and the getter runs on the read that follows, which is only
+        // possible if the second half joined the first instead of replacing it.
+        assert_eq!(
+            evaluate_number(
+                "let o = { v: 0, get x() { return this.v * 2; }, set x(n) { this.v = n; } }; o.x = 21; o.x"
+            ),
+            42.0
+        );
+        assert_eq!(
+            evaluate_display(
+                "function id(v) { return v; } id({ get x() { return 1; }, set x(n) {} })"
+            ),
+            "{ x: [Getter/Setter] }"
+        );
+    }
+
+    #[test]
+    fn an_accessor_half_written_on_its_own_leaves_the_other_half_missing() {
+        assert_eq!(
+            evaluate_display("function id(v) { return v; } id({ get x() { return 1; } })"),
+            "{ x: [Getter] }"
+        );
+        assert_eq!(
+            evaluate_display("function id(v) { return v; } id({ set x(n) {} })"),
+            "{ x: [Setter] }"
+        );
+        // Reading a property that only has a setter is undefined rather than an error, because
+        // there is nothing to call and nothing stored.
+        assert_eq!(
+            evaluate_display("let o = { set x(n) {} }; o.x"),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn a_value_after_an_accessor_replaces_it_and_keeps_the_place_it_had() {
+        // Last mention wins, because a literal defines its properties in source order. The position
+        // is the first mention's, which is the same rule an ordinary overwrite follows.
+        assert_eq!(
+            evaluate_display(
+                "function id(v) { return v; } id({ get x() { return 1; }, y: 2, x: 5 })"
+            ),
+            "{ x: 5, y: 2 }"
+        );
+        assert_eq!(
+            evaluate_display(
+                "function id(v) { return v; } id({ x: 5, y: 2, get x() { return 1; } })"
+            ),
+            "{ x: [Getter], y: 2 }"
         );
     }
 
