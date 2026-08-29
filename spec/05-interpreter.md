@@ -276,25 +276,35 @@ The measurement paid for itself immediately. The first run of it reported 43 nan
 
 ### 5.3.7 What a `try` costs when nothing goes wrong, and what a throw costs when something does
 
-The handler table of 4.10 is a trade, and both sides of it are measurable, so both sides are measured here rather than argued about. All five numbers are a thousand iterations of a `while` loop divided by a thousand, so they are per iteration and not per instruction, and the loop is the same loop in all five.
+The handler table of 4.10 is a trade, and both sides of it are measurable, so both sides are measured here rather than argued about. Every number is a thousand iterations of a `while` loop divided by a thousand, so they are per iteration and not per instruction, and the loop is the same loop throughout.
 
-These ran on the m4 only. The other two reference machines were not reachable when this was written, and one column is enough for what the table is for, which is the ratios inside it. The absolutes belong next to the ones in 5.3.5 and should be read as the same machine on a different day.
+These ran on `gamingpc-win`, pinned to one performance core with `start /affinity`, which is why the intervals are tight enough that a four nanosecond difference is a result rather than a mood. The earlier version of this table was measured on the m4 and has been replaced rather than extended, because the m4 was indexing photos throughout the session these were taken in and moved by more between reruns than several of the differences below. `gamingpc` under WSL2 was not reachable. One column that can be trusted is worth more than three that cannot, and the table is for the ratios inside it anyway.
 
-| Operation | m4 |
+| Operation | gamingpc-win |
 |---|---|
-| An iteration of a plain loop, for scale | 17.21 ns |
-| The same iteration wrapped in a `try` that never fires | 19.83 ns |
-| An iteration that throws a number and catches it in the same frame | 14.55 ns |
-| The same throw caught three frames up | 50.32 ns |
-| The same shape throwing a `TypeError` instead of a number | 153.14 ns |
+| An iteration of a plain loop, for scale | 14.29 ns |
+| The same iteration wrapped in a `try` that never fires | 15.14 ns |
+| The same iteration wrapped in a `finally` that always runs | 19.09 ns |
+| An iteration that throws a number and catches it in the same frame | 16.36 ns |
+| The same throw travelling through one `finally` on its way out | 27.76 ns |
+| A call and a `return`, for scale | 23.98 ns |
+| The same `return` routed through a `finally` | 41.57 ns |
+| A throw caught three frames up | 51.54 ns |
+| A caught `TypeError` instead of a caught number | 196.58 ns |
 
-The first two rows are the claim the design exists to make, and the honest version of it is not zero. A `try` that never fires costs one `jump` per exit, over the handler and into the code after it, which is the same jump an `if` with no `else` emits, plus one register of frame width for the slot the caught value would land in. Nothing is pushed on entry and nothing is popped on exit, because there is no handler stack to push onto, and that is the part the design was for. Both of those remaining costs come from lowering the handler in line, and lowering it out of line would remove them, which is a thing to do rather than a thing to explain.
+The first two rows are the claim the design exists to make, and the honest version of it is not zero. A `try` that never fires costs 0.85 ns, which is one `jump` per exit, over the handler and into the code after it, the same jump an `if` with no `else` emits, plus one register of frame width for the slot the caught value would land in. Nothing is pushed on entry and nothing is popped on exit, because there is no handler stack to push onto, and that is the part the design was for. Both remaining costs come from lowering the handler in line, and lowering it out of line would remove them, which is a thing to do rather than a thing to explain.
 
-The third row is the one that looks wrong and is not. An iteration that throws is cheaper than an iteration that does the arithmetic, because throwing skips the arithmetic and the jump and replaces them with one `throw`, a walk of a one entry table and a store into the handler's register. The useful reading is not that throwing is free but that a throw caught nearby is in the same range as ordinary instructions rather than an order of magnitude above them, which is what a table search should cost when the table is short.
+The third row is what a `finally` costs when nothing goes wrong, and it is 4.80 ns over a plain loop and 3.95 ns over a `try` and `catch`. That is three instructions on the normal path, the `load_int` that sets the token to zero, the jump into the body and the `jump_if_false` that lets a normal completion out of the dispatch, plus two registers of frame width. Against 1.55 ns per instruction from 5.3.5 that is the whole of it, so a `finally` costs what its instructions cost and nothing is hiding. It is four to five times what a `catch` costs, and the reason is not the token, it is that a `catch` gets to be zero instructions on the path that does not throw and a `finally` cannot be, because it runs on that path too.
 
-The fourth row prices unwinding. Three frames of distance adds 35.8 ns, and three calls measured on the same machine in the same session cost 25.5 ns of that, so popping a frame and missing its handler table is about 3.4 ns, which is the frame pop and a table that is empty. A throw is charged for the calls it has to walk back through and very little else.
+The fourth row is the one that looks wrong and is not. An iteration that throws costs about what an iteration that does the arithmetic costs, because throwing skips the arithmetic and the jump and replaces them with one `throw`, a walk of a one entry table and a store into the handler's register. The useful reading is not that throwing is free but that a throw caught nearby is in the same range as ordinary instructions rather than an order of magnitude above them, which is what a table search should cost when the table is short.
 
-The fifth row is the one with a number worth acting on. A caught `TypeError` costs 138 ns more than a caught number, and deferring the object to the `catch` only removes part of that. What is left at the throw is the message, which is a `format!` and a `String` before anything knows whether a handler exists, and what is left at the `catch` is interning the name, allocating the message on the heap and building a two property object with a shape. The first half is the one to attack, because it is paid by every engine error including the ones nothing catches, and making the message a closure over what it needs rather than a built string would move all of it behind the same test that already defers the object. That is exactly the shape of the bug 5.3.6 found in property reads and it is worth writing down before it is fixed rather than after.
+The fifth row prices a `finally` in the path of a throw at 11.40 ns, which is the prologue that sets the token, the dispatch, and a second walk of the table for the `throw` the dispatch re-issues. The second walk is the honest cost of not chaining: a completion that passes through two `finally` clauses searches the table twice rather than being handed from one to the next. That is the right trade at this size, because the table is short and the alternative is state the search has to carry, and it is a thing to revisit when a table is long rather than a thing to fix now.
+
+The sixth and seventh rows price routing a `return`, and 17.59 ns is the largest number in this table that is ours rather than the language's. It is eight instructions, a `move` into the payload, the `load_int` and jump that enter the body, and a dispatch of `jump_if_false`, `load_int`, `strict_equal` and `jump_if_true` before the `return`. The `strict_equal` is the part worth attacking. It goes through an inline cache and a general comparison in order to ask whether a small integer we put in a register one instruction ago equals a small integer constant, which is a question a compare against an immediate could answer without either. That opcode does not exist yet because nothing needed it, and this is the first thing that does.
+
+The eighth row prices unwinding. Three frames of distance adds 35.18 ns, and three calls measured on the same machine in the same session cost 33.30 ns of that, so popping a frame and missing its handler table is about 0.6 ns. A throw is charged for the calls it has to walk back through and very little else, which is the strongest form of the claim the table design was making.
+
+The last row is the one with a number worth acting on. A caught `TypeError` costs 180 ns more than a caught number, and deferring the object to the `catch` only removes part of that. What is left at the throw is the message, which is a `format!` and a `String` before anything knows whether a handler exists, and what is left at the `catch` is interning the name, allocating the message on the heap and building a two property object with a shape. The first half is the one to attack, because it is paid by every engine error including the ones nothing catches, and making the message a closure over what it needs rather than a built string would move all of it behind the same test that already defers the object. That is exactly the shape of the bug 5.3.6 found in property reads and it is worth writing down before it is fixed rather than after.
 
 ## 5.4 Our own stack
 
