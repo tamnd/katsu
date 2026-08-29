@@ -4,6 +4,7 @@
 //! See `spec/05-interpreter.md` for dispatch, `spec/07-object-model.md` for values and
 //! shapes, and `spec/03-architecture.md` for why an isolate is `Send` but not `Sync`.
 
+mod clock;
 mod global;
 mod inspect;
 mod interpret;
@@ -19,6 +20,7 @@ use std::fmt;
 use katsu_gc::{Atom, AtomTable, BumpHeap, Cage, CageError, ShapeRef, StringRef};
 use katsu_ir::FunctionBlueprint;
 
+pub use clock::{now_ms, origin_ms, start as start_clock};
 pub use global::Globals;
 pub use interpret::{Interpreter, Interrupt, RuntimeError};
 pub use native::{NativeFn, Natives, arg};

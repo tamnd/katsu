@@ -6,7 +6,7 @@
 
 pub use katsu_api::{
     Discard, Error, Interrupt, Isolate, Output, Recorder, Runtime, Standard, Stream, Value,
-    jit_enabled,
+    jit_enabled, start_clock,
 };
 pub use katsu_macros::export;
 
