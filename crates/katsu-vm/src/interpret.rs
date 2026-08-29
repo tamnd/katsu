@@ -415,7 +415,7 @@ impl Interpreter {
     /// negative zero is `"0"`. [`Interpreter::display`] is the other one and the two differ on
     /// exactly those two cases on purpose.
     ///
-    /// It goes through the same [`Interpreter::text_of`] that `'' + x` goes through, rather than
+    /// It goes through the same private `text_of` that `'' + x` goes through, rather than
     /// reimplementing the rules, because the one thing `String(x)` must never do is disagree with
     /// concatenation about what a value's text is.
     #[must_use]
