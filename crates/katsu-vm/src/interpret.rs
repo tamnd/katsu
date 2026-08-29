@@ -109,6 +109,18 @@ pub enum RuntimeError {
     /// gets a clear refusal naming the opcode rather than a wrong answer or a crash.
     #[error("{0} is not implemented yet")]
     NotImplemented(Op),
+    /// A builtin that exists but has not been finished, refusing by name.
+    ///
+    /// Separate from [`RuntimeError::NotImplemented`] because that one names an opcode and this one
+    /// names a piece of the standard library, and because a native has no opcode to point at. Both
+    /// mean the same thing to everybody above: this is our gap and not the program's mistake.
+    ///
+    /// It exists so that a half built builtin can say so. The alternative is leaving the method off
+    /// the object, which makes a missing feature arrive as `JSON.parse is not a function`, and that
+    /// is an ordinary JavaScript error that a program will feature detect around and a reader will
+    /// take for a bug in their own code.
+    #[error("{0}")]
+    Unsupported(String),
     /// The heap had no room for an object.
     ///
     /// Not a JavaScript error, because a program cannot catch running out of memory under Node
@@ -395,6 +407,93 @@ impl Interpreter {
             return "-0".to_owned();
         }
         Self::primitive_text(value)
+    }
+
+    /// `ToString` of a value, as Rust text.
+    ///
+    /// This is the language's conversion and not inspection, so an object is `[object Object]` and
+    /// negative zero is `"0"`. [`Interpreter::display`] is the other one and the two differ on
+    /// exactly those two cases on purpose.
+    ///
+    /// It goes through the same [`Interpreter::text_of`] that `'' + x` goes through, rather than
+    /// reimplementing the rules, because the one thing `String(x)` must never do is disagree with
+    /// concatenation about what a value's text is.
+    #[must_use]
+    pub fn to_text(&self, value: Value) -> String {
+        self.text_of(value)
+    }
+
+    /// Put text on the heap and hand back a value pointing at it.
+    ///
+    /// How a builtin written in Rust returns a string. Everything else it might want to return is a
+    /// primitive that fits in a [`Value`] on its own, so this is the only allocation a builtin has to
+    /// ask the interpreter for, and it has to ask, because a string is an address into this
+    /// interpreter's cage and nowhere else.
+    ///
+    /// Not interned. An atom costs a hash and a lookup and earns them back when the same text is
+    /// mentioned many times, which is true of property names and false of the answer a builtin
+    /// computed for one call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the text.
+    pub fn new_string(&mut self, text: &str) -> Result<Value, RuntimeError> {
+        let string = self
+            .isolate
+            .allocate_string(text)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(string.slot(), self.isolate.cage()))
+    }
+
+    /// The text of a value that really is a string, and nothing else.
+    ///
+    /// `None` for a number, a boolean, an object or anything else, without converting. A builtin
+    /// that has to treat `"1"` differently from `1` needs to ask this rather than asking for the
+    /// text, and `JSON.stringify` is exactly that builtin: one of those two comes out quoted.
+    #[must_use]
+    pub fn as_text(&self, value: Value) -> Option<String> {
+        self.as_string(value)
+            .map(|string| string.to_utf8_lossy(self.isolate.cage()).into_owned())
+    }
+
+    /// Whether calling this value would work.
+    ///
+    /// True for a function written in JavaScript and for one written in Rust. There is nothing else
+    /// callable yet, and when there is, this is the one place that has to learn about it.
+    #[must_use]
+    pub fn is_callable(&self, value: Value) -> bool {
+        self.as_closure(value).is_some() || self.as_native(value).is_some()
+    }
+
+    /// The own properties of an object, in the order they were added, or `None` if it is not one.
+    ///
+    /// Insertion order rather than any other order, because that is the order the language
+    /// guarantees for string keys that are not array indices, and it is the order `JSON.stringify`
+    /// and `Object.keys` both have to produce. It falls out of shapes for free: a shape is a
+    /// transition chain and the chain is in the order the properties arrived.
+    ///
+    /// `None` and not an empty vector for a non object, because a caller usually has something
+    /// different to do with a number than with an object that happens to have no properties.
+    #[must_use]
+    pub fn own_properties(&self, value: Value) -> Option<Vec<(String, Value)>> {
+        let object = self.as_object(value)?;
+        let cage = self.isolate.cage();
+        Some(
+            object
+                .names(cage)
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let slot = object
+                        .value_at(cage, u32::try_from(index).unwrap_or(u32::MAX))
+                        .expect("a name at this index means there is a value at it");
+                    (
+                        name.to_utf8_lossy(cage).into_owned(),
+                        Value::from_bits(slot),
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Run a blueprint from its first instruction and return the value it returns.
@@ -1089,14 +1188,23 @@ impl Interpreter {
 
     /// Whether a `catch` is allowed to see this error at all.
     ///
-    /// The three that are not are not JavaScript exceptions. A program cannot catch running out of
-    /// memory under Node, it cannot catch being killed by a worker terminating, and an opcode this
-    /// build has not written yet is a gap in katsu rather than an event in the program, so letting
-    /// a `catch` swallow one would turn a missing feature into a wrong answer.
+    /// The four that are not are not JavaScript exceptions. A program cannot catch running out of
+    /// memory under Node, it cannot catch being killed by a worker terminating, and an opcode or a
+    /// builtin this build has not written yet is a gap in katsu rather than an event in the program,
+    /// so letting a `catch` swallow one would turn a missing feature into a wrong answer.
+    ///
+    /// The unfinished builtin belongs in this list for a sharper reason than the others. A program
+    /// that wraps `JSON.parse` in a `try` is doing something completely reasonable, because parsing
+    /// really can fail on bad input, and if our refusal were catchable that program would take our
+    /// gap for malformed input and carry on down its error path with a wrong answer and no
+    /// indication anything was missing.
     const fn catchable(error: &RuntimeError) -> bool {
         !matches!(
             error,
-            RuntimeError::NotImplemented(_) | RuntimeError::OutOfMemory | RuntimeError::Interrupted
+            RuntimeError::NotImplemented(_)
+                | RuntimeError::Unsupported(_)
+                | RuntimeError::OutOfMemory
+                | RuntimeError::Interrupted
         )
     }
 
@@ -1644,22 +1752,36 @@ impl Interpreter {
     /// it is the same piece of work that makes `x is not a function` name `x` instead of naming the
     /// value, and until it lands this at least says the thing is a function.
     fn coerce_to_string(&mut self, value: Value) -> Result<StringRef, RuntimeError> {
+        // A value that is already a string hands back the reference it already has rather than a
+        // copy of it, which is why this cannot simply call `text_of` and allocate the answer.
         if let Some(string) = self.as_string(value) {
             return Ok(string);
         }
-        let text = match self.as_closure(value) {
-            Some(closure) => self.function_text(closure),
-            // An object converts to `[object Object]` and not to what `console.log` shows, because
-            // this is `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and
-            // the two differing is a real distinction in the language rather than an inconsistency.
-            None => match self.as_native(value) {
-                Some(native) => self.native_text(native),
-                None => Self::primitive_text(value),
-            },
-        };
+        let text = self.text_of(value);
         self.isolate
             .allocate_string(&text)
             .ok_or(RuntimeError::OutOfMemory)
+    }
+
+    /// The rules of `ToString`, as Rust text and without touching the heap.
+    ///
+    /// Split out of [`Interpreter::coerce_to_string`] so that `String(x)` and `'' + x` cannot come
+    /// to disagree. They are the same conversion in the language and a second copy of these rules
+    /// would eventually be a second answer.
+    fn text_of(&self, value: Value) -> String {
+        if let Some(string) = self.as_string(value) {
+            return string.to_utf8_lossy(self.isolate.cage()).into_owned();
+        }
+        if let Some(closure) = self.as_closure(value) {
+            return self.function_text(closure);
+        }
+        if let Some(native) = self.as_native(value) {
+            return self.native_text(native);
+        }
+        // An object converts to `[object Object]` and not to what `console.log` shows, because this
+        // is `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and the two
+        // differing is a real distinction in the language rather than an inconsistency.
+        Self::primitive_text(value)
     }
 
     /// The text of a primitive, meaning everything that is not on the heap.
