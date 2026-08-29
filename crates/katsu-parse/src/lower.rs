@@ -170,6 +170,18 @@ struct Lowerer<'a> {
     /// `finally`'s protected block leaves through the `finally`, and a `break` inside a loop written
     /// inside that block does not, and only the interleaving says which is which.
     enclosing: Vec<Enclosing>,
+    /// Labels written on the statement about to be lowered, which it takes as it opens its frame.
+    ///
+    /// A label is not a construct of its own in the bytecode, it is a name on the construct it sits
+    /// in front of, so `a: while (x)` is one loop frame wearing one name rather than two frames.
+    /// This is how the name gets from the label to the loop without every loop taking a parameter
+    /// that is empty almost every time.
+    pending_labels: Vec<String>,
+    /// The next token value a labelled completion can travel as through a `finally`.
+    ///
+    /// Counted per function and never reset, so two labelled jumps aimed at different places can
+    /// never collide inside one dispatch. The four fixed values are what everything else uses.
+    next_completion: i32,
 }
 
 /// Something a `break`, a `continue` or a `return` has to deal with on its way out.
@@ -182,45 +194,98 @@ enum Enclosing {
     /// it aims at the back edge instruction at the bottom of the loop, so that every iteration
     /// passes through the counter the tiering decision is going to read.
     Breakable {
-        /// True for a loop, false for a switch, which is the whole difference `continue` cares
-        /// about.
-        loops: bool,
+        /// Which of the three it is, which decides what can aim at it.
+        kind: BreakableKind,
+        /// The labels written on it, outermost first, usually none.
+        ///
+        /// A construct can wear more than one, because `a: b: for (;;)` puts both names on the same
+        /// loop, and a `break` or a `continue` may use either of them.
+        labels: Vec<String>,
         /// Jumps waiting for the instruction after the construct.
         breaks: Vec<usize>,
-        /// Jumps waiting for the back edge, empty for a switch.
+        /// Jumps waiting for the back edge, empty for a switch and for a label.
         continues: Vec<usize>,
     },
     /// A `finally` body that every way out of the block it guards has to pass through first.
     Finally {
-        /// Holds which of the five completions the body was reached by.
+        /// Holds which of the completions the body was reached by.
         token: Register,
         /// Holds the value that completion is carrying, which is a thrown value or a returned one.
         payload: Register,
         /// Jumps into the body, from the normal path and from every abrupt one.
         entries: Vec<usize>,
-        /// Whether a `return` routed through here, and so whether the dispatch has to ask about one.
-        returns: bool,
-        /// Whether a `break` routed through here.
-        breaks: bool,
-        /// Whether a `continue` routed through here.
-        continues: bool,
+        /// The abrupt completions that actually routed through here, and the token value each one
+        /// travels as.
+        ///
+        /// A list rather than three flags, because a labelled jump is not one completion but one
+        /// per label it aims at: `a: { b: { try { break a; } finally {} } }` has to come out of the
+        /// dispatch knowing which of the two it was carrying. The unlabelled cases keep their fixed
+        /// token values so the common `finally` compares the same numbers it always did.
+        outcomes: Vec<(i32, Outcome)>,
     },
 }
 
+/// What a `break` or a `continue` is allowed to aim at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BreakableKind {
+    /// A loop, which both a `break` and a `continue` can aim at, with or without a label.
+    Loop,
+    /// A switch, which an unlabelled `break` can leave and a `continue` walks straight past.
+    Switch,
+    /// Anything else wearing a label, which only a `break` naming that label can leave.
+    ///
+    /// A plain block is the usual one. It is deliberately invisible to an unlabelled `break`,
+    /// because `while (x) { a: { break; } }` leaves the loop and not the block.
+    Labelled,
+}
+
+/// An abrupt completion on its way out through a `finally`.
+///
+/// The label is carried rather than resolved, because the frame the jump is aimed at is inside the
+/// construct being lowered and will be gone by the time the dispatch re issues it. A name survives
+/// that, and it is unambiguous, since a label nested inside another of the same name is refused
+/// before lowering ever runs.
+#[derive(Clone, PartialEq, Eq)]
+enum Outcome {
+    Throw,
+    Return,
+    Break(Option<String>),
+    Continue(Option<String>),
+}
+
 impl Enclosing {
-    fn loop_() -> Self {
+    fn loop_(labels: Vec<String>) -> Self {
         Self::Breakable {
-            loops: true,
+            kind: BreakableKind::Loop,
+            labels,
             breaks: Vec::new(),
             continues: Vec::new(),
         }
     }
 
-    fn switch() -> Self {
+    fn switch(labels: Vec<String>) -> Self {
         Self::Breakable {
-            loops: false,
+            kind: BreakableKind::Switch,
+            labels,
             breaks: Vec::new(),
             continues: Vec::new(),
+        }
+    }
+
+    fn labelled(labels: Vec<String>) -> Self {
+        Self::Breakable {
+            kind: BreakableKind::Labelled,
+            labels,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        }
+    }
+
+    /// Whether a jump naming this label can aim at this frame.
+    fn wears(&self, label: &str) -> bool {
+        match self {
+            Self::Breakable { labels, .. } => labels.iter().any(|held| held == label),
+            Self::Finally { .. } => false,
         }
     }
 
@@ -275,6 +340,8 @@ impl<'a> Lowerer<'a> {
             max_target: 0,
             end: span.end,
             enclosing: Vec::new(),
+            pending_labels: Vec::new(),
+            next_completion: COMPLETION_CONTINUE + 1,
         }
     }
 
@@ -892,8 +959,11 @@ impl<'a> Lowerer<'a> {
                 discriminant,
                 cases,
             } => self.switch(at, discriminant, cases)?,
-            StmtKind::Break => self.break_out(at),
-            StmtKind::Continue => self.continue_on(at),
+            StmtKind::Labeled { label, body } => self.labeled(label, body)?,
+            StmtKind::Break(label) => self.break_out(at, label.as_ref().map(|it| it.name.as_str())),
+            StmtKind::Continue(label) => {
+                self.continue_on(at, label.as_ref().map(|it| it.name.as_str()));
+            }
             StmtKind::Throw(value) => {
                 let mark = self.next_temp;
                 let src = self.expr(value)?;
@@ -924,22 +994,32 @@ impl<'a> Lowerer<'a> {
             unreachable!("innermost_finally only ever answers with a finally")
         };
         self.emit(at, Op::Move { dst: payload, src });
-        self.route(at, index, COMPLETION_RETURN);
+        self.route(at, index, Outcome::Return);
     }
 
     /// Emit a `break`, or send it through a `finally` that is in the way.
     ///
-    /// Only the innermost frame is looked at, because whatever it is, it is what the `break` reaches
-    /// first. A `finally` there sends the break on after its body has run, and a loop or a switch
-    /// there is the thing being left.
-    fn break_out(&mut self, at: u32) {
+    /// The search stops at the first frame the `break` could be talking about, and a `finally` counts
+    /// as one of those wherever it sits, because its body has to run before the jump goes anywhere.
+    /// An unlabelled `break` walks past a labelled block, since `while (x) { a: { break; } }` leaves
+    /// the loop, and a labelled one walks past everything that is not wearing its name.
+    fn break_out(&mut self, at: u32, label: Option<&str>) {
         let index = self
             .enclosing
-            .len()
-            .checked_sub(1)
+            .iter()
+            .rposition(|frame| match label {
+                Some(label) => matches!(frame, Enclosing::Finally { .. }) || frame.wears(label),
+                None => !matches!(
+                    frame,
+                    Enclosing::Breakable {
+                        kind: BreakableKind::Labelled,
+                        ..
+                    }
+                ),
+            })
             .expect("scope analysis rejected a break with nothing to leave");
         if matches!(self.enclosing[index], Enclosing::Finally { .. }) {
-            self.route(at, index, COMPLETION_BREAK);
+            self.route(at, index, Outcome::Break(label.map(str::to_owned)));
             return;
         }
         let jump = self.emit(at, Op::Jump { target: UNPATCHED });
@@ -952,20 +1032,32 @@ impl<'a> Lowerer<'a> {
     /// Emit a `continue`, or send it through a `finally` that is in the way.
     ///
     /// A switch is walked past because a `continue` inside one belongs to the loop around it, and a
-    /// `finally` is not, because its body runs whatever the `continue` is aimed at.
-    fn continue_on(&mut self, at: u32) {
+    /// `finally` is not, because its body runs whatever the `continue` is aimed at. A labelled
+    /// `continue` also walks past every loop that is not wearing its name, which is the only thing
+    /// it can do that the unlabelled one cannot.
+    fn continue_on(&mut self, at: u32, label: Option<&str>) {
         let index = self
             .enclosing
             .iter()
             .rposition(|frame| {
-                matches!(
+                if matches!(frame, Enclosing::Finally { .. }) {
+                    return true;
+                }
+                let loops = matches!(
                     frame,
-                    Enclosing::Finally { .. } | Enclosing::Breakable { loops: true, .. }
-                )
+                    Enclosing::Breakable {
+                        kind: BreakableKind::Loop,
+                        ..
+                    }
+                );
+                match label {
+                    Some(label) => loops && frame.wears(label),
+                    None => loops,
+                }
             })
             .expect("scope analysis rejected a continue with no loop around it");
         if matches!(self.enclosing[index], Enclosing::Finally { .. }) {
-            self.route(at, index, COMPLETION_CONTINUE);
+            self.route(at, index, Outcome::Continue(label.map(str::to_owned)));
             return;
         }
         let jump = self.emit(at, Op::Jump { target: UNPATCHED });
@@ -987,10 +1079,31 @@ impl<'a> Lowerer<'a> {
     /// The token is what the dispatch after the body reads to decide where to send the completion
     /// on, and recording the kind on the frame is what keeps that dispatch to the completions that
     /// can actually arrive rather than all four.
-    fn route(&mut self, at: u32, index: usize, kind: i32) {
-        let Enclosing::Finally { token, .. } = self.enclosing[index] else {
+    fn route(&mut self, at: u32, index: usize, outcome: Outcome) {
+        let Enclosing::Finally {
+            token, outcomes, ..
+        } = &self.enclosing[index]
+        else {
             unreachable!("the caller checked the frame")
         };
+        let token = *token;
+        // Two `break`s aimed at the same place travel as the same token value and share one arm of
+        // the dispatch, which is what keeps the ordinary `finally` down to the numbers it always
+        // compared. Only a jump aimed somewhere new needs a value of its own.
+        let kind = match outcomes.iter().find(|(_, held)| *held == outcome) {
+            Some((kind, _)) => *kind,
+            None => match &outcome {
+                Outcome::Return => COMPLETION_RETURN,
+                Outcome::Break(None) => COMPLETION_BREAK,
+                Outcome::Continue(None) => COMPLETION_CONTINUE,
+                Outcome::Break(Some(_)) | Outcome::Continue(Some(_)) => {
+                    self.next_completion += 1;
+                    self.next_completion - 1
+                }
+                Outcome::Throw => unreachable!("a throw finds its handler without being routed"),
+            },
+        };
+
         self.emit(
             at,
             Op::LoadInt {
@@ -1000,21 +1113,14 @@ impl<'a> Lowerer<'a> {
         );
         let jump = self.emit(at, Op::Jump { target: UNPATCHED });
         let Enclosing::Finally {
-            entries,
-            returns,
-            breaks,
-            continues,
-            ..
+            entries, outcomes, ..
         } = &mut self.enclosing[index]
         else {
             unreachable!("the caller checked the frame")
         };
         entries.push(jump);
-        match kind {
-            COMPLETION_RETURN => *returns = true,
-            COMPLETION_BREAK => *breaks = true,
-            COMPLETION_CONTINUE => *continues = true,
-            _ => unreachable!("only an abrupt completion is routed"),
+        if !outcomes.iter().any(|(_, held)| *held == outcome) {
+            outcomes.push((kind, outcome));
         }
     }
 
@@ -1104,9 +1210,7 @@ impl<'a> Lowerer<'a> {
             token,
             payload,
             entries: Vec::new(),
-            returns: false,
-            breaks: false,
-            continues: false,
+            outcomes: Vec::new(),
         });
         let result = match catch {
             Some(catch) => self.try_catch(at, block, catch),
@@ -1114,11 +1218,7 @@ impl<'a> Lowerer<'a> {
         };
         let end = self.here();
         let Some(Enclosing::Finally {
-            entries,
-            returns,
-            breaks,
-            continues,
-            ..
+            entries, outcomes, ..
         }) = self.enclosing.pop()
         else {
             unreachable!("the finally frame was pushed")
@@ -1167,7 +1267,7 @@ impl<'a> Lowerer<'a> {
         }
         self.body(&finally.body)?;
 
-        self.dispatch(at, token, payload, returns, breaks, continues);
+        self.dispatch(at, token, payload, outcomes);
         self.release(mark);
         Ok(())
     }
@@ -1187,20 +1287,10 @@ impl<'a> Lowerer<'a> {
         at: u32,
         token: Register,
         payload: Register,
-        returns: bool,
-        breaks: bool,
-        continues: bool,
+        outcomes: Vec<(i32, Outcome)>,
     ) {
-        let mut kinds = vec![COMPLETION_THROW];
-        if returns {
-            kinds.push(COMPLETION_RETURN);
-        }
-        if breaks {
-            kinds.push(COMPLETION_BREAK);
-        }
-        if continues {
-            kinds.push(COMPLETION_CONTINUE);
-        }
+        let mut kinds = vec![(COMPLETION_THROW, Outcome::Throw)];
+        kinds.extend(outcomes);
 
         let done = self.emit(
             at,
@@ -1211,7 +1301,7 @@ impl<'a> Lowerer<'a> {
         );
         let last = kinds.pop().expect("a throw is always one of them");
         let mut tests = Vec::with_capacity(kinds.len());
-        for kind in kinds {
+        for (kind, outcome) in kinds {
             let inner = self.next_temp;
             let want = self.alloc();
             self.emit(
@@ -1240,15 +1330,15 @@ impl<'a> Lowerer<'a> {
                 },
             );
             self.release(inner);
-            tests.push((kind, jump));
+            tests.push((outcome, jump));
         }
 
         // The last kind needs no test, because the token is not zero and every other kind has been
         // asked about and jumped away.
-        self.completion(at, last, payload);
-        for (kind, jump) in tests {
+        self.completion(at, &last.1, payload);
+        for (outcome, jump) in tests {
             self.patch(jump);
-            self.completion(at, kind, payload);
+            self.completion(at, &outcome, payload);
         }
         self.patch(done);
     }
@@ -1262,15 +1352,14 @@ impl<'a> Lowerer<'a> {
     ///
     /// A throw does not need that, because the `throw` instruction is inside whatever range guards
     /// this code and the table finds the next handler on its own.
-    fn completion(&mut self, at: u32, kind: i32, payload: Register) {
-        match kind {
-            COMPLETION_THROW => {
+    fn completion(&mut self, at: u32, outcome: &Outcome, payload: Register) {
+        match outcome {
+            Outcome::Throw => {
                 self.emit(at, Op::Throw { src: payload });
             }
-            COMPLETION_RETURN => self.return_value(at, payload),
-            COMPLETION_BREAK => self.break_out(at),
-            COMPLETION_CONTINUE => self.continue_on(at),
-            _ => unreachable!("a normal completion never reaches a dispatch arm"),
+            Outcome::Return => self.return_value(at, payload),
+            Outcome::Break(label) => self.break_out(at, label.as_deref()),
+            Outcome::Continue(label) => self.continue_on(at, label.as_deref()),
         }
     }
 
@@ -1309,6 +1398,7 @@ impl<'a> Lowerer<'a> {
     /// backwards jump rather than a test and a forwards jump, and a loop that never runs costs one
     /// test and nothing else.
     fn while_loop(&mut self, at: u32, test: &Expr, body: &Stmt) -> Result<(), LowerError> {
+        let labels = self.take_labels();
         let top = self.here();
         let mark = self.next_temp;
         let cond = self.expr(test)?;
@@ -1321,7 +1411,7 @@ impl<'a> Lowerer<'a> {
             },
         );
 
-        self.enclosing.push(Enclosing::loop_());
+        self.enclosing.push(Enclosing::loop_(labels));
         let result = self.statement(body);
         let frame = self.enclosing.pop().expect("the loop frame was pushed");
         let (breaks, continues) = frame.jumps();
@@ -1347,6 +1437,46 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    /// Lower a labelled statement, which emits nothing of its own.
+    ///
+    /// A label is a name on the statement after it and not a construct, so nearly always the right
+    /// thing to do is hand the name to that statement and let it wear it. A loop and a switch
+    /// already open a frame a jump can aim at, so they take the pending names as they open it and
+    /// this costs exactly nothing.
+    ///
+    /// Anything else needs a frame of its own, because `a: { break a; }` has somewhere to go and a
+    /// plain block does not open one. That frame is deliberately invisible to an unlabelled `break`,
+    /// so a `break` with no name written inside it still leaves the loop around it.
+    fn labeled(&mut self, label: &Ident, body: &Stmt) -> Result<(), LowerError> {
+        self.pending_labels.push(label.name.clone());
+        if matches!(
+            body.kind,
+            StmtKind::Labeled { .. }
+                | StmtKind::While { .. }
+                | StmtKind::DoWhile { .. }
+                | StmtKind::For { .. }
+                | StmtKind::Switch { .. }
+        ) {
+            return self.statement(body);
+        }
+
+        let labels = std::mem::take(&mut self.pending_labels);
+        self.enclosing.push(Enclosing::labelled(labels));
+        let result = self.statement(body);
+        let frame = self.enclosing.pop().expect("the label frame was pushed");
+        let (breaks, _) = frame.jumps();
+        result?;
+        for jump in breaks {
+            self.patch(jump);
+        }
+        Ok(())
+    }
+
+    /// Take the labels written on the construct being lowered, leaving none for the next one.
+    fn take_labels(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_labels)
+    }
+
     /// Lower a `do while`.
     ///
     /// The body comes first and the test comes after it, which is the whole of the difference from
@@ -1356,9 +1486,10 @@ impl<'a> Lowerer<'a> {
     /// `continue` that jumped to the back edge would turn `do { continue; } while (false)` into an
     /// endless loop.
     fn do_while_loop(&mut self, at: u32, body: &Stmt, test: &Expr) -> Result<(), LowerError> {
+        let labels = self.take_labels();
         let top = self.here();
 
-        self.enclosing.push(Enclosing::loop_());
+        self.enclosing.push(Enclosing::loop_(labels));
         let result = self.statement(body);
         let frame = self.enclosing.pop().expect("the loop frame was pushed");
         let (breaks, continues) = frame.jumps();
@@ -1417,6 +1548,7 @@ impl<'a> Lowerer<'a> {
         update: Option<&Expr>,
         body: &Stmt,
     ) -> Result<(), LowerError> {
+        let labels = self.take_labels();
         match init {
             None => {}
             Some(ForInit::Expr(expr)) => {
@@ -1453,7 +1585,7 @@ impl<'a> Lowerer<'a> {
             None => None,
         };
 
-        self.enclosing.push(Enclosing::loop_());
+        self.enclosing.push(Enclosing::loop_(labels));
         let result = self.statement(body);
         let frame = self.enclosing.pop().expect("the loop frame was pushed");
         let (breaks, continues) = frame.jumps();
@@ -1499,6 +1631,7 @@ impl<'a> Lowerer<'a> {
     /// runs, which is why a `case` test can be in the dead zone of a `let` written three clauses
     /// further down.
     fn switch(&mut self, at: u32, discriminant: &Expr, cases: &[Case]) -> Result<(), LowerError> {
+        let labels = self.take_labels();
         let mark = self.next_temp;
         let value = self.expr(discriminant)?;
         // Every test is evaluated after this and any of them can assign, so a discriminant that
@@ -1545,7 +1678,7 @@ impl<'a> Lowerer<'a> {
         let miss = self.emit(at, Op::Jump { target: UNPATCHED });
         self.release(mark);
 
-        self.enclosing.push(Enclosing::switch());
+        self.enclosing.push(Enclosing::switch(labels));
         let mut default_target = None;
         let mut result = Ok(());
         for (case, entry) in cases.iter().zip(entries) {
@@ -3050,6 +3183,141 @@ mod tests {
             loop_back_edge @1, ic2
             load_undefined r1
             return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_labelled_break_leaves_every_loop_between_it_and_the_one_it_names() {
+        // The `break outer` at @4 goes to @7, which is past the outer back edge at @6 and not past
+        // the inner one at @5. An unlabelled `break` in the same place would go to @6, so the label
+        // is worth exactly one frame of the walk outwards, and that is the whole feature.
+        assert_code(
+            &code(&lowered("outer: while (a) { while (b) { break outer; } }")),
+            "
+            load_global r0, k0, ic0
+            jump_if_false r0, @7
+            load_global r0, k1, ic1
+            jump_if_false r0, @6
+            jump @7
+            loop_back_edge @2, ic2
+            loop_back_edge @0, ic3
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn a_labelled_continue_lands_on_the_update_of_the_loop_it_names() {
+        // @6 goes to @8, the `to_number` that starts the outer update, rather than to @7 which is
+        // the inner back edge or to @10 which is the outer one. A labelled `continue` has to find
+        // the continue target of a specific frame, and that target is not where its `break` goes.
+        assert_code(
+            &code(&lowered(
+                "outer: for (let i = 0; i < 2; i++) { while (b) { continue outer; } }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 2
+            less r1, r0, r1, ic0
+            jump_if_false r1, @11
+            load_global r1, k0, ic1
+            jump_if_false r1, @8
+            jump @8
+            loop_back_edge @4, ic2
+            to_number r1, r0, ic3
+            inc r0, r1, ic4
+            loop_back_edge @1, ic5
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_label_on_something_that_is_not_a_loop_costs_nothing_until_a_break_uses_it() {
+        // A labelled block is a frame that only collects jumps, so it emits no instruction of its
+        // own and the `break done` at @2 is a plain jump to the end of the block at @5. This is the
+        // early exit an if with no else would otherwise need a flag for.
+        assert_code(
+            &code(&lowered("done: { if (a) { break done; } f(); }")),
+            "
+            load_global r0, k0, ic0
+            jump_if_false r0, @3
+            jump @5
+            load_global r0, k1, ic1
+            call r0, r0, r1, 0, ic2
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn a_chain_of_labels_all_name_the_same_statement() {
+        // Both names are on the one loop, so `break a` is the same jump `break b` would be, and
+        // neither of them builds a frame of its own around the other.
+        assert_code(
+            &code(&lowered("a: b: while (x) { break a; }")),
+            "
+            load_global r0, k0, ic0
+            jump_if_false r0, @4
+            jump @4
+            loop_back_edge @0, ic1
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn two_labelled_breaks_through_one_finally_travel_as_two_different_tokens() {
+        // The case an ordinary completion token cannot survive. Both breaks route through the same
+        // `finally`, and by the time the dispatch after it runs, the frame each one was aimed at is
+        // gone, so the token is the only thing left that says which. `break a` sets 5 at @6 and
+        // `break b` sets 6 at @9, and the dispatch tells them apart at @20 to @22: 5 goes to @25
+        // and out past the outer back edge, and 6 falls through to @23 and out past the inner one.
+        //
+        // Nothing was added to the dispatch a plain `finally` emits. The two comparisons here are
+        // throw and one label, because normal is the falsy token the `jump_if_false` at @16 lets
+        // out and the last arm needs no comparison, so a `finally` with no labelled jump through it
+        // compares exactly the numbers it always did.
+        assert_code(
+            &code(&lowered(
+                "a: while (p) { b: while (q) { try { if (r) break a; else break b; } finally { g(); } } }",
+            )),
+            "
+            load_global r0, k0, ic0
+            jump_if_false r0, @28
+            load_global r0, k1, ic1
+            jump_if_false r0, @27
+            load_global r2, k2, ic2
+            jump_if_false r2, @9
+            load_int r0, 5
+            jump @14
+            jump @11
+            load_int r0, 6
+            jump @14
+            load_int r0, 0
+            jump @14
+            load_int r0, 1
+            load_global r2, k3, ic3
+            call r2, r2, r3, 0, ic4
+            jump_if_false r0, @26
+            load_int r2, 1
+            strict_equal r3, r0, r2, ic5
+            jump_if_true r3, @24
+            load_int r2, 5
+            strict_equal r3, r0, r2, ic6
+            jump_if_true r3, @25
+            jump @27
+            throw r1
+            jump @28
+            loop_back_edge @2, ic7
+            loop_back_edge @0, ic8
+            load_undefined r0
+            return r0
             ",
         );
     }

@@ -570,13 +570,23 @@ pub enum StmtKind {
         /// The block that runs however the protected block finished, if one was written.
         finally: Option<Block>,
     },
-    /// `break`, which leaves the nearest enclosing loop or switch.
+    /// A labelled statement, which is a name a `break` or a `continue` can aim at.
     ///
-    /// No label, because a labelled statement is not in the subset yet and a label can only name
-    /// one, so there is nothing a label could refer to.
-    Break,
-    /// `continue`, which starts the next iteration of the nearest enclosing loop.
-    Continue,
+    /// The label is not a binding and it does not go anywhere near the scope chain. `let x = 1; x:
+    /// while (0);` is perfectly legal, because labels and variables are two namespaces that never
+    /// meet. What a label does share with an identifier is the spelling rules, so `public:` is
+    /// refused in strict code the same way reading `public` is.
+    Labeled {
+        /// The name written before the colon.
+        label: Ident,
+        /// The statement it names, which is anything at all and not only a loop.
+        body: Box<Stmt>,
+    },
+    /// `break`, which leaves the nearest enclosing loop or switch, or the statement a label names.
+    Break(Option<Ident>),
+    /// `continue`, which starts the next iteration of the nearest enclosing loop, or of the loop a
+    /// label names.
+    Continue(Option<Ident>),
     /// A braced block, which is a scope for `let` and `const`.
     Block(Vec<Stmt>),
     /// A lone semicolon.
