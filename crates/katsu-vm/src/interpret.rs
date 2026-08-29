@@ -173,19 +173,16 @@ struct Landing {
 /// Two variants and not three: a property with no getter has already been turned into `undefined` by
 /// the time this is built, because that decision needs nothing the caller knows and answering it
 /// here means the opcode has one case fewer to handle.
+///
+/// The receiver is not in here. It would be the same value the caller passed in, because a getter is
+/// called on where the read started and not on where the property was found, so carrying it back
+/// would hand the caller something it is already holding.
 #[derive(Clone, Copy, Debug)]
 enum Found {
     /// A value, which is what every read finds until a program defines an accessor.
     Value(Value),
-    /// A getter to call, and the object to call it on.
-    Getter {
-        /// The function to call, which is a closure or a native.
-        getter: Value,
-        /// Where the read started, which is `this` inside the getter. Not where the property was
-        /// found: a getter on a prototype answers for every object below it and can only do that by
-        /// being called on the one the read went through.
-        receiver: Value,
-    },
+    /// A getter to call, on the object the read started from.
+    Getter(Value),
 }
 
 /// What a store did, which like a read is not always the obvious thing.
@@ -1395,28 +1392,19 @@ impl Interpreter {
                     let name = self.name_at(constants, key);
                     match guard!(self.property(object, name, blueprint, key)) {
                         Found::Value(value) => self.stack.set(dst, value),
-                        // A read that is a call. The getter takes no arguments, so `args` points at
-                        // a register nothing is copied from, and its answer goes where the read's
-                        // answer was going to go. Nothing else about this is special: the frame is
-                        // an ordinary frame and the getter returns through the ordinary return.
-                        Found::Getter { getter, receiver } => {
-                            let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
-                            let call = Call {
-                                target: getter,
-                                receiver,
-                                first: dst,
-                                passed: 0,
-                                return_to: dst,
-                                return_pc,
-                            };
-                            match guard!(self.enter(call, unit)) {
-                                Entered::Frame { index, callee } => {
-                                    function = index;
-                                    blueprint = callee;
-                                    constants = unit.function(index).constants.as_slice();
-                                    pc = 0;
-                                }
-                                Entered::Answered(value) => self.stack.set(dst, value),
+                        // A read that is a call, kept to two instructions here and done in a cold
+                        // function. Everything this needs to say lives in registers the loop holds
+                        // across every other opcode, so writing it out inline puts more pressure on
+                        // them than the arm is worth: it runs once per accessor and never on the
+                        // path the architecture is judged on.
+                        Found::Getter(getter) => {
+                            if let Some((index, callee)) =
+                                guard!(self.read_through(getter, object, dst, pc, unit))
+                            {
+                                function = index;
+                                blueprint = callee;
+                                constants = unit.function(index).constants.as_slice();
+                                pc = 0;
                             }
                         }
                     }
@@ -1506,7 +1494,7 @@ impl Interpreter {
                         // that is waiting on another call, because the only thing it resumes into
                         // is the instruction after the one it left, so this refuses by name rather
                         // than calling the getter and then losing its answer.
-                        Found::Getter { .. } => {
+                        Found::Getter(_) => {
                             let key = Self::constant_name(blueprint, key);
                             raise!(RuntimeError::Unsupported(format!(
                                 "calling '{key}', which is a getter, needs the result of the \
@@ -1902,6 +1890,54 @@ impl Interpreter {
         Ok(Entered::Frame { index, callee })
     }
 
+    /// Turn a read that found a getter into the call it is.
+    ///
+    /// Out of line and cold because `Op::GetProp` is the opcode the whole architecture is judged on
+    /// and this arm runs once per accessor and never on a plain read. Measured, it is worth nothing
+    /// on its own: the loop is fast either way and the cost of accessors is elsewhere, in the extra
+    /// word the lookup now reads. It stays out of line because a cold arm belongs out of line, not
+    /// because a benchmark moved.
+    ///
+    /// The getter takes no arguments, so `first` points at a register nothing is copied from, and
+    /// its answer goes where the read's answer was going to go. Nothing else about it is special:
+    /// the frame is an ordinary frame and it comes back through the ordinary return.
+    ///
+    /// A getter written in Rust has already run by the time this returns, so its answer is stored
+    /// here and the loop is told to carry on where it was. Answering `None` is that, and answering
+    /// `Some` is a frame the loop has to switch into.
+    ///
+    /// # Errors
+    ///
+    /// A program long enough that its own program counter does not fit in the return address, a
+    /// stack overflow from the push, or whatever a getter written in Rust throws.
+    #[cold]
+    #[inline(never)]
+    fn read_through<'a>(
+        &mut self,
+        getter: Value,
+        receiver: Value,
+        dst: Register,
+        pc: usize,
+        unit: &'a Unit,
+    ) -> Result<Option<(u32, &'a FunctionBlueprint)>, RuntimeError> {
+        let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+        let call = Call {
+            target: getter,
+            receiver,
+            first: dst,
+            passed: 0,
+            return_to: dst,
+            return_pc,
+        };
+        match self.enter(call, unit)? {
+            Entered::Frame { index, callee } => Ok(Some((index, callee))),
+            Entered::Answered(value) => {
+                self.stack.set(dst, value);
+                Ok(None)
+            }
+        }
+    }
+
     /// The interned name a name operand holds.
     ///
     /// Both halves of this are guaranteed by something that already ran. The index is inside the
@@ -1985,6 +2021,25 @@ impl Interpreter {
     /// loop, so the reason to prefer this one is that the common case reads as the common case
     /// rather than a benchmark that says so. The thing that takes the tenth back is an inline cache,
     /// which is the next item on M1, and which is the entire reason the prototype lives in the shape.
+    ///
+    /// Accessors added a second tenth to the same benchmark, and where it went was measured rather
+    /// than guessed. `property/prop_load` is about a fifth slower than it was without them, over
+    /// three separate runs of twenty four alternating pairs each, against a control in the same pairs
+    /// that stayed at 1.02. Swapping this one line back to the lookup that does not read the flags
+    /// put it at 1.00 and made the runtime wrong, which is what says the whole cost is here and none
+    /// of it is in the opcode or in the shape of what gets returned. Both of those were tried and
+    /// neither moved the number.
+    ///
+    /// It is the honest price of the question. A slot can hold a value or a pair of functions and
+    /// nothing about the slot says which, so something has to be read that says, and the flags are
+    /// the only thing that can. Packing them into the count word so the search loop reads one word
+    /// instead of two was tried too: it moved a little of the cost from the read to the write and
+    /// left the total where it was, so it was not kept.
+    ///
+    /// The same inline cache takes back this tenth and the earlier one together, and it takes this
+    /// one back completely rather than partly. A cache that has matched a shape has established in
+    /// that comparison that the slot is a plain value, because the flags are part of what the shape
+    /// says, so the fast path does not read them and does not test them.
     #[inline]
     fn property(
         &self,
@@ -2004,9 +2059,9 @@ impl Interpreter {
             let bits = record
                 .value_at(cage, index)
                 .expect("a property the shape has is a property the object has room for");
-            return Ok(self.found(bits, attributes, object));
+            return Ok(self.found(bits, attributes));
         }
-        Ok(self.inherited(record, name, object))
+        Ok(self.inherited(record, name))
     }
 
     /// What a lookup found, once the flags have been consulted.
@@ -2017,11 +2072,11 @@ impl Interpreter {
     /// has established the answer in the comparison it already made, so the fast path this is
     /// standing in for will not run the test at all.
     #[inline]
-    fn found(&self, bits: u64, attributes: Attributes, receiver: Value) -> Found {
+    fn found(&self, bits: u64, attributes: Attributes) -> Found {
         if !attributes.is_accessor() {
             return Found::Value(Value::from_bits(bits));
         }
-        self.getter_of(Value::from_bits(bits), receiver)
+        self.getter_of(Value::from_bits(bits))
     }
 
     /// The getter half of a pair, or `undefined` when the property has no getter.
@@ -2029,22 +2084,19 @@ impl Interpreter {
     /// A property with only a setter reads as `undefined` and does not throw, which is the language
     /// saying that a write only property is still readable and simply has nothing to say.
     ///
-    /// The receiver is where the read started rather than where the property was found. One getter
-    /// defined on a prototype answers for every object below it, and it can only do that by being
-    /// called on the object the read went through.
+    /// The receiver is not decided here. It is where the read started rather than where the property
+    /// was found, which is how one getter on a prototype answers for every object below it, and the
+    /// caller is the one holding that object.
     #[cold]
     #[inline(never)]
-    fn getter_of(&self, pair: Value, receiver: Value) -> Found {
+    fn getter_of(&self, pair: Value) -> Found {
         let cage = self.isolate.cage();
         let getter = pair
             .to_slot(cage)
             .and_then(AccessorPairRef::from_slot)
             .and_then(|pair| pair.getter(cage));
         match getter {
-            Some(getter) => Found::Getter {
-                getter: Value::from_slot(getter, cage),
-                receiver,
-            },
+            Some(getter) => Found::Getter(Value::from_slot(getter, cage)),
             None => Found::Value(Value::UNDEFINED),
         }
     }
@@ -2060,7 +2112,7 @@ impl Interpreter {
     /// return a `Result`. The one property read that does throw is a read off `undefined` or `null`,
     /// and that is answered by the caller before there is an object to start walking from.
     #[inline(never)]
-    fn inherited(&self, object: ObjectRef, name: StringRef, receiver: Value) -> Found {
+    fn inherited(&self, object: ObjectRef, name: StringRef) -> Found {
         let cage = self.isolate.cage();
         let mut holder = object.prototype(cage);
         while let Some(current) = holder {
@@ -2068,7 +2120,7 @@ impl Interpreter {
                 let bits = current
                     .value_at(cage, index)
                     .expect("a property the shape has is a property the object has room for");
-                return self.found(bits, attributes, receiver);
+                return self.found(bits, attributes);
             }
             holder = current.prototype(cage);
         }
