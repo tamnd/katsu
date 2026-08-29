@@ -29,8 +29,9 @@ use oxc_ast::ast as oxc;
 
 use crate::ParseError;
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident,
-    LogicalOp, Module, Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, ForInit, Func,
+    Ident, LogicalOp, Module, Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp,
+    UpdateOp,
 };
 
 /// Turn one parsed program into our tree.
@@ -208,6 +209,14 @@ impl Adapter<'_> {
                 Stmt::new(span(node.span), StmtKind::While { test, body })
             }
 
+            oxc::Statement::DoWhileStatement(node) => {
+                let body = self.branch(&node.body, strict)?;
+                let test = self.expression(&node.test, strict)?;
+                Stmt::new(span(node.span), StmtKind::DoWhile { body, test })
+            }
+
+            oxc::Statement::ForStatement(node) => self.for_statement(node, strict)?,
+
             oxc::Statement::SwitchStatement(node) => self.switch_statement(node, strict)?,
 
             oxc::Statement::ThrowStatement(node) => Stmt::new(
@@ -306,6 +315,56 @@ impl Adapter<'_> {
         ))
     }
 
+    /// Adapt a `for`, the three part one.
+    ///
+    /// Every part is optional and `for (;;)` is a legal endless loop, so all three arrive as
+    /// options and stay options. Filling an absent test in with `true` here would be a small lie
+    /// that costs a comparison on every iteration of the loops that leave it out on purpose.
+    ///
+    /// The head is a declaration or an expression and the grammar allows nothing else, which is why
+    /// it becomes a `ForInit` rather than a `Stmt`. Adapting it as a statement would have meant
+    /// every reader downstream handling arms the parser can never hand it.
+    fn for_statement(
+        &self,
+        node: &oxc::ForStatement<'_>,
+        strict: bool,
+    ) -> Result<Stmt, ParseError> {
+        let init = match node.init.as_ref() {
+            None => None,
+            Some(oxc::ForStatementInit::VariableDeclaration(declaration)) => {
+                // A `declare` in this position is not valid syntax, so unlike a statement level
+                // declaration there is nothing that erases to nothing here.
+                let (kind, bindings) = self.declaration_parts(declaration, strict)?;
+                Some(ForInit::Declare { kind, bindings })
+            }
+            Some(other) => {
+                let expression = other
+                    .as_expression()
+                    .expect("a for head is a declaration or an expression");
+                Some(ForInit::Expr(self.expression(expression, strict)?))
+            }
+        };
+
+        let test = match node.test.as_ref() {
+            Some(test) => Some(self.expression(test, strict)?),
+            None => None,
+        };
+        let update = match node.update.as_ref() {
+            Some(update) => Some(self.expression(update, strict)?),
+            None => None,
+        };
+
+        Ok(Stmt::new(
+            span(node.span),
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body: self.branch(&node.body, strict)?,
+            },
+        ))
+    }
+
     /// Adapt a `try` and its two or three parts.
     ///
     /// All three are separate fields rather than two shapes, because the grammar allows a `catch`
@@ -384,6 +443,22 @@ impl Adapter<'_> {
         node: &oxc::VariableDeclaration<'_>,
         strict: bool,
     ) -> Result<Stmt, ParseError> {
+        let (kind, bindings) = self.declaration_parts(node, strict)?;
+        Ok(Stmt::new(
+            span(node.span),
+            StmtKind::Declare { kind, bindings },
+        ))
+    }
+
+    /// Adapt the keyword and the declarators of a declaration, without deciding what holds them.
+    ///
+    /// A declaration is a statement in most places and the head of a `for` in one, and the two
+    /// differ only in what wraps this, so this is the part they share.
+    fn declaration_parts(
+        &self,
+        node: &oxc::VariableDeclaration<'_>,
+        strict: bool,
+    ) -> Result<(DeclKind, Vec<Binding>), ParseError> {
         let kind = match node.kind {
             oxc::VariableDeclarationKind::Var => DeclKind::Var,
             oxc::VariableDeclarationKind::Let => DeclKind::Let,
@@ -409,10 +484,7 @@ impl Adapter<'_> {
             });
         }
 
-        Ok(Stmt::new(
-            span(node.span),
-            StmtKind::Declare { kind, bindings },
-        ))
+        Ok((kind, bindings))
     }
 
     /// Pull the single name out of a binding position, refusing destructuring.
@@ -947,10 +1019,8 @@ fn assign_op(operator: oxc::AssignmentOperator) -> AssignOp {
 fn statement_name(statement: &oxc::Statement<'_>) -> &'static str {
     match statement {
         oxc::Statement::DebuggerStatement(_) => "debugger",
-        oxc::Statement::DoWhileStatement(_) => "a do while loop",
         oxc::Statement::ForInStatement(_) => "a for in loop",
         oxc::Statement::ForOfStatement(_) => "a for of loop",
-        oxc::Statement::ForStatement(_) => "a for loop",
         oxc::Statement::LabeledStatement(_) => "a label",
         oxc::Statement::ThrowStatement(_) => "throw",
         oxc::Statement::TryStatement(_) => "try",
@@ -1375,8 +1445,9 @@ mod tests {
     #[test]
     fn what_m0_does_not_cover_is_refused_by_name() {
         // This list is the M1 work list read backwards, and every line of it should disappear.
-        assert_eq!(refused("t.js", "for (;;) {}"), "a for loop");
+        assert_eq!(refused("t.js", "for (const x in o) {}"), "a for in loop");
         assert_eq!(refused("t.js", "for (const x of xs) {}"), "a for of loop");
+        assert_eq!(refused("t.js", "outer: while (x) {}"), "a label");
         assert_eq!(refused("t.js", "class C {}"), "a class");
         assert_eq!(refused("t.js", "let x = [1, 2];"), "an array literal");
         assert_eq!(refused("t.js", "let f = () => 1;"), "an arrow function");

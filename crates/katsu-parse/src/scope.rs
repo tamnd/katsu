@@ -50,8 +50,8 @@ use std::rc::Rc;
 use rustc_hash::FxHashMap;
 
 use crate::ast::{
-    Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident, Module, Span, Stmt, StmtKind,
-    Target, TargetKind,
+    Block, Case, Catch, DeclKind, Expr, ExprKind, ForInit, Func, Ident, Module, Span, Stmt,
+    StmtKind, Target, TargetKind,
 };
 
 /// Which function a scope belongs to.
@@ -588,7 +588,26 @@ impl Analyser {
                         self.hoist_vars(std::slice::from_ref(alternate))?;
                     }
                 }
-                StmtKind::While { body, .. } => self.hoist_vars(std::slice::from_ref(body))?,
+                StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } => {
+                    self.hoist_vars(std::slice::from_ref(body))?;
+                }
+                // The head is looked at as well as the body, because `for (var i = 0; ;)` declares
+                // `i` in the function and not in the loop, which is the whole difference between
+                // that and a `let` head.
+                StmtKind::For { init, body, .. } => {
+                    if let Some(ForInit::Declare {
+                        kind: DeclKind::Var,
+                        bindings,
+                    }) = init
+                    {
+                        for binding in bindings {
+                            if self.declared_in_scope(&binding.name.name).is_none() {
+                                self.declare(&binding.name, BindingKind::Var, binding.span)?;
+                            }
+                        }
+                    }
+                    self.hoist_vars(std::slice::from_ref(body))?;
+                }
                 StmtKind::Switch { cases, .. } => {
                     for case in cases {
                         self.hoist_vars(&case.body)?;
@@ -671,19 +690,7 @@ impl Analyser {
     fn statement(&mut self, statement: &Stmt) -> Result<(), ScopeError> {
         match &statement.kind {
             StmtKind::Expr(expr) => self.expression(expr)?,
-            StmtKind::Declare { bindings, .. } => {
-                for binding in bindings {
-                    if let Some(init) = &binding.init {
-                        self.expression(init)?;
-                    }
-                    // The declared name is resolved like any other occurrence, so that lowering
-                    // asks one question rather than two.
-                    let id = self
-                        .lookup(&binding.name.name)
-                        .expect("a declared name was declared");
-                    self.declaration_reference(&binding.name, id);
-                }
-            }
+            StmtKind::Declare { bindings, .. } => self.initialisers(bindings)?,
             StmtKind::Function(func) => {
                 if let Some(name) = func.name.as_ref() {
                     let id = self
@@ -713,6 +720,29 @@ impl Analyser {
                 self.expression(test)?;
                 self.breakable(true, |walker| walker.statement(body))?;
             }
+            // The test is inside the loop for `break` and `continue` purposes even though it is
+            // outside it in the source, because `do { } while (f())` can have a `break` in the
+            // condition only if the condition is written inside a function, and that function is
+            // walked with the counters already reset. Keeping it inside costs nothing and keeps
+            // the two loop forms reading the same.
+            StmtKind::DoWhile { body, test } => {
+                self.breakable(true, |walker| {
+                    walker.statement(body)?;
+                    walker.expression(test)
+                })?;
+            }
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => self.for_statement(
+                statement.span,
+                init.as_ref(),
+                test.as_ref(),
+                update.as_ref(),
+                body,
+            )?,
             StmtKind::Block(body) => {
                 self.push_block(statement.span);
                 let result = self.block_body(body);
@@ -761,6 +791,89 @@ impl Analyser {
             StmtKind::Empty => {}
         }
         Ok(())
+    }
+
+    /// Walk what a list of bindings initialises itself to, and record each declared name.
+    ///
+    /// The declared name is resolved like any other occurrence, so that lowering asks one question
+    /// rather than two. The names were declared by an earlier pass, either the hoisting one for a
+    /// `var` or `declare_lexicals` for a `let` and a `const`, which is why nothing here declares.
+    fn initialisers(&mut self, bindings: &[crate::ast::Binding]) -> Result<(), ScopeError> {
+        for binding in bindings {
+            if let Some(init) = &binding.init {
+                self.expression(init)?;
+            }
+            let id = self
+                .lookup(&binding.name.name)
+                .expect("a declared name was declared");
+            self.declaration_reference(&binding.name, id);
+        }
+        Ok(())
+    }
+
+    /// Walk the head, the test, the update and the body of a `for`, inside the scope the head opens.
+    ///
+    /// One scope covers the whole statement, which is what makes the `i` of
+    /// `for (let i = 0; i < n; i = i + 1)` invisible outside and makes a `let i` in the body a
+    /// shadowing rather than the redeclaration it would be if the two shared a scope. A `var` in the
+    /// head hoisted out to the function long before this ran.
+    ///
+    /// The order is the order they run in, which matters for the dead zone. `for (let i = i; ;)` is
+    /// a `ReferenceError` and not a read of an outer `i`, because the head's `i` is declared before
+    /// its own initialiser is walked, and that only happens if the declaration goes in first.
+    fn for_statement(
+        &mut self,
+        span: Span,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Result<(), ScopeError> {
+        self.push_block(span);
+        let result = self.for_parts(init, test, update, body);
+        self.blocks.pop();
+        result
+    }
+
+    fn for_parts(
+        &mut self,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Result<(), ScopeError> {
+        if let Some(init) = init {
+            match init {
+                ForInit::Expr(expr) => self.expression(expr)?,
+                ForInit::Declare { kind, bindings } => {
+                    for binding in bindings {
+                        // A `var` head was declared by the hoisting pass and belongs to the
+                        // function, so only a `let` or a `const` declares anything here.
+                        // A `const` with no initialiser is checked in `declare_lexicals` for a
+                        // statement and is not checked here, because the parser refuses
+                        // `for (const x; ;)` before this runs and does it in node's exact words.
+                        let kind = match kind {
+                            DeclKind::Var => continue,
+                            DeclKind::Let => BindingKind::Let,
+                            DeclKind::Const => BindingKind::Const,
+                        };
+                        self.declare(&binding.name, kind, binding.span)?;
+                    }
+                    self.initialisers(bindings)?;
+                }
+            }
+        }
+
+        self.breakable(true, |walker| {
+            if let Some(test) = test {
+                walker.expression(test)?;
+            }
+            walker.statement(body)?;
+            if let Some(update) = update {
+                walker.expression(update)?;
+            }
+            Ok(())
+        })
     }
 
     /// Walk the two or three parts of a `try`.
@@ -1059,7 +1172,7 @@ impl ScopeError {
 mod tests {
     use super::{BindingKind, FunctionId, Reference, Resolution, Scopes};
     use crate::ParseError;
-    use crate::ast::{Expr, ExprKind, Func, Ident, Stmt, StmtKind, Target, TargetKind};
+    use crate::ast::{Expr, ExprKind, ForInit, Func, Ident, Stmt, StmtKind, Target, TargetKind};
 
     /// Parse and analyse, for the cases that are expected to be accepted.
     fn analysed(source: &str) -> Scopes {
@@ -1154,9 +1267,35 @@ mod tests {
                         variable_idents(std::slice::from_ref(alternate), out);
                     }
                 }
-                StmtKind::While { test, body } => {
+                StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
                     expression_idents(test, out);
                     variable_idents(std::slice::from_ref(body), out);
+                }
+                StmtKind::For {
+                    init,
+                    test,
+                    update,
+                    body,
+                } => {
+                    match init {
+                        None => {}
+                        Some(ForInit::Expr(expr)) => expression_idents(expr, out),
+                        Some(ForInit::Declare { bindings, .. }) => {
+                            for binding in bindings {
+                                out.push(binding.name.clone());
+                                if let Some(init) = &binding.init {
+                                    expression_idents(init, out);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(test) = test {
+                        expression_idents(test, out);
+                    }
+                    variable_idents(std::slice::from_ref(body), out);
+                    if let Some(update) = update {
+                        expression_idents(update, out);
+                    }
                 }
                 StmtKind::Switch {
                     discriminant,
@@ -1909,5 +2048,66 @@ mod tests {
             resolved(&scopes, source, "b", 1).binding,
             "and so is a var in the handler"
         );
+    }
+
+    #[test]
+    fn a_let_in_a_for_head_belongs_to_the_loop_and_a_var_belongs_to_the_function() {
+        let source = "for (let i = 0; i < 1; i = i + 1) { i; } let i = 9; i;";
+        let scopes = analysed(source);
+        assert_ne!(
+            resolved(&scopes, source, "i", 0).binding,
+            resolved(&scopes, source, "i", 5).binding,
+            "the head's name and the one declared after the loop are different bindings"
+        );
+        assert_eq!(
+            resolved(&scopes, source, "i", 0).binding,
+            resolved(&scopes, source, "i", 4).binding,
+            "the body reads the head's name"
+        );
+
+        let source = "for (var j = 0; j < 1; j = j + 1) {} j;";
+        let scopes = analysed(source);
+        assert_eq!(
+            resolved(&scopes, source, "j", 0).binding,
+            resolved(&scopes, source, "j", 4).binding,
+            "a var head hoists to the function and is still readable after the loop"
+        );
+    }
+
+    #[test]
+    fn a_for_head_is_in_its_own_dead_zone_while_its_initialiser_runs() {
+        // `for (let i = i; ;)` reads the `i` the head is declaring rather than the one outside it,
+        // which is the same rule as `let i = i;` and is only true if the declaration goes in before
+        // the initialiser is walked. The read is marked for the check rather than refused here,
+        // because the dead zone is a `ReferenceError` at run time and not an early error.
+        let source = "let i = 1; for (let i = i; ;) {}";
+        let scopes = analysed(source);
+        let head = resolved(&scopes, source, "i", 1);
+        let read = resolved(&scopes, source, "i", 2);
+        assert_eq!(head.binding, read.binding, "the head reads its own name");
+        assert!(
+            matches!(read.resolution, Resolution::Local { tdz: true, .. }),
+            "and reads it before it has a value"
+        );
+
+        // A `const` head with no initialiser never reaches this pass, because the parser already
+        // refuses it and uses the same words node uses.
+        let error =
+            crate::frontend("test.js", "for (const x; ;) {}").expect_err("should be refused");
+        let ParseError::Syntax { message, .. } = error else {
+            panic!("expected a syntax error, got {error:?}");
+        };
+        assert_eq!(message, "Missing initializer in const declaration");
+    }
+
+    #[test]
+    fn the_update_and_the_test_of_a_for_are_inside_the_loop_for_break_and_continue() {
+        analysed("for (;;) { break; }");
+        analysed("for (;;) { continue; }");
+        analysed("do { break; } while (false);");
+        analysed("do { continue; } while (false);");
+
+        let (_, _, message) = refused("for (;;) {} break;");
+        assert_eq!(message, "Illegal break statement");
     }
 }
