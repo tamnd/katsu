@@ -77,7 +77,7 @@ fn creation(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut heap = heap(BATCH as usize * 64);
-                let root = ShapeRef::root(&mut heap).unwrap();
+                let root = ShapeRef::root(&mut heap, None).unwrap();
                 (heap, root)
             },
             |(mut heap, root)| {
@@ -99,7 +99,7 @@ fn creation(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let mut heap = heap(BATCH as usize * 512);
-                    let root = ShapeRef::root(&mut heap).unwrap();
+                    let root = ShapeRef::root(&mut heap, None).unwrap();
                     let names = names(&mut heap, count);
                     // One object first, so the transitions the timed objects need already exist.
                     // Without this the first iteration pays for the whole shape path and every
@@ -130,7 +130,7 @@ fn lookup(c: &mut Criterion) {
     for count in COUNTS {
         group.bench_with_input(BenchmarkId::new("last", count), &count, |b, &count| {
             let mut heap = heap(1 << 20);
-            let root = ShapeRef::root(&mut heap).unwrap();
+            let root = ShapeRef::root(&mut heap, None).unwrap();
             let names = names(&mut heap, count);
             let object = object(&mut heap, root, &names);
             let last = *names.last().unwrap();
@@ -144,7 +144,7 @@ fn lookup(c: &mut Criterion) {
     for count in COUNTS {
         group.bench_with_input(BenchmarkId::new("first", count), &count, |b, &count| {
             let mut heap = heap(1 << 20);
-            let root = ShapeRef::root(&mut heap).unwrap();
+            let root = ShapeRef::root(&mut heap, None).unwrap();
             let names = names(&mut heap, count);
             let object = object(&mut heap, root, &names);
             let first = names[0];
@@ -156,7 +156,7 @@ fn lookup(c: &mut Criterion) {
     // rare case: it is what every `typeof x.y` and every prototype chain step will do.
     group.bench_function("miss/16", |b| {
         let mut heap = heap(1 << 20);
-        let root = ShapeRef::root(&mut heap).unwrap();
+        let root = ShapeRef::root(&mut heap, None).unwrap();
         let names = names(&mut heap, 17);
         let absent = names[16];
         let object = object(&mut heap, root, &names[..16]);
@@ -175,7 +175,7 @@ fn store(c: &mut Criterion) {
     for count in COUNTS {
         group.bench_with_input(BenchmarkId::new("existing", count), &count, |b, &count| {
             let mut heap = heap(1 << 20);
-            let root = ShapeRef::root(&mut heap).unwrap();
+            let root = ShapeRef::root(&mut heap, None).unwrap();
             let names = names(&mut heap, count);
             let object = object(&mut heap, root, &names);
             let first = names[0];
@@ -199,7 +199,7 @@ fn store(c: &mut Criterion) {
                 let mut heap = heap(1 << 20);
                 // A fresh root each iteration, so every one of the sixty four stores below is a
                 // transition that has never been taken.
-                let root = ShapeRef::root(&mut heap).unwrap();
+                let root = ShapeRef::root(&mut heap, None).unwrap();
                 let names = names(&mut heap, FAN_OUT);
                 let objects: Vec<ObjectRef> = (0..FAN_OUT)
                     .map(|_| ObjectRef::new(&mut heap, root, 1).unwrap())
@@ -220,7 +220,7 @@ fn store(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut heap = heap(BATCH as usize * 256);
-                let root = ShapeRef::root(&mut heap).unwrap();
+                let root = ShapeRef::root(&mut heap, None).unwrap();
                 let names = names(&mut heap, 1);
                 // Take the transition once, so the timed stores all find it.
                 object(&mut heap, root, &names);
@@ -246,7 +246,7 @@ fn store(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut heap = heap(BATCH as usize * 512);
-                let root = ShapeRef::root(&mut heap).unwrap();
+                let root = ShapeRef::root(&mut heap, None).unwrap();
                 let names = names(&mut heap, 8);
                 object(&mut heap, root, &names);
                 (heap, root, names)
@@ -279,7 +279,7 @@ fn transitions(c: &mut Criterion) {
             &width,
             |b, &width| {
                 let mut heap = heap(1 << 20);
-                let root = ShapeRef::root(&mut heap).unwrap();
+                let root = ShapeRef::root(&mut heap, None).unwrap();
                 let names = names(&mut heap, width);
                 for name in &names {
                     root.transition(&mut heap, *name).unwrap();
@@ -297,7 +297,7 @@ fn transitions(c: &mut Criterion) {
     for count in COUNTS {
         group.bench_with_input(BenchmarkId::new("index_of", count), &count, |b, &count| {
             let mut heap = heap(1 << 20);
-            let root = ShapeRef::root(&mut heap).unwrap();
+            let root = ShapeRef::root(&mut heap, None).unwrap();
             let names = names(&mut heap, count);
             let mut shape = root;
             for name in &names {

@@ -38,7 +38,7 @@
 //! Exceptions are here. `throw` is one instruction, a `try` is no instructions at all, and where a
 //! throw goes is decided by [`Interpreter::handle`] reading the handler table the frontend wrote.
 //! The search crosses frames, so a throw deep inside a call finds a handler above it, and the frames
-//! in between are popped on the way. `finally` is not here yet, and neither are prototypes, so a
+//! in between are popped on the way. There is no `Error` constructor to be an instance of, so a
 //! caught engine error is an object with `name` and `message` rather than an instance of `Error`.
 //!
 //! # The one assumption about the heap
@@ -418,8 +418,12 @@ impl Interpreter {
     /// It goes through the same private `text_of` that `'' + x` goes through, rather than
     /// reimplementing the rules, because the one thing `String(x)` must never do is disagree with
     /// concatenation about what a value's text is.
-    #[must_use]
-    pub fn to_text(&self, value: Value) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Type`] for an object with no `toString` anywhere on its prototype
+    /// chain, which is what `Object.create(null)` makes. Every other value has a text.
+    pub fn to_text(&self, value: Value) -> Result<String, RuntimeError> {
         self.text_of(value)
     }
 
@@ -454,6 +458,71 @@ impl Interpreter {
     pub fn as_text(&self, value: Value) -> Option<String> {
         self.as_string(value)
             .map(|string| string.to_utf8_lossy(self.isolate.cage()).into_owned())
+    }
+
+    /// What `value` inherits from: the prototype, `null` if it inherits from nothing, or `None` if
+    /// `value` is not an object at all.
+    ///
+    /// The three answers are separate on purpose. `null` is a real prototype chain that ends, which
+    /// is what `Object.create(null)` makes, and `None` is a question that does not apply, which is
+    /// what a number is until there are wrapper prototypes to answer it with. Collapsing them would
+    /// have `Object.getPrototypeOf(1)` quietly report `null` when the real answer is
+    /// `Number.prototype`.
+    #[must_use]
+    pub fn prototype_of(&self, value: Value) -> Option<Value> {
+        let object = self.as_object(value)?;
+        Some(
+            object
+                .prototype(self.isolate.cage())
+                .map_or(Value::NULL, |prototype| {
+                    Value::from_slot(prototype.slot(), self.isolate.cage())
+                }),
+        )
+    }
+
+    /// `Object.prototype`, the object at the top of almost every chain in this realm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for it, which at startup means
+    /// the heap is far too small rather than that anything went wrong here.
+    pub fn object_prototype(&mut self) -> Result<Value, RuntimeError> {
+        let object = self
+            .isolate
+            .object_prototype()
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(object.slot(), self.isolate.cage()))
+    }
+
+    /// An object with no properties that inherits from `prototype`, where `null` means nothing.
+    ///
+    /// This is `Object.create` without the second argument, and it is the only way to make an object
+    /// whose prototype is not `Object.prototype` until `new` arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Type`] if `prototype` is neither an object nor `null`, in the words
+    /// Node uses, because this is the one place that has to render the offending value and putting
+    /// the message anywhere else would mean writing it twice. Returns
+    /// [`RuntimeError::OutOfMemory`] if the heap has no room for the object or its root shape.
+    pub fn new_object_with_prototype(&mut self, prototype: Value) -> Result<Value, RuntimeError> {
+        let above = if prototype.is_null() {
+            None
+        } else if let Some(object) = self.as_object(prototype) {
+            Some(object)
+        } else {
+            let what = self.display(prototype);
+            return Err(RuntimeError::Type(format!(
+                "Object prototype may only be an Object or null: {what}"
+            )));
+        };
+        let shape = self
+            .isolate
+            .root_shape_for(above)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let object =
+            ObjectRef::new(self.isolate.heap_mut(), shape, 0).ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(object.slot(), self.isolate.cage()))
     }
 
     /// Whether calling this value would work.
@@ -1215,8 +1284,8 @@ impl Interpreter {
     /// properties, which is what `e.name` and `e.message` read.
     ///
     /// It is not an `Error` yet, in the sense that there is no `Error` to be an instance of:
-    /// `e instanceof Error` needs prototypes and `e.stack` needs the source spans that stack traces
-    /// need, and both are still ahead on M1. So `console.log(e)` prints the object rather than
+    /// `e instanceof Error` needs an `Error` constructor with a prototype on it, which needs `new`,
+    /// and `e.stack` needs the source spans that stack traces need, and both are ahead on M1. So `console.log(e)` prints the object rather than
     /// `TypeError: ...`, which is a difference from Node that is visible and deliberate rather than
     /// quietly wrong.
     fn exception(&mut self, error: RuntimeError) -> Result<Value, RuntimeError> {
@@ -1365,8 +1434,10 @@ impl Interpreter {
     ///
     /// The check is that the first word holds a shape, which is one tag test on a word the property
     /// read is about to load anyway. Strings and functions have properties in the language and do
-    /// not have them here, because both of those are properties of a prototype and there are no
-    /// prototypes yet.
+    /// not have them here, because those properties live on `String.prototype` and
+    /// `Function.prototype`, and a primitive reaching its prototype means the wrapper conversion
+    /// that is still ahead. Prototype chains themselves work: it is the two prototypes that do not
+    /// exist, not the mechanism.
     fn as_object(&self, value: Value) -> Option<ObjectRef> {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
@@ -1457,18 +1528,37 @@ impl Interpreter {
         }
     }
 
-    /// Read one property.
+    /// Read one property, own or inherited.
     ///
-    /// Three answers and not two. An object either has the name or it does not, and a missing name
-    /// is `undefined` rather than an error, which is the rule the whole language is built on.
-    /// Anything that is not an object is also `undefined`, because a number's properties come off
-    /// its prototype and prototypes are still ahead. `undefined` and `null` are the exception, and
-    /// they throw, because those two have no prototype to reach for in any milestone and Node's
-    /// message for it is the single most read error message in JavaScript.
+    /// Three answers and not two. The name is found somewhere on the chain, or it is nowhere on the
+    /// chain and the answer is `undefined` rather than an error, which is the rule the whole
+    /// language is built on. Anything that is not an object is also `undefined`, because a number's
+    /// properties come off `Number.prototype` and the wrapper prototypes are still ahead.
+    /// `undefined` and `null` are the exception, and they throw, because those two have no prototype
+    /// to reach for in any milestone and Node's message for it is the single most read error message
+    /// in JavaScript.
+    ///
+    /// The walk terminates without a visited set, because a chain can only be built downwards: an
+    /// object names its prototype when it is created and there is no `Object.setPrototypeOf` and no
+    /// `__proto__` to point an existing one back up. The day either of those lands is the day this
+    /// needs the cycle check that the specification's `SetPrototypeOf` performs, and the check
+    /// belongs there rather than here, because paying for it on every read to catch something a
+    /// write could have refused is the wrong end.
+    ///
     /// The name is the interned one and the index is only for the message, which is why the message
     /// is built in a function of its own that a successful read never calls. Reading the constant
     /// back out of the pool allocates a `String`, and doing that on the way through every property
     /// read that worked cost more than the lookup itself did.
+    ///
+    /// The first step is written out rather than being the first turn of the loop, so that finding
+    /// the name on the object itself is the same straight line of code it was before there was a
+    /// chain to walk. Being able to look above an object is not free: `property/prop_load` is around
+    /// a tenth slower than it was, measured by alternating two binaries so that a busy machine
+    /// charged both of them equally. That machine could not pin the number tighter than that, and it
+    /// could not tell this shape apart from the shorter one that puts the first step inside the
+    /// loop, so the reason to prefer this one is that the common case reads as the common case
+    /// rather than a benchmark that says so. The thing that takes the tenth back is an inline cache,
+    /// which is the next item on M1, and which is the entire reason the prototype lives in the shape.
     #[inline]
     fn property(
         &self,
@@ -1483,9 +1573,34 @@ impl Interpreter {
         let Some(record) = self.as_object(object) else {
             return Ok(Value::UNDEFINED);
         };
-        Ok(record
-            .get(self.isolate.cage(), name)
-            .map_or(Value::UNDEFINED, Value::from_bits))
+        let cage = self.isolate.cage();
+        if let Some(bits) = record.get(cage, name) {
+            return Ok(Value::from_bits(bits));
+        }
+        Ok(self.inherited(record, name))
+    }
+
+    /// Keep looking above an object for a name that is not on it.
+    ///
+    /// Out of line, because it is the uncommon half of [`Interpreter::property`] and inlining it
+    /// would put the loop back in the middle of the opcode that the peeled first step exists to keep
+    /// straight. An object with nothing above it reaches the `None` on the first test, which is what
+    /// a read of a missing own property costs: one load of the shape's prototype word.
+    ///
+    /// Nowhere on the chain is `undefined` rather than an error, so this cannot fail and does not
+    /// return a `Result`. The one property read that does throw is a read off `undefined` or `null`,
+    /// and that is answered by the caller before there is an object to start walking from.
+    #[inline(never)]
+    fn inherited(&self, object: ObjectRef, name: StringRef) -> Value {
+        let cage = self.isolate.cage();
+        let mut holder = object.prototype(cage);
+        while let Some(current) = holder {
+            if let Some(bits) = current.get(cage, name) {
+                return Value::from_bits(bits);
+            }
+            holder = current.prototype(cage);
+        }
+        Value::UNDEFINED
     }
 
     /// What reading a property of `undefined` or `null` says, which is what Node says word for word.
@@ -1564,16 +1679,30 @@ impl Interpreter {
         }
         let cage = self.isolate.cage();
         let names = object.names(cage);
+        // An object that inherits from nothing says so, and the tag counts towards the width the
+        // same way a back reference does, so an object with it breaks onto several lines earlier
+        // than the same object without it. That was measured against node rather than assumed.
+        let tag = if object.prototype(cage).is_none() {
+            inspect::NULL_PROTOTYPE
+        } else {
+            ""
+        };
         // Also before the depth check, and also measured. An object with nothing in it prints as
         // `{}` however deep it is, because there is nothing below it for the limit to be protecting
         // anybody from, and `[Object]` would be six characters longer as well as less informative.
         // The differential harness found this one: `[Object]` is long enough to push the object
         // holding it over the width limit, so getting it wrong breaks a line that Node keeps whole.
         if names.is_empty() {
-            return "{}".to_owned();
+            return inspect::braces(&[], indent, tag);
         }
         if depth == 0 {
-            return "[Object]".to_owned();
+            // The tag on its own rather than `[Object]`, because at the depth limit the one thing
+            // still worth saying about an object is the thing its contents would not have shown.
+            return if tag.is_empty() {
+                "[Object]".to_owned()
+            } else {
+                tag.to_owned()
+            };
         }
         cycles.enter(slot);
         let entries: Vec<String> = names
@@ -1596,9 +1725,10 @@ impl Interpreter {
         cycles.leave();
         // Read after the walk and not before it, because whether anything points back at this
         // object is only known once everything under it has been printed.
-        let base = match cycles.assigned(slot) {
-            Some(number) => inspect::reference(number),
-            None => String::new(),
+        let base = match (cycles.assigned(slot), tag) {
+            (Some(number), "") => inspect::reference(number),
+            (Some(number), tag) => format!("{} {tag}", inspect::reference(number)),
+            (None, tag) => tag.to_owned(),
         };
         inspect::braces(&entries, indent, &base)
     }
@@ -1757,7 +1887,7 @@ impl Interpreter {
         if let Some(string) = self.as_string(value) {
             return Ok(string);
         }
-        let text = self.text_of(value);
+        let text = self.text_of(value)?;
         self.isolate
             .allocate_string(&text)
             .ok_or(RuntimeError::OutOfMemory)
@@ -1768,20 +1898,53 @@ impl Interpreter {
     /// Split out of [`Interpreter::coerce_to_string`] so that `String(x)` and `'' + x` cannot come
     /// to disagree. They are the same conversion in the language and a second copy of these rules
     /// would eventually be a second answer.
-    fn text_of(&self, value: Value) -> String {
+    fn text_of(&self, value: Value) -> Result<String, RuntimeError> {
         if let Some(string) = self.as_string(value) {
-            return string.to_utf8_lossy(self.isolate.cage()).into_owned();
+            return Ok(string.to_utf8_lossy(self.isolate.cage()).into_owned());
         }
         if let Some(closure) = self.as_closure(value) {
-            return self.function_text(closure);
+            return Ok(self.function_text(closure));
         }
         if let Some(native) = self.as_native(value) {
-            return self.native_text(native);
+            return Ok(self.native_text(native));
         }
-        // An object converts to `[object Object]` and not to what `console.log` shows, because this
-        // is `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and the two
-        // differing is a real distinction in the language rather than an inconsistency.
-        Self::primitive_text(value)
+        if let Some(object) = self.as_object(value) {
+            return self.object_to_text(object);
+        }
+        Ok(Self::primitive_text(value))
+    }
+
+    /// `ToString` of an object, which is where the prototype chain first becomes observable.
+    ///
+    /// An object has no text of its own. What converts it is the `toString` it inherits, and an
+    /// object that inherits from nothing has none, so `String(Object.create(null))` is a `TypeError`
+    /// in Node and here, in the same words. That is not an edge case dressed up: it is the reason
+    /// `[object Object]` is the answer for an ordinary object, because that text comes from
+    /// `Object.prototype.toString` rather than from the object.
+    ///
+    /// The test is whether the chain reaches this realm's `Object.prototype`, and not whether a
+    /// property called `toString` is on it, because there is nothing on it yet: a method there would
+    /// be enumerable, and there is no way to say otherwise until property attributes land. Reaching
+    /// `Object.prototype` and finding a `toString` are the same question for every object this build
+    /// can make, since nothing else can put one there. When there is a real method to find, this
+    /// becomes a real lookup and a real call, and the answer stops being a constant.
+    ///
+    /// An object converts to `[object Object]` and not to what `console.log` shows, because this is
+    /// `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and the two
+    /// differing is a real distinction in the language rather than an inconsistency.
+    fn object_to_text(&self, object: ObjectRef) -> Result<String, RuntimeError> {
+        let cage = self.isolate.cage();
+        let top = self.isolate.object_prototype_if_built();
+        let mut holder = Some(object);
+        while let Some(current) = holder {
+            if Some(current) == top {
+                return Ok("[object Object]".to_owned());
+            }
+            holder = current.prototype(cage);
+        }
+        Err(RuntimeError::Type(
+            "Cannot convert object to primitive value".to_owned(),
+        ))
     }
 
     /// The text of a primitive, meaning everything that is not on the heap.
@@ -1801,8 +1964,9 @@ impl Interpreter {
         if let Some(number) = value.as_f64() {
             return to_string(number);
         }
-        // Everything else on the heap, which is an object. `ToString` of one really is this text,
-        // and it is why `'' + {}` reads the way it does.
+        // Everything else on the heap. An ordinary object never gets here, because `text_of` sends
+        // one to `object_to_text` first, and this is the answer for a context or anything else that
+        // is on the heap without being a value a program can hold.
         "[object Object]".to_owned()
     }
 
@@ -1831,11 +1995,12 @@ impl Interpreter {
     /// `ToPrimitive`, which today gives back a string or the value it was handed.
     ///
     /// Every heap value that is not already a string reaches the default `toString`, because there
-    /// is no prototype yet to carry a `valueOf` and no `Symbol.toPrimitive` to look up first. That
-    /// is why the hint the specification passes is not threaded through here: number and string and
-    /// default all reach the same place, so a parameter for it would be a parameter nothing reads.
-    /// It arrives with prototypes, and so does the ability of this to run code and throw, which is
-    /// why it already returns a `Result`.
+    /// is nothing on `Object.prototype` yet to carry a `valueOf` and no `Symbol.toPrimitive` to look
+    /// up first. That is why the hint the specification passes is not threaded through here: number
+    /// and string and default all reach the same place, so a parameter for it would be a parameter
+    /// nothing reads. The hint arrives with the methods, and so does the ability of this to run code
+    /// and throw, which is why it already returns a `Result`. It throws today for one reason only,
+    /// which is an object whose chain reaches nothing at all and so has no conversion to reach.
     ///
     /// The test for having anything to do is `is_pointer`, which is a range check on a word that is
     /// already in a register rather than a load of a heap kind, so a comparison between two numbers
@@ -3088,7 +3253,7 @@ mod tests {
     fn an_engine_error_becomes_an_object_the_moment_something_catches_it() {
         // Until here it is a name and a message, which is what makes entering a `try` free and an
         // uncaught error cheap. Not an `Error` instance, because there is no `Error` to be an
-        // instance of yet: that needs prototypes, and so does the `stack` this deliberately lacks.
+        // instance of yet: that needs an `Error` constructor, and so does the `stack` it lacks.
         let blueprint = assemble_handled(
             vec![Op::ThrowConstAssignment, Op::Return { src: Register(0) }],
             vec![handler(0, 1, 1, 0)],

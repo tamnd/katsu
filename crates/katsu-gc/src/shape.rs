@@ -32,15 +32,41 @@
 //! The transition lookup is a scan too, over the children of one shape, and it is bounded by how
 //! many different names a program has ever added at that exact point in construction. For an object
 //! literal that is one.
+//!
+//! # Why the prototype is in here and not in the object
+//!
+//! An object's prototype is a property of its shape, so every object sharing a shape shares a
+//! prototype, and two objects with the same names in the same order but different prototypes are
+//! two shapes. That costs a transition tree per prototype, which is why there is a root per
+//! prototype rather than one root.
+//!
+//! It buys the thing the object model is aimed at. An inline cache that has compared an object's
+//! shape against the one it remembers has, in that single comparison, also checked every prototype
+//! between the object and wherever the property was found, because a shape names its prototype, and
+//! that prototype's own shape names the next one, and none of them can change without the shape
+//! changing. So a property inherited from three levels up is guarded exactly as cheaply as an own
+//! one. Keeping the prototype in the object instead would turn that guard into a walk, and the walk
+//! would be on the fast path rather than the slow one.
+//!
+//! This is what V8 does with the map and what JavaScriptCore does with the structure, and it is the
+//! same reason in all three places rather than a coincidence.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
 use crate::object::{HeapKind, read_u32, slot_of, write_kind, write_u32, write_u32_at};
+use crate::ordinary::ObjectRef;
 use crate::string::StringRef;
 
-/// Bytes a shape occupies, which is the same for every shape because they all hold the same six
-/// words: the kind tag, the count, the name, the parent, the first child and the next sibling.
-pub(crate) const SHAPE_SIZE: usize = 24;
+/// Bytes a shape occupies, which is the same for every shape because they all hold the same seven
+/// words: the kind tag, the count, the name, the parent, the first child, the next sibling and the
+/// prototype.
+///
+/// Twenty eight asked for and thirty two taken, because the heap aligns to eight. The padding word
+/// is not free and it is also not per object: there is one shape per layout and a million objects
+/// can share it, so four bytes here is nothing like four bytes in `ordinary.rs`. It is where the
+/// next field goes at no further cost, and the attributes bitmap in the next piece of object model
+/// work is the obvious candidate.
+pub(crate) const SHAPE_SIZE: usize = 28;
 /// How many properties an object with this shape has, which is also the depth of this node.
 const COUNT_OFFSET: usize = 4;
 /// The name this shape added to its parent, or a small integer zero at the root.
@@ -51,6 +77,11 @@ const PARENT_OFFSET: usize = 12;
 const CHILD_OFFSET: usize = 16;
 /// The next transition out of the same parent, which is how the children are chained together.
 const SIBLING_OFFSET: usize = 20;
+/// The prototype every object with this shape inherits from, or a small integer zero for none.
+///
+/// Copied down every transition, so the whole tree under a root shares one prototype and asking a
+/// shape for it is a load rather than a walk to the root.
+const PROTOTYPE_OFFSET: usize = 24;
 
 /// One node in the transition tree: a property layout that objects share.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,21 +94,28 @@ impl std::fmt::Debug for ShapeRef {
 }
 
 impl ShapeRef {
-    /// The shape of an object with no properties, which is the root every other shape hangs off.
+    /// The shape of an object with no properties that inherits from `prototype`.
     ///
-    /// One per heap, held by whoever owns the heap, because two roots would mean two trees and two
-    /// objects built identically could then have different shapes, which defeats the entire point.
+    /// One per prototype, held by whoever owns the heap, because two roots for the same prototype
+    /// would mean two trees and two objects built identically could then have different shapes,
+    /// which defeats the entire point. A root per prototype rather than one root is the cost of
+    /// keeping the prototype in the shape, and the module documentation says what it buys.
+    ///
+    /// `None` for the prototype means an object with nothing above it, which is what
+    /// `Object.create(null)` makes and what `Object.prototype` itself is.
     ///
     /// Returns `None` if the heap is full.
     #[must_use]
-    pub fn root(heap: &mut BumpHeap) -> Option<ShapeRef> {
+    pub fn root(heap: &mut BumpHeap, prototype: Option<ObjectRef>) -> Option<ShapeRef> {
         let pointer = heap.allocate(SHAPE_SIZE, ObjectKind::Shape)?;
         let slot = slot_of(heap.cage(), pointer)?;
+        let above = prototype.map_or(0, |object| object.slot().to_bits());
         // SAFETY: the allocation is `SHAPE_SIZE` bytes and every field is inside it. The name, the
         // parent, the child and the sibling are all left as the zero the heap hands out, which is a
         // small integer zero and reads back as "there is none".
         unsafe {
             write_kind(pointer, HeapKind::Shape);
+            write_u32(pointer, PROTOTYPE_OFFSET, above);
         }
         Some(ShapeRef(slot))
     }
@@ -99,6 +137,12 @@ impl ShapeRef {
     #[must_use]
     pub fn parent(self, cage: &Cage) -> Option<ShapeRef> {
         ShapeRef::from_slot(Slot::from_bits(self.field(cage, PARENT_OFFSET)))
+    }
+
+    /// What an object with this shape inherits from, or `None` if it inherits from nothing.
+    #[must_use]
+    pub fn prototype(self, cage: &Cage) -> Option<ObjectRef> {
+        ObjectRef::from_slot(Slot::from_bits(self.field(cage, PROTOTYPE_OFFSET)))
     }
 
     /// Where `name` sits in an object with this shape, or `None` if it has no such property.
@@ -144,6 +188,9 @@ impl ShapeRef {
         }
         let count = self.count(heap.cage()).checked_add(1)?;
         let first_child = self.field(heap.cage(), CHILD_OFFSET);
+        // Adding a property does not change what an object inherits from, so the child carries the
+        // parent's prototype down rather than the tree being searched for it later.
+        let above = self.field(heap.cage(), PROTOTYPE_OFFSET);
 
         let pointer = heap.allocate(SHAPE_SIZE, ObjectKind::Shape)?;
         let slot = slot_of(heap.cage(), pointer)?;
@@ -154,6 +201,7 @@ impl ShapeRef {
             write_u32(pointer, NAME_OFFSET, name.slot().to_bits());
             write_u32(pointer, PARENT_OFFSET, self.0.to_bits());
             write_u32(pointer, SIBLING_OFFSET, first_child);
+            write_u32(pointer, PROTOTYPE_OFFSET, above);
         }
 
         // The new child goes on the front of the parent's list, which is one store rather than a
@@ -215,7 +263,7 @@ impl ShapeRef {
         None
     }
 
-    /// One of the four slot fields, as raw bits.
+    /// One of the five slot fields, as raw bits.
     fn field(self, cage: &Cage, at: usize) -> u32 {
         // SAFETY: the slot points at a shape, and every offset this is called with is one of its
         // own fields, all of which are written before the shape escapes.
@@ -233,6 +281,7 @@ mod tests {
     use crate::bump::{BumpHeap, ObjectKind};
     use crate::cage::Slot;
     use crate::object::HeapKind;
+    use crate::ordinary::ObjectRef;
     use crate::string::StringRef;
 
     fn heap() -> BumpHeap {
@@ -254,7 +303,7 @@ mod tests {
     #[test]
     fn the_root_is_the_shape_of_an_object_with_nothing_on_it() {
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         assert_eq!(root.count(heap.cage()), 0);
         assert_eq!(root.name(heap.cage()), None);
         assert_eq!(root.parent(heap.cage()), None);
@@ -267,7 +316,7 @@ mod tests {
     #[test]
     fn adding_a_name_reaches_a_child_that_knows_where_the_name_went() {
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let with_x = root.transition(&mut heap, x).expect("should have room");
         assert_eq!(with_x.count(heap.cage()), 1);
@@ -281,7 +330,7 @@ mod tests {
         // The property the whole design rests on. Nothing here compares property lists: both walks
         // take the same two edges out of the same root and arrive at the same node.
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let first = root
@@ -306,7 +355,7 @@ mod tests {
         // Insertion order is observable in JavaScript, so it is part of a shape's identity rather
         // than something the representation is free to normalise away.
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let xy = root
@@ -327,7 +376,7 @@ mod tests {
         // Two programs that build `{a: 1}` and then add different second properties share the work
         // of the first property and diverge at the second, which is what the tree is for.
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let a = name(&mut heap, "a");
         let b = name(&mut heap, "b");
         let c = name(&mut heap, "c");
@@ -344,7 +393,7 @@ mod tests {
     #[test]
     fn the_names_come_back_in_the_order_they_were_added() {
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let mut shape = root;
         for text in ["first", "second", "third"] {
             let name = name(&mut heap, text);
@@ -357,7 +406,7 @@ mod tests {
     #[test]
     fn a_name_that_was_never_added_is_absent_rather_than_wrong() {
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let missing = name(&mut heap, "nope");
         let with_x = root.transition(&mut heap, x).expect("should have room");
@@ -365,21 +414,70 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_costs_one_object_and_twenty_four_bytes() {
+    fn a_shape_costs_one_object_and_thirty_two_bytes() {
         // The layout claim from the field list, checked rather than asserted in prose, because the
         // per shape cost is what decides whether a program with many small layouts is affordable.
+        // Twenty eight of fields and four of alignment padding, which is the price of the prototype
+        // word and is paid once per layout rather than once per object.
         let mut heap = heap();
         let before = heap.census().totals(ObjectKind::Shape);
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         root.transition(&mut heap, x).expect("should have room");
         let after = heap.census().totals(ObjectKind::Shape);
         assert_eq!(after.count - before.count, 2);
-        assert_eq!(
-            after.reserved_bytes - before.reserved_bytes,
-            (2 * SHAPE_SIZE) as u64,
-            "a shape should not need padding"
-        );
+        assert_eq!(after.requested_bytes - before.requested_bytes, 2 * 28);
+        assert_eq!(after.reserved_bytes - before.reserved_bytes, 2 * 32);
+        assert_eq!(SHAPE_SIZE, 28);
+    }
+
+    #[test]
+    fn a_root_remembers_what_its_objects_inherit_from() {
+        let mut heap = heap();
+        let bare = ShapeRef::root(&mut heap, None).expect("should have room");
+        assert_eq!(bare.prototype(heap.cage()), None);
+        let above = ObjectRef::new(&mut heap, bare, 0).expect("should have room");
+        let root = ShapeRef::root(&mut heap, Some(above)).expect("should have room");
+        assert_eq!(root.prototype(heap.cage()), Some(above));
+    }
+
+    #[test]
+    fn adding_a_property_does_not_change_what_an_object_inherits_from() {
+        // The reason this is worth a test of its own: the transition copies the prototype down, and
+        // if it ever stopped doing that, every object would silently lose its prototype on its
+        // first property and the failure would look like a lookup bug rather than a transition bug.
+        let mut heap = heap();
+        let bare = ShapeRef::root(&mut heap, None).expect("should have room");
+        let above = ObjectRef::new(&mut heap, bare, 0).expect("should have room");
+        let root = ShapeRef::root(&mut heap, Some(above)).expect("should have room");
+        let mut shape = root;
+        for text in ["a", "b", "c"] {
+            let name = name(&mut heap, text);
+            shape = shape.transition(&mut heap, name).expect("should have room");
+        }
+        assert_eq!(shape.prototype(heap.cage()), Some(above));
+    }
+
+    #[test]
+    fn the_same_layout_over_two_prototypes_is_two_shapes() {
+        // What makes a shape check enough to guard an inherited property. If these two shared a
+        // node, an inline cache that had seen the first would happily read through the second and
+        // find the wrong prototype's property.
+        let mut heap = heap();
+        let bare = ShapeRef::root(&mut heap, None).expect("should have room");
+        let first = ObjectRef::new(&mut heap, bare, 0).expect("should have room");
+        let second = ObjectRef::new(&mut heap, bare, 0).expect("should have room");
+        let x = name(&mut heap, "x");
+        let one = ShapeRef::root(&mut heap, Some(first))
+            .and_then(|root| root.transition(&mut heap, x))
+            .expect("should have room");
+        let two = ShapeRef::root(&mut heap, Some(second))
+            .and_then(|root| root.transition(&mut heap, x))
+            .expect("should have room");
+        assert_ne!(one, two);
+        assert_eq!(one.index_of(heap.cage(), x), two.index_of(heap.cage(), x));
+        assert_eq!(one.prototype(heap.cage()), Some(first));
+        assert_eq!(two.prototype(heap.cage()), Some(second));
     }
 
     #[test]
