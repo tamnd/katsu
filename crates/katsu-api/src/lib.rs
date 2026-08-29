@@ -41,7 +41,9 @@ pub enum Error {
 impl From<RuntimeError> for Error {
     fn from(error: RuntimeError) -> Error {
         match error {
-            RuntimeError::NotImplemented(_) => Error::NotImplemented(error.to_string()),
+            RuntimeError::NotImplemented(_) | RuntimeError::Unsupported(_) => {
+                Error::NotImplemented(error.to_string())
+            }
             RuntimeError::OutOfMemory | RuntimeError::Interrupted => {
                 Error::Fatal(error.to_string())
             }
@@ -91,6 +93,8 @@ impl Runtime {
         katsu_builtins::install_globals(&mut interpreter)?;
         katsu_builtins::install_console(&mut interpreter)?;
         katsu_builtins::install_performance(&mut interpreter)?;
+        katsu_builtins::install_string(&mut interpreter)?;
+        katsu_builtins::install_json(&mut interpreter)?;
         Ok(Runtime { interpreter })
     }
 
