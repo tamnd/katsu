@@ -117,6 +117,24 @@ pub struct Frame {
     pub return_pc: u32,
     /// The register in the caller's frame that this frame's return value is written into.
     pub return_to: Register,
+    /// What `this` is inside this frame, or [`Value::EMPTY`] if the call site did not supply one.
+    ///
+    /// Nothing supplied is not the same as `undefined` supplied, and the difference is the whole
+    /// reason there is a third state. A method call supplies the object it was read from, and that
+    /// object can be anything including `undefined` once `call` and `apply` exist. A plain call
+    /// supplies nothing, and what `this` means then depends on where the code is and whether it is
+    /// strict, which is a question the call site cannot answer and [`Op::LoadThis`] can.
+    ///
+    /// An `Option<Value>` says all of that in the type and costs eight bytes to do it, because a
+    /// value has no spare bit pattern for the discriminant to hide in. That took the header from
+    /// twenty four bytes to forty and cost 14 percent on `call/call_return` and on `call/fib`,
+    /// measured in ABBA order on the m4, which is a lot to pay for a nicer signature on a field two
+    /// places read. The empty value is what the encoding already uses for "there is no value here",
+    /// it is what a register in the dead zone holds, and no call site can produce it, so it says the
+    /// same thing in the eight bytes the value was going to take anyway.
+    ///
+    /// [`Op::LoadThis`]: katsu_ir::Op::LoadThis
+    pub receiver: Value,
 }
 
 /// What a call site tells the stack, other than how big the frame it needs is.
@@ -139,6 +157,11 @@ pub struct Invocation {
     pub return_pc: u32,
     /// The caller's register the returned value goes into.
     pub return_to: Register,
+    /// What `this` is inside the call, or [`Value::EMPTY`] if this call site does not supply one.
+    ///
+    /// See [`Frame::receiver`], which this is copied into and which says what the empty value means
+    /// here and why it is not an option.
+    pub receiver: Value,
 }
 
 /// A contiguous region of value slots, carved into frames.
@@ -267,7 +290,9 @@ impl Stack {
         let (arguments, rest) = slots.split_at_mut(taken);
         arguments.copy_from_slice(&args[..taken]);
         rest.fill(Value::UNDEFINED);
-        self.commit(base, size, function, 0, Register(0));
+        // No receiver, because nothing called this frame. What `this` means at the outermost level
+        // of a program is a question about the module system rather than about the stack.
+        self.commit(base, size, function, 0, Register(0), Value::EMPTY);
         Ok(())
     }
 
@@ -309,7 +334,14 @@ impl Stack {
             std::slice::from_raw_parts_mut(slots.add(base + taken), usize::from(size) - taken)
                 .fill(Value::UNDEFINED);
         }
-        self.commit(base, size, call.function, call.return_pc, call.return_to);
+        self.commit(
+            base,
+            size,
+            call.function,
+            call.return_pc,
+            call.return_to,
+            call.receiver,
+        );
         Ok(())
     }
 
@@ -338,6 +370,7 @@ impl Stack {
         function: u32,
         return_pc: u32,
         return_to: Register,
+        receiver: Value,
     ) {
         self.top = base + usize::from(size);
         self.frames.push(Frame {
@@ -347,6 +380,7 @@ impl Stack {
             context: 0,
             return_pc,
             return_to,
+            receiver,
         });
     }
 
@@ -492,6 +526,7 @@ mod tests {
             function: 0,
             return_pc: 0,
             return_to: Register(0),
+            receiver: Value::EMPTY,
         }
     }
 
@@ -593,6 +628,7 @@ mod tests {
                     function: 5,
                     return_pc: 7,
                     return_to: Register(3),
+                    receiver: Value::EMPTY,
                 },
             )
             .expect("should push");
@@ -613,6 +649,39 @@ mod tests {
         assert_eq!(frame.return_pc, 0);
         assert_eq!(frame.function, 0);
         assert_eq!(frame.context, 0, "nothing has been captured yet");
+        assert!(
+            frame.receiver.is_empty(),
+            "nothing called it, so nothing supplied a receiver"
+        );
+    }
+
+    #[test]
+    fn a_call_carries_its_receiver_onto_the_frame_it_pushes() {
+        // What makes a method call different from a plain one. The object the method was read from
+        // is put here by the call site, because the call site is the only place that knows it.
+        let mut stack = Stack::new().expect("should reserve");
+        push(&mut stack, 2);
+        let object = Value::from_pointer(0x2000);
+        let mut invocation = call(0, Register(0), 0);
+        invocation.receiver = object;
+        stack.push_call(2, invocation).expect("should push");
+        assert_eq!(
+            stack.current().expect("a frame is running").receiver,
+            object
+        );
+
+        stack.pop();
+        stack
+            .push_call(2, call(0, Register(0), 0))
+            .expect("should push");
+        assert!(
+            stack
+                .current()
+                .expect("a frame is running")
+                .receiver
+                .is_empty(),
+            "a plain call supplies nothing, which is not the same as supplying undefined"
+        );
     }
 
     #[test]

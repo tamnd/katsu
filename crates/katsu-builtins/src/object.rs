@@ -7,7 +7,16 @@
 //! # What is here
 //!
 //! `Object.prototype`, `Object.create`, `Object.getPrototypeOf`, `Object.defineProperty`,
-//! `Object.defineProperties` and `Object.getOwnPropertyDescriptor`.
+//! `Object.defineProperties` and `Object.getOwnPropertyDescriptor`, and on the prototype itself
+//! `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` and `valueOf`.
+//!
+//! # Why the prototype was empty until now
+//!
+//! Every method on `Object.prototype` needed two things that arrived separately. It needed
+//! attributes, because a method at the top of nearly every chain in the realm has to be hidden or it
+//! shows up in every object printed, everything serialised and every `for in`. And it needed
+//! receivers, because each of these methods is a question about the object it was called on and
+//! until a call site kept that object there was nothing to ask about. Both are here, so they are.
 //!
 //! # Defining a property is not assigning to one
 //!
@@ -42,22 +51,27 @@
 //!
 //! `new Object()`, which needs `new`.
 //!
-//! Accessors, meaning `get` and `set` in a descriptor. A getter is called with the object the
-//! property was read from and `this` is `undefined` everywhere in this build, so there is nothing to
-//! call one with. A descriptor carrying either one refuses by name rather than being read as a data
-//! descriptor and silently defining the wrong thing. The one case that is a real `TypeError` rather
-//! than a gap, a descriptor with both an accessor and a value, still throws what Node throws,
-//! because that answer does not need a receiver to be correct.
+//! Accessors, meaning `get` and `set` in a descriptor. There is now a receiver to call a getter
+//! with, and what is left is the storage: a slot has to be able to hold a pair of functions instead
+//! of a value, and a shape node has to say that it does. A descriptor carrying either one refuses by
+//! name rather than being read as a data descriptor and silently defining the wrong thing. The one
+//! case that is a real `TypeError` rather than a gap, a descriptor with both an accessor and a
+//! value, still throws what Node throws.
 //!
-//! Anything on `Object.prototype`, for the same reason. `toString`, `hasOwnProperty` and
-//! `valueOf` are all methods that read the object they were called on, so they are waiting on
-//! receivers and not on attributes. Attributes were the other half of what they needed and they are
-//! here now: a method installed there would be hidden from `console.log`, from `JSON.stringify` and
-//! from `for in`, which is what [`Attributes::BUILTIN`] means.
+//! `Object.prototype.toLocaleString`, which is defined as calling `this.toString()`. Calling a value
+//! from Rust is not something a native can do yet, and writing the same answer out twice would give
+//! the wrong one for any object that overrides `toString`.
 //!
-//! What that costs today is that `({}).toString()` and `o.hasOwnProperty('x')` do not work. The
-//! conversion itself does, because `String({})` asks whether the chain reaches `Object.prototype`
-//! rather than asking for a method that is not there yet.
+//! `Object.prototype.constructor`, which points at `Object`. It is one line and the line would be a
+//! lie: `Object` is not a function here, so `x.constructor` would answer with something that cannot
+//! be called or constructed. It lands with `new`.
+//!
+//! `__defineGetter__` and the three others like it, which are accessors under an older spelling.
+//!
+//! Calling one of these methods on a primitive. `ToObject` boxes a number or a string into a wrapper
+//! and there are no wrapper prototypes, so anything that is not an ordinary object refuses by name.
+//! No program can reach that today, because reaching a method through a primitive needs the same
+//! wrapper prototypes, and it is written down so that it stays true when they arrive.
 //!
 //! `Object.setPrototypeOf` and `__proto__`, which change an existing object's prototype. That is a
 //! different operation from choosing one at creation: it has to move an object to a different shape
@@ -74,7 +88,7 @@
 //! record that yet. Where extensibility lives is a decision about the object model rather than a few
 //! lines in this file, so the whole group waits for it.
 
-use katsu_vm::{Attributes, Interpreter, RuntimeError, Value, arg};
+use katsu_vm::{Attributes, Interpreter, NativeFn, RuntimeError, Value, arg, this_value};
 
 /// Put `Object` in the global scope.
 ///
@@ -106,7 +120,162 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
     // rewrite it, hide it or remove it, because the top of every prototype chain in the realm moving
     // out from under running code is not something the language is willing to allow.
     interpreter.define_property(object, "prototype", prototype, Attributes::NONE)?;
+    install_prototype(interpreter, prototype)?;
     interpreter.define_global("Object", object)
+}
+
+/// Put the methods every object inherits onto `Object.prototype`.
+///
+/// All of them non enumerable, writable and configurable, which is what Node reports for each one
+/// and what [`Attributes::BUILTIN`] means. That is not a detail: these live at the top of nearly
+/// every prototype chain in the realm, so an enumerable one would appear in every `for in` over
+/// every object in the program.
+fn install_prototype(interpreter: &mut Interpreter, prototype: Value) -> Result<(), RuntimeError> {
+    for (name, call) in [
+        ("hasOwnProperty", has_own_property as NativeFn),
+        ("isPrototypeOf", is_prototype_of),
+        ("propertyIsEnumerable", property_is_enumerable),
+        ("toString", to_string),
+        ("valueOf", value_of),
+    ] {
+        let function = interpreter.native_function(name, call)?;
+        interpreter.define_property(prototype, name, function, Attributes::BUILTIN)?;
+    }
+    Ok(())
+}
+
+/// `Object.prototype.hasOwnProperty(key)`.
+///
+/// Own and not inherited, which is the whole reason the method exists. `({}).hasOwnProperty(
+/// 'toString')` is false even though `({}).toString` is a function, because the function is on the
+/// prototype and the question is about the object.
+fn has_own_property(
+    interpreter: &mut Interpreter,
+    receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let key = interpreter.to_text(arg(args, 0))?;
+    let object = called_on(interpreter, receiver, "Object.prototype.hasOwnProperty")?;
+    Ok(Value::from_bool(
+        interpreter.own_descriptor(object, &key).is_some(),
+    ))
+}
+
+/// `Object.prototype.isPrototypeOf(value)`.
+///
+/// Anywhere on the chain rather than immediately above, which is the difference between this and
+/// comparing against `Object.getPrototypeOf`. Anything that is not an object answers false rather
+/// than throwing, because a primitive has no chain to be on and that is an answer rather than a
+/// mistake.
+fn is_prototype_of(
+    interpreter: &mut Interpreter,
+    receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let object = called_on(interpreter, receiver, "Object.prototype.isPrototypeOf")?;
+    let mut walking = arg(args, 0);
+    // The value itself does not count, so the walk starts one above it. `o.isPrototypeOf(o)` is
+    // false in Node and the loop below is what makes it false here.
+    while let Some(above) = interpreter.prototype_of(walking) {
+        if above == object {
+            return Ok(Value::TRUE);
+        }
+        walking = above;
+    }
+    Ok(Value::FALSE)
+}
+
+/// `Object.prototype.propertyIsEnumerable(key)`.
+///
+/// False for a name the object does not have of its own, which folds two different answers into
+/// one: a property that is hidden and a property that is not there both say false, and the way to
+/// tell them apart is `Object.getOwnPropertyDescriptor`.
+fn property_is_enumerable(
+    interpreter: &mut Interpreter,
+    receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let key = interpreter.to_text(arg(args, 0))?;
+    let object = called_on(
+        interpreter,
+        receiver,
+        "Object.prototype.propertyIsEnumerable",
+    )?;
+    let enumerable = interpreter
+        .own_descriptor(object, &key)
+        .is_some_and(|(_, attributes)| attributes.is_enumerable());
+    Ok(Value::from_bool(enumerable))
+}
+
+/// `Object.prototype.toString()`, which is where `[object Object]` comes from.
+///
+/// This one answers for every value rather than going through [`called_on`], because that is what
+/// the specification asks for: `undefined` and `null` have their own tags here instead of throwing
+/// the way every other method on this prototype does. They are unreachable until `call` exists,
+/// since a plain `x.toString()` on either throws before the method is found, and they are written
+/// out anyway because the alternative is a method that is right about the values it can see today
+/// and wrong about the ones it will see next.
+fn to_string(
+    interpreter: &mut Interpreter,
+    receiver: Option<Value>,
+    _args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let value = this_value(receiver, "Object.prototype.toString")?;
+    let tag = if value.is_undefined() {
+        "Undefined"
+    } else if value.is_null() {
+        "Null"
+    } else if interpreter.is_callable(value) {
+        "Function"
+    } else if interpreter.is_ordinary_object(value) {
+        "Object"
+    } else {
+        // A primitive, which boxes into a wrapper whose tag is the wrapper's name. There are no
+        // wrapper prototypes to reach this through yet, so `Symbol.toStringTag` and the exotic tags
+        // arrive with them rather than being guessed at here.
+        return Err(RuntimeError::Unsupported(
+            "Object.prototype.toString is not supported yet for a primitive, because it needs the wrapper prototypes".to_owned(),
+        ));
+    };
+    interpreter.new_string(&format!("[object {tag}]"))
+}
+
+/// `Object.prototype.valueOf()`, which for an ordinary object is the object.
+///
+/// It exists so that a conversion has something to call and so that a type which does have a
+/// primitive value has something to override. Answering with the receiver unchanged is the whole
+/// implementation for everything that does not.
+fn value_of(
+    interpreter: &mut Interpreter,
+    receiver: Option<Value>,
+    _args: &[Value],
+) -> Result<Value, RuntimeError> {
+    called_on(interpreter, receiver, "Object.prototype.valueOf")
+}
+
+/// The object a method on `Object.prototype` was called on, or why there is not one.
+///
+/// Every one of these methods begins with `ToObject(this)`, and that step has three outcomes.
+/// `undefined` and `null` throw, in the words Node uses. An ordinary object is itself. Everything
+/// else boxes into a wrapper, and there are no wrapper prototypes yet, so it refuses by name rather
+/// than answering about a box that was never made.
+fn called_on(
+    interpreter: &Interpreter,
+    receiver: Option<Value>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    let value = this_value(receiver, name)?;
+    if value.is_undefined() || value.is_null() {
+        return Err(RuntimeError::Type(
+            "Cannot convert undefined or null to object".to_owned(),
+        ));
+    }
+    if !interpreter.is_ordinary_object(value) {
+        return Err(RuntimeError::Unsupported(format!(
+            "{name} is not supported yet for a value that is not an ordinary object, because it needs the wrapper prototypes"
+        )));
+    }
+    Ok(value)
 }
 
 /// `Object.create(prototype, descriptors)`.
@@ -119,13 +288,17 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
 /// in Node, because the argument is required to be an object or `null` and `undefined` is neither,
 /// so the missing argument falls into the same message rather than being defaulted. It is the other
 /// way around for the second, where absent means there is nothing to define.
-fn create(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn create(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let object = interpreter.new_object_with_prototype(arg(args, 0))?;
     let descriptors = arg(args, 1);
     if descriptors.is_undefined() {
         return Ok(object);
     }
-    define_properties(interpreter, &[object, descriptors])
+    define_properties(interpreter, None, &[object, descriptors])
 }
 
 /// `Object.getPrototypeOf(value)`.
@@ -135,7 +308,11 @@ fn create(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, Runtim
 /// Every other primitive has an answer in the specification, which is the prototype of the wrapper
 /// it would be converted to, and this build has no wrapper prototypes, so it refuses by name instead
 /// of saying `null` and being believed.
-fn get_prototype_of(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn get_prototype_of(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let value = arg(args, 0);
     if value.is_undefined() || value.is_null() {
         return Err(RuntimeError::Type(
@@ -174,7 +351,11 @@ struct Descriptor {
 ///
 /// Answers with the target, which is what makes `Object.defineProperty(o, 'x', d).x` work and is the
 /// only reason it returns anything at all.
-fn define_property(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn define_property(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let target = arg(args, 0);
     if !interpreter.is_ordinary_object(target) {
         return Err(RuntimeError::Type(
@@ -196,7 +377,11 @@ fn define_property(interpreter: &mut Interpreter, args: &[Value]) -> Result<Valu
 ///
 /// A primitive other than `undefined` and `null` has no own properties to read, so it defines
 /// nothing and does not complain, which is also what Node does.
-fn define_properties(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn define_properties(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let target = arg(args, 0);
     if !interpreter.is_ordinary_object(target) {
         return Err(RuntimeError::Type(
@@ -224,7 +409,11 @@ fn define_properties(interpreter: &mut Interpreter, args: &[Value]) -> Result<Va
 ///
 /// `undefined` for a name the object does not have of its own, including one it inherits, because
 /// this question is about the object and not about its chain.
-fn describe(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn describe(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     let value = arg(args, 0);
     if value.is_undefined() || value.is_null() {
         return Err(RuntimeError::Type(
@@ -313,7 +502,7 @@ fn read_descriptor(
     }
     if getter.is_some() || setter.is_some() {
         return Err(RuntimeError::Unsupported(
-            "Object.defineProperty does not support accessors yet, because a getter needs the receiver it was read from and this is undefined everywhere in this build".to_owned(),
+            "Object.defineProperty does not support accessors yet, because a property slot holds a value rather than a pair of functions".to_owned(),
         ));
     }
     Ok(descriptor)
@@ -407,6 +596,128 @@ mod tests {
     fn logged(source: &str) -> String {
         let text = printed(source).expect("the program should run");
         text.strip_suffix('\n').unwrap_or(&text).to_owned()
+    }
+
+    /// What a program failed with, for a program that should fail.
+    #[track_caller]
+    fn refused(source: &str) -> String {
+        printed(source).expect_err("the program should fail")
+    }
+
+    #[test]
+    fn every_object_has_the_methods_on_object_prototype() {
+        assert_eq!(
+            logged(
+                "var o = {a: 1}; console.log(o.toString(), o.valueOf() === o, typeof o.hasOwnProperty);"
+            ),
+            "[object Object] true function"
+        );
+    }
+
+    #[test]
+    fn has_own_property_asks_about_the_object_and_not_about_its_chain() {
+        assert_eq!(
+            logged(
+                "var p = {a: 1}; var o = Object.create(p);\n\
+                 console.log(o.a, o.hasOwnProperty('a'), p.hasOwnProperty('a'), o.hasOwnProperty('toString'));"
+            ),
+            "1 false true false"
+        );
+    }
+
+    #[test]
+    fn has_own_property_converts_its_key_the_way_a_property_name_is_converted() {
+        assert_eq!(
+            logged(
+                "console.log(({undefined: 1}).hasOwnProperty(undefined), ({}).hasOwnProperty());"
+            ),
+            "true false"
+        );
+    }
+
+    #[test]
+    fn is_prototype_of_walks_the_whole_chain_and_leaves_the_object_itself_out() {
+        assert_eq!(
+            logged(
+                "var top = {}; var middle = Object.create(top); var bottom = Object.create(middle);\n\
+                 console.log(top.isPrototypeOf(bottom), bottom.isPrototypeOf(top), top.isPrototypeOf(top));"
+            ),
+            "true false false"
+        );
+    }
+
+    #[test]
+    fn is_prototype_of_answers_false_for_something_that_has_no_chain_rather_than_throwing() {
+        assert_eq!(
+            logged(
+                "console.log(Object.prototype.isPrototypeOf(1), Object.prototype.isPrototypeOf(Object.create(null)));"
+            ),
+            "false false"
+        );
+    }
+
+    #[test]
+    fn a_hidden_property_is_still_an_own_property() {
+        // Where the two questions come apart. `hasOwnProperty` is about whether the property is
+        // there and `propertyIsEnumerable` is about whether it shows, and a defined property is
+        // there and does not show.
+        assert_eq!(
+            logged(
+                "var o = {shown: 1}; Object.defineProperty(o, 'kept', {value: 2});\n\
+                 console.log(o.hasOwnProperty('kept'), o.propertyIsEnumerable('kept'), o.propertyIsEnumerable('shown'));"
+            ),
+            "true false true"
+        );
+    }
+
+    #[test]
+    fn property_is_enumerable_says_false_for_a_name_that_is_not_there_at_all() {
+        assert_eq!(
+            logged(
+                "console.log(({}).propertyIsEnumerable('nope'), ({}).propertyIsEnumerable('toString'));"
+            ),
+            "false false"
+        );
+    }
+
+    #[test]
+    fn the_methods_on_object_prototype_are_hidden_from_everything_that_walks_an_object() {
+        // The reason they could not be installed before attributes. An enumerable `toString` at the
+        // top of every chain would appear in every object printed and everything serialised.
+        assert_eq!(
+            logged("var o = {a: 1}; console.log(o, JSON.stringify(o));"),
+            "{ a: 1 } {\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn the_methods_on_object_prototype_carry_the_attributes_node_reports_for_them() {
+        assert_eq!(
+            logged(
+                "var d = Object.getOwnPropertyDescriptor(Object.prototype, 'hasOwnProperty');\n\
+                 console.log(d.writable, d.enumerable, d.configurable);"
+            ),
+            "true false true"
+        );
+    }
+
+    #[test]
+    fn an_object_with_no_prototype_has_none_of_them() {
+        assert_eq!(
+            logged(
+                "var bare = Object.create(null); console.log(bare.toString, bare.hasOwnProperty);"
+            ),
+            "undefined undefined"
+        );
+    }
+
+    #[test]
+    fn a_method_on_object_prototype_called_on_nothing_refuses_by_name() {
+        // A plain call needs `globalThis` to know what it was called on, and there is not one. The
+        // only way to make this call today is to read the method out and call it, which is what the
+        // program below does.
+        let error = refused("var f = ({}).hasOwnProperty; f('x');");
+        assert!(error.contains("globalThis"), "{error}");
     }
 
     #[test]

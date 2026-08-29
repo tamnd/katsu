@@ -53,7 +53,11 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
 
 /// Write one line to standard output.
 #[allow(clippy::unnecessary_wraps)]
-fn log(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn log(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     write_line(interpreter, Stream::Out, args);
     Ok(Value::UNDEFINED)
 }
@@ -63,21 +67,33 @@ fn log(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeEr
 /// Standard error and not standard output, which is the part of `console.error` that matters. A
 /// program whose output is being piped somewhere expects its diagnostics to stay out of the pipe.
 #[allow(clippy::unnecessary_wraps)]
-fn error(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn error(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     write_line(interpreter, Stream::Err, args);
     Ok(Value::UNDEFINED)
 }
 
 /// Write one line to standard error, which is where Node puts a warning too.
 #[allow(clippy::unnecessary_wraps)]
-fn warn(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn warn(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     write_line(interpreter, Stream::Err, args);
     Ok(Value::UNDEFINED)
 }
 
 /// `console.log` under another name, which is what it is in Node as well.
 #[allow(clippy::unnecessary_wraps)]
-fn info(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn info(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     write_line(interpreter, Stream::Out, args);
     Ok(Value::UNDEFINED)
 }
@@ -85,7 +101,11 @@ fn info(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeE
 /// Also `console.log` under another name. Node routes `debug` to standard output, not to a debug
 /// channel, and a program that expects its debug output in the same stream as the rest is right.
 #[allow(clippy::unnecessary_wraps)]
-fn debug(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn debug(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
     write_line(interpreter, Stream::Out, args);
     Ok(Value::UNDEFINED)
 }

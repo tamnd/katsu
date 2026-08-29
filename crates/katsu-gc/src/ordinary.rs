@@ -51,9 +51,10 @@
 //!
 //! # What is not here
 //!
-//! No accessors, so a property is always a value rather than a pair of functions. That is waiting on
-//! receivers rather than on anything in this file: a getter is called with the object it was read
-//! from, and `this` is `undefined` everywhere in this build. No delete, which is the one operation a
+//! No accessors, so a property is always a value rather than a pair of functions. What that is
+//! waiting on is a place to put the second function rather than anything about receivers, which
+//! exist now: a getter needs the slot to hold a pair, and a shape node needs a flag saying that the
+//! slot holds one. No delete, which is the one operation a
 //! transition tree genuinely does not want and which needs the dictionary mode that every engine
 //! falls back to. No indexed properties. No setters, for the same reason there are no getters, which
 //! is why a write always makes an own property and never goes up the chain. Each of those is its own

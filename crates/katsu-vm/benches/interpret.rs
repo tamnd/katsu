@@ -400,7 +400,7 @@ fn calls(c: &mut Criterion) {
 /// The `Result` is the signature every native has and not a return this one needs, which is exactly
 /// what makes it the right shape to measure the boundary with.
 #[allow(clippy::unnecessary_wraps)]
-fn nothing(_: &mut Interpreter, _: &[Value]) -> Result<Value, RuntimeError> {
+fn nothing(_: &mut Interpreter, _: Option<Value>, _: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::UNDEFINED)
 }
 

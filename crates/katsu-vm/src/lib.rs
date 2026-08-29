@@ -27,7 +27,7 @@ pub use interpret::{Interpreter, Interrupt, RuntimeError};
 /// What a property is allowed to do, re exported so that a builtin can say it without depending on
 /// the heap crate. See [`katsu_gc::Attributes`].
 pub use katsu_gc::Attributes;
-pub use native::{NativeFn, Natives, arg};
+pub use native::{NativeFn, Natives, arg, this_value};
 pub use output::{Discard, Output, Recorder, Standard, Stream};
 pub use stack::{Frame, Invocation, Stack, StackError};
 pub use unit::{Loaded, Resolved, Unit};

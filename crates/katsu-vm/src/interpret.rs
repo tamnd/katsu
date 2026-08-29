@@ -863,11 +863,12 @@ impl Interpreter {
                     ));
                 }
 
-                // `this` at the top level of a module is `undefined`, and no function in M0 can be
-                // called with a receiver because calls are not implemented, so there is nothing else
-                // it can be yet. The CommonJS case, where it is `module.exports`, arrives with the
-                // module system.
-                Op::LoadThis { dst } => self.stack.set(dst, Value::UNDEFINED),
+                // A method call put the object here and this reads it back. Everything else is a
+                // question the call site could not answer, so it is answered here.
+                Op::LoadThis { dst } => {
+                    let receiver = guard!(self.receiver(blueprint));
+                    self.stack.set(dst, receiver);
+                }
 
                 // `+` is two operators sharing one symbol, and which one it is depends on the values
                 // rather than on the syntax. The specification says to run ToPrimitive on both sides
@@ -1142,7 +1143,7 @@ impl Interpreter {
                         // called, and which language its body is written in is not something the
                         // call site knows.
                         if let Some(native) = self.as_native(target) {
-                            let value = guard!(self.call_native(native, args, argc));
+                            let value = guard!(self.call_native(native, None, args, argc));
                             self.stack.set(dst, value);
                             continue;
                         }
@@ -1178,6 +1179,10 @@ impl Interpreter {
                                     function: index,
                                     return_pc,
                                     return_to: dst,
+                                    // A plain call supplies no receiver. What `this` means inside
+                                    // one is a question about where the code is rather than about
+                                    // the call, and `Op::LoadThis` is where that is answered.
+                                    receiver: Value::EMPTY,
                                 },
                             )
                             .map_err(RuntimeError::from)
@@ -1252,10 +1257,10 @@ impl Interpreter {
                 }
 
                 // A property read and a call, kept in one opcode so that the receiver is not lost
-                // between them. The receiver is looked up and then dropped, because neither a closure
-                // nor a native can see `this` yet, and `console.log` does not need to. What that
-                // costs is that a method depending on its receiver would read `undefined`, and the
-                // only methods that exist today are the ones the runtime installs itself.
+                // between them. The object the property was read from goes on the frame the call
+                // pushes, or straight into the native, and either way `this` inside the callee is
+                // the object rather than nothing. That is the whole reason this is one opcode and
+                // not a read followed by a call.
                 Op::CallMethod {
                     dst,
                     obj,
@@ -1269,7 +1274,7 @@ impl Interpreter {
                     let target = guard!(self.property(object, name, blueprint, key));
                     let Some(closure) = self.as_closure(target) else {
                         if let Some(native) = self.as_native(target) {
-                            let value = guard!(self.call_native(native, args, argc));
+                            let value = guard!(self.call_native(native, Some(object), args, argc));
                             self.stack.set(dst, value);
                             continue;
                         }
@@ -1295,6 +1300,9 @@ impl Interpreter {
                                     function: index,
                                     return_pc,
                                     return_to: dst,
+                                    // The object the method was read from, which is the whole
+                                    // point of this opcode existing separately from `Op::Call`.
+                                    receiver: object,
                                 },
                             )
                             .map_err(RuntimeError::from)
@@ -1590,6 +1598,7 @@ impl Interpreter {
     fn call_native(
         &mut self,
         native: NativeRef,
+        receiver: Option<Value>,
         first: Register,
         count: u16,
     ) -> Result<Value, RuntimeError> {
@@ -1598,7 +1607,7 @@ impl Interpreter {
             return Err(Self::broken_native());
         };
         let arguments: SmallVec<[Value; 8]> = SmallVec::from_slice(self.stack.range(first, count));
-        call(self, &arguments)
+        call(self, receiver, &arguments)
     }
 
     /// The interned name a name operand holds.
@@ -1726,6 +1735,46 @@ impl Interpreter {
             holder = current.prototype(cage);
         }
         Value::UNDEFINED
+    }
+
+    /// What `this` is in the frame that is running.
+    ///
+    /// A method call already answered this by putting the object it read the method from on the
+    /// frame, and that is the case worth being fast. Everything else is a question the call site
+    /// could not answer, because the answer depends on where the code is and whether it is strict,
+    /// and both of those are properties of the callee rather than of the caller.
+    ///
+    /// The three remaining cases are not one rule with exceptions, they are three different rules.
+    /// A strict function called with no receiver gets `undefined`, and that one is answerable here
+    /// and answered. A sloppy function called with no receiver gets `globalThis`, which needs a real
+    /// global object and there is not one yet, so it refuses by name. The outermost frame in a
+    /// CommonJS file gets `module.exports`, which is an empty object rather than the global one, and
+    /// that needs a module system, so it refuses by name too. Refusing is better than answering
+    /// `undefined` in both, because `undefined` is a legal answer that a program will act on and a
+    /// refusal is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Unsupported`] for the two cases above.
+    fn receiver(&self, blueprint: &FunctionBlueprint) -> Result<Value, RuntimeError> {
+        let frame = self.stack.current().expect("an opcode runs inside a frame");
+        if !frame.receiver.is_empty() {
+            return Ok(frame.receiver);
+        }
+        if self.stack.depth() == 1 {
+            return Err(RuntimeError::Unsupported(
+                "`this` at the top level is module.exports, and modules are not implemented yet"
+                    .to_owned(),
+            ));
+        }
+        if blueprint.strict {
+            return Ok(Value::UNDEFINED);
+        }
+        Err(RuntimeError::Unsupported(
+            "`this` in a sloppy mode function called on nothing is globalThis, and globalThis is \
+             not implemented yet"
+                .to_owned(),
+        ))
     }
 
     /// Write one property, which is an ordinary assignment and not a definition.
@@ -2141,11 +2190,12 @@ impl Interpreter {
     /// `Object.prototype.toString` rather than from the object.
     ///
     /// The test is whether the chain reaches this realm's `Object.prototype`, and not whether a
-    /// property called `toString` is on it, because there is nothing on it yet. A method there needs
-    /// a receiver to be called with, and `this` is `undefined` everywhere in this build, so nothing
-    /// can put one there and reaching `Object.prototype` and finding a `toString` are the same
-    /// question for every object this build can make. When there is a real method to find, this
-    /// becomes a real lookup and a real call, and the answer stops being a constant.
+    /// property called `toString` is found on it. There is a real one on it now, and it answers
+    /// exactly this text, so the two questions still have the same answer for every object this
+    /// build can make. What stops it being a real lookup and a real call is that an object with its
+    /// own `toString` would then have it called, and calling a JavaScript function from Rust is not
+    /// something the interpreter can do yet. Until it can, an overridden `toString` is ignored by
+    /// `String(x)` and `'' + x`, which is a known wrong answer and the next thing this becomes.
     ///
     /// An object converts to `[object Object]` and not to what `console.log` shows, because this is
     /// `ToString` and not inspection. `'' + {}` is `[object Object]` in Node too, and the two
@@ -2703,8 +2753,6 @@ mod tests {
                 },
                 Value::FALSE,
             ),
-            // `this` at the top level of a module, which is the only receiver M0 can produce.
-            (Op::LoadThis { dst: Register(0) }, Value::UNDEFINED),
         ] {
             assert_eq!(
                 run(vec![op, Op::Return { src: Register(0) }]),
@@ -4268,6 +4316,68 @@ mod tests {
     }
 
     #[test]
+    fn a_method_call_makes_this_the_object_it_was_read_from() {
+        assert_eq!(
+            evaluate_number("var o = { n: 41, get: function () { return this.n + 1; } }; o.get();"),
+            42.0
+        );
+    }
+
+    #[test]
+    fn this_is_the_object_the_call_went_through_and_not_the_one_the_function_came_from() {
+        // The property that makes a receiver a receiver rather than a second closure variable. The
+        // same function reached through two objects reads two different values.
+        assert_eq!(
+            evaluate_display(
+                "var one = { n: 1, read: function () { return this.n; } };\n\
+                 var two = { n: 2, read: one.read };\n\
+                 one.read() + ',' + two.read();"
+            ),
+            "1,2"
+        );
+    }
+
+    #[test]
+    fn a_method_can_write_through_its_receiver() {
+        assert_eq!(
+            evaluate_number(
+                "var c = { n: 0, bump: function () { this.n = this.n + 1; return this.n; } };\n\
+                 c.bump(); c.bump(); c.n;"
+            ),
+            2.0
+        );
+    }
+
+    #[test]
+    fn a_strict_function_called_on_nothing_gets_undefined() {
+        assert_eq!(
+            evaluate("function f() { 'use strict'; return this; } f();"),
+            Ok(Value::UNDEFINED)
+        );
+    }
+
+    #[test]
+    fn a_sloppy_function_called_on_nothing_refuses_by_name_rather_than_guessing() {
+        // `globalThis`, and there is no global object yet. Answering `undefined` would be a legal
+        // value that a program would go on to read a property from, and the failure would then be
+        // reported somewhere else entirely.
+        let error = evaluate("function f() { return this; } f();").expect_err("should refuse");
+        assert!(
+            matches!(&error, RuntimeError::Unsupported(text) if text.contains("globalThis")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn this_at_the_top_level_refuses_by_name_because_it_is_module_exports() {
+        let error = evaluate("this;").expect_err("should refuse");
+        assert!(
+            matches!(&error, RuntimeError::Unsupported(text) if text.contains("module.exports")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn a_call_leaves_the_callers_registers_alone() {
         // The two frames are neighbouring windows into one region, so a callee that sized its frame
         // wrong or copied its arguments to the wrong place writes over the caller's variables. The
@@ -4488,7 +4598,11 @@ mod tests {
     /// The `Result` is the signature rather than something this one uses, which is true of plenty of
     /// real builtins as well.
     #[allow(clippy::unnecessary_wraps)]
-    fn sum(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    fn sum(
+        interpreter: &mut Interpreter,
+        _receiver: Option<Value>,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
         let total: f64 = args.iter().map(|value| interpreter.number(*value)).sum();
         Ok(Value::from_f64(total))
     }
@@ -4497,13 +4611,17 @@ mod tests {
     ///
     /// The one that proves a native can do the two things a native exists to do: look at a value it
     /// was given, and allocate a new one in the heap it was handed.
-    fn text_of(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    fn text_of(
+        interpreter: &mut Interpreter,
+        _receiver: Option<Value>,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
         let text = interpreter.display(crate::arg(args, 0));
         interpreter.intern(&text)
     }
 
     /// A native that throws, because Rust code is allowed to fail the same way an opcode is.
-    fn boom(_: &mut Interpreter, _: &[Value]) -> Result<Value, RuntimeError> {
+    fn boom(_: &mut Interpreter, _: Option<Value>, _: &[Value]) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Type("boom".to_owned()))
     }
 
@@ -4663,7 +4781,11 @@ mod tests {
     /// cannot depend on the crate that depends on it, and because what is being tested is the
     /// plumbing and not the builtin.
     #[allow(clippy::unnecessary_wraps)]
-    fn print(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    fn print(
+        interpreter: &mut Interpreter,
+        _receiver: Option<Value>,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
         let text = interpreter.display(crate::arg(args, 0));
         interpreter.write_output(crate::Stream::Out, &format!("{text}\n"));
         Ok(Value::UNDEFINED)

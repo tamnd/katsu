@@ -68,7 +68,11 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
 /// Takes no arguments and ignores any it is given, which is what every other implementation does and
 /// what the specification says: extra arguments to a builtin are dropped rather than being an error.
 #[allow(clippy::unnecessary_wraps)]
-fn now(_interpreter: &mut Interpreter, _args: &[Value]) -> Result<Value, RuntimeError> {
+fn now(
+    _interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    _args: &[Value],
+) -> Result<Value, RuntimeError> {
     Ok(Value::from_f64(katsu_vm::now_ms()))
 }
 
