@@ -230,7 +230,8 @@ mod tests {
 
     #[test]
     fn an_unsupported_construct_says_where_it_is() {
-        let error = parse("loop.js", "let i = 0;\nfor (;;) {}").expect_err("should be refused");
+        let error =
+            parse("loop.js", "let i = 0;\nfor (i of xs) {}").expect_err("should be refused");
         let ParseError::Unsupported {
             path,
             line,
@@ -241,7 +242,7 @@ mod tests {
             panic!("expected an unsupported construct, got {error:?}");
         };
         assert_eq!(path, "loop.js");
-        assert_eq!(construct, "a for loop");
+        assert_eq!(construct, "a for of loop");
         assert_eq!((line, column), (2, 1));
     }
 }

@@ -47,8 +47,8 @@ use katsu_ir::{
 };
 
 use crate::ast::{
-    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, Func, Ident,
-    LogicalOp, Module, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
+    AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, ForInit, Func,
+    Ident, LogicalOp, Module, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp, UpdateOp,
 };
 use crate::scope::{BindingKind, FunctionId, Reference, Resolution, Scopes};
 
@@ -881,6 +881,13 @@ impl<'a> Lowerer<'a> {
                 }
             }
             StmtKind::While { test, body } => self.while_loop(at, test, body)?,
+            StmtKind::DoWhile { body, test } => self.do_while_loop(at, body, test)?,
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => self.for_loop(at, init.as_ref(), test.as_ref(), update.as_ref(), body)?,
             StmtKind::Switch {
                 discriminant,
                 cases,
@@ -1334,6 +1341,145 @@ impl<'a> Lowerer<'a> {
             },
         );
         self.patch(exit);
+        for jump in breaks {
+            self.patch(jump);
+        }
+        Ok(())
+    }
+
+    /// Lower a `do while`.
+    ///
+    /// The body comes first and the test comes after it, which is the whole of the difference from
+    /// a `while` in the source and almost the whole of it in the bytecode too. The one thing that
+    /// is not obvious is where a `continue` goes. It lands on the test rather than past it, because
+    /// an iteration cut short still has to ask the condition before the next one starts, and a
+    /// `continue` that jumped to the back edge would turn `do { continue; } while (false)` into an
+    /// endless loop.
+    fn do_while_loop(&mut self, at: u32, body: &Stmt, test: &Expr) -> Result<(), LowerError> {
+        let top = self.here();
+
+        self.enclosing.push(Enclosing::loop_());
+        let result = self.statement(body);
+        let frame = self.enclosing.pop().expect("the loop frame was pushed");
+        let (breaks, continues) = frame.jumps();
+        result?;
+
+        for jump in continues {
+            self.patch(jump);
+        }
+
+        let mark = self.next_temp;
+        let cond = self.expr(test)?;
+        self.release(mark);
+        let exit = self.emit(
+            at,
+            Op::JumpIfFalse {
+                cond,
+                target: UNPATCHED,
+            },
+        );
+        let profile = self.cache();
+        self.emit(
+            at,
+            Op::LoopBackEdge {
+                target: top,
+                profile,
+            },
+        );
+
+        self.patch(exit);
+        for jump in breaks {
+            self.patch(jump);
+        }
+        Ok(())
+    }
+
+    /// Lower a `for`, the three part one.
+    ///
+    /// The layout is the head, then the test, then the body, then the update, then the jump back to
+    /// the test. A `continue` lands on the update rather than on the back edge, which is the only
+    /// place it can land: skipping the update would make `for (let i = 0; i < 3; i++) { continue; }`
+    /// an endless loop, and skipping the test would run the body after the condition went false.
+    ///
+    /// Every part is optional and every part that is absent costs nothing. `for (;;)` lowers to a
+    /// body and a back edge with no comparison in it at all, which is a tighter loop than the same
+    /// thing written as `while (true)`, and that is a real difference rather than an accident: an
+    /// absent test is not a test against `true`.
+    ///
+    /// The scope the head opens is the loop's own and the analysis already put the head's names in
+    /// it, so all this owes it is the dead zone holes, which go in before the head runs because
+    /// `for (let i = i; ;)` has to be a `ReferenceError` rather than a read of an outer `i`.
+    fn for_loop(
+        &mut self,
+        at: u32,
+        init: Option<&ForInit>,
+        test: Option<&Expr>,
+        update: Option<&Expr>,
+        body: &Stmt,
+    ) -> Result<(), LowerError> {
+        match init {
+            None => {}
+            Some(ForInit::Expr(expr)) => {
+                let mark = self.next_temp;
+                self.expr(expr)?;
+                self.release(mark);
+            }
+            Some(ForInit::Declare { kind, bindings }) => {
+                if *kind != DeclKind::Var {
+                    for binding in bindings {
+                        self.dead_zone_hole(binding);
+                    }
+                }
+                for binding in bindings {
+                    self.declare(*kind, binding)?;
+                }
+            }
+        }
+
+        let top = self.here();
+        let exit = match test {
+            Some(test) => {
+                let mark = self.next_temp;
+                let cond = self.expr(test)?;
+                self.release(mark);
+                Some(self.emit(
+                    at,
+                    Op::JumpIfFalse {
+                        cond,
+                        target: UNPATCHED,
+                    },
+                ))
+            }
+            None => None,
+        };
+
+        self.enclosing.push(Enclosing::loop_());
+        let result = self.statement(body);
+        let frame = self.enclosing.pop().expect("the loop frame was pushed");
+        let (breaks, continues) = frame.jumps();
+        result?;
+
+        for jump in continues {
+            self.patch(jump);
+        }
+        if let Some(update) = update {
+            let mark = self.next_temp;
+            self.expr(update)?;
+            self.release(mark);
+        }
+
+        let profile = self.cache();
+        self.emit(
+            at,
+            Op::LoopBackEdge {
+                target: top,
+                profile,
+            },
+        );
+
+        if let Some(exit) = exit {
+            self.patch(exit);
+        }
         for jump in breaks {
             self.patch(jump);
         }
@@ -2772,6 +2918,135 @@ mod tests {
             jump_if_false r1, @7
             load_int r1, 1
             add r0, r0, r1, ic1
+            loop_back_edge @1, ic2
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_for_loop_runs_its_head_once_and_its_update_at_the_bottom() {
+        // The head is the first `load_int r1, 0` and it is outside the loop, since the back edge at
+        // the end goes to @2 and not to @1. The update is the `add r1, r1, r2` just above the back
+        // edge, which is where the language puts it and not where the source does.
+        assert_code(
+            &code(&lowered(
+                "let s = 0; for (let i = 0; i < 5; i = i + 1) { s = s + i; }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 0
+            load_int r2, 5
+            less r2, r1, r2, ic0
+            jump_if_false r2, @9
+            add r0, r0, r1, ic1
+            load_int r2, 1
+            add r1, r1, r2, ic2
+            loop_back_edge @2, ic3
+            load_undefined r2
+            return r2
+            ",
+        );
+    }
+
+    #[test]
+    fn a_for_loop_with_no_test_has_no_comparison_at_all() {
+        // An absent test is not a test against `true`. There is no comparison and no forward jump
+        // in this listing, so `for (;;)` is a tighter loop than `while (true)` written out, and it
+        // needs no implicit return either because nothing can reach past the back edge.
+        assert_code(
+            &code(&lowered("let s = 0; for (;;) { s = s + 1; }")),
+            "
+            load_int r0, 0
+            load_int r1, 1
+            add r0, r0, r1, ic0
+            loop_back_edge @1, ic1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_continue_in_a_for_loop_lands_on_the_update_and_a_break_lands_past_it() {
+        // The two go to different places and both of them matter. The `continue` at @5 goes to @6,
+        // the update, because skipping it would leave the loop variable where it was and the loop
+        // would never end. The `break` goes to @9, past the back edge.
+        assert_code(
+            &code(&lowered(
+                "let s = 0; for (let i = 0; i < 5; i = i + 1) { continue; }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 0
+            load_int r2, 5
+            less r2, r1, r2, ic0
+            jump_if_false r2, @9
+            jump @6
+            load_int r2, 1
+            add r1, r1, r2, ic1
+            loop_back_edge @2, ic2
+            load_undefined r2
+            return r2
+            ",
+        );
+        assert_code(
+            &code(&lowered(
+                "let s = 0; for (let i = 0; i < 5; i = i + 1) { break; }",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 0
+            load_int r2, 5
+            less r2, r1, r2, ic0
+            jump_if_false r2, @9
+            jump @9
+            load_int r2, 1
+            add r1, r1, r2, ic1
+            loop_back_edge @2, ic2
+            load_undefined r2
+            return r2
+            ",
+        );
+    }
+
+    #[test]
+    fn a_do_while_asks_nothing_before_the_first_iteration() {
+        // The body is at the top with no comparison above it, which is the whole point of the form.
+        // The test is at @3 and the back edge below it goes to @1, the first instruction of the
+        // body, so the condition is asked once per iteration and never before the first.
+        assert_code(
+            &code(&lowered("let s = 0; do { s = s + 1; } while (s < 5);")),
+            "
+            load_int r0, 0
+            load_int r1, 1
+            add r0, r0, r1, ic0
+            load_int r1, 5
+            less r1, r0, r1, ic1
+            jump_if_false r1, @7
+            loop_back_edge @1, ic2
+            load_undefined r1
+            return r1
+            ",
+        );
+    }
+
+    #[test]
+    fn a_continue_in_a_do_while_goes_to_the_test_and_not_past_it() {
+        // The `continue` at @3 goes to @4, which is the first instruction of the condition rather
+        // than the back edge below it. Landing on the back edge would make `do { continue; } while
+        // (false)` an endless loop, which is the one way this can be wrong and still look right.
+        assert_code(
+            &code(&lowered(
+                "let s = 0; do { s = s + 1; continue; } while (s < 5);",
+            )),
+            "
+            load_int r0, 0
+            load_int r1, 1
+            add r0, r0, r1, ic0
+            jump @4
+            load_int r1, 5
+            less r1, r0, r1, ic1
+            jump_if_false r1, @8
             loop_back_edge @1, ic2
             load_undefined r1
             return r1

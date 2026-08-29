@@ -377,6 +377,26 @@ pub struct Binding {
     pub init: Option<Expr>,
 }
 
+/// The first of the three parts of a `for`, which runs once before anything else.
+///
+/// A type of its own rather than a `Stmt`, for the reason assignment targets are a type of their
+/// own: the grammar allows a declaration or an expression here and nothing else, so saying that in
+/// the type means every pass gets the guarantee instead of re-checking for it. The two arms are
+/// genuinely different and not two spellings of one thing, since a `let` or a `const` here opens a
+/// scope that the test, the update and the body are all inside and that nothing outside can see.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForInit {
+    /// `for (var i = 0; ...)`, `for (let i = 0; ...)` or `for (const x = 1; ...)`.
+    Declare {
+        /// Which of the three keywords it was.
+        kind: DeclKind,
+        /// The names bound, in source order, since `for (let i = 0, n = 10; ...)` is one head.
+        bindings: Vec<Binding>,
+    },
+    /// `for (i = 0; ...)`, or any other expression evaluated for its effect.
+    Expr(Expr),
+}
+
 /// A function, however it was written.
 ///
 /// Function declarations and function expressions share this type because the difference between
@@ -497,6 +517,33 @@ pub enum StmtKind {
     While {
         /// The condition, tested before every iteration including the first.
         test: Expr,
+        /// The body.
+        body: Box<Stmt>,
+    },
+    /// `do while`, which is a `while` that runs its body before it asks anything.
+    ///
+    /// The test is at the bottom in the source and it is at the bottom in the bytecode too, so the
+    /// only thing that separates this from a `while` is where a `continue` lands. A `continue` here
+    /// goes to the test rather than past it, because the loop still stops when the condition is
+    /// false however the iteration ended.
+    DoWhile {
+        /// The body, which always runs at least once.
+        body: Box<Stmt>,
+        /// The condition, tested after every iteration.
+        test: Expr,
+    },
+    /// `for`, the three part one, with every part optional.
+    ///
+    /// `for (;;)` is a legal endless loop and so is every combination in between, which is why all
+    /// three are options rather than one shape with holes filled in by defaults. An absent test is
+    /// not a test against `true`, it is no test at all and no instruction.
+    For {
+        /// The head, run once before the first test.
+        init: Option<ForInit>,
+        /// The condition, tested before every iteration including the first.
+        test: Option<Expr>,
+        /// The expression run after every iteration, which is also where a `continue` lands.
+        update: Option<Expr>,
         /// The body.
         body: Box<Stmt>,
     },

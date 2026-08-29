@@ -327,17 +327,30 @@ impl Builder<'_> {
     /// The counter is not added to the live set, because it is left holding the bound in every run
     /// and printing it says nothing that the bound in the source does not already say.
     ///
-    /// The increment is the first statement of the body rather than the last, and that is what makes
-    /// a generated `continue` safe. With the increment at the bottom, a `continue` skips it and the
-    /// loop never ends, so the generator would be back to being killed by timeouts.
+    /// In a `while` and a `do while` the increment is the first statement of the body rather than the
+    /// last, and that is what makes a generated `continue` safe. With the increment at the bottom, a
+    /// `continue` skips it and the loop never ends, so the generator would be back to being killed by
+    /// timeouts. A `for` is the one form that can keep its counter in the head, because its update
+    /// runs on the way round even when a `continue` skipped the rest of the body.
+    ///
+    /// All three forms are drawn, because they are three different lowerings of the same idea and an
+    /// engine can get the shape of one right and the shape of another wrong. A `do while` runs its
+    /// body before it asks anything, so it goes round once more than the other two for the same
+    /// bound, and a generator that only ever emitted `while` would never notice an engine that put
+    /// the test in the wrong place.
     fn loop_statement(&mut self, depth: usize) -> String {
         let name = format!("i{}", self.next);
         self.next += 1;
         let bound = self.random.below(4) + 1;
+        let form = self.random.below(3);
         self.loops += 1;
         let body = self.block(depth + 1);
         self.loops -= 1;
-        format!("let {name} = 0; while ({name} < {bound}) {{ {name}++; {body} }}")
+        match form {
+            0 => format!("for (let {name} = 0; {name} < {bound}; {name}++) {{ {body} }}"),
+            1 => format!("let {name} = 0; do {{ {name}++; {body} }} while ({name} < {bound});"),
+            _ => format!("let {name} = 0; while ({name} < {bound}) {{ {name}++; {body} }}"),
+        }
     }
 
     /// `switch (<expr>) { case <literal>: ... }`, with a break in some clauses and not in others.
