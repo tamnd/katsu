@@ -108,6 +108,16 @@ const WRITABLE: u8 = 1;
 const ENUMERABLE: u8 = 2;
 /// Bit for a property that can be deleted or redefined.
 const CONFIGURABLE: u8 = 4;
+/// Bit for a property whose slot holds a getter and a setter rather than a value.
+///
+/// It lives here rather than beside the value because this is the question that has to be answered
+/// before the slot is read, and the shape is what an inline cache already compared. A cache that
+/// has matched a shape has in that same comparison established that the slot is a plain value, so
+/// the fast path never tests this bit at run time.
+const ACCESSOR: u8 = 8;
+
+/// Every bit that means something, which is what [`Attributes::from_bits`] keeps.
+const KNOWN: u8 = WRITABLE | ENUMERABLE | CONFIGURABLE | ACCESSOR;
 
 /// What a property is allowed to do: the three flags every own property in the language has.
 ///
@@ -131,6 +141,7 @@ impl std::fmt::Debug for Attributes {
             (self.is_writable(), 'w'),
             (self.is_enumerable(), 'e'),
             (self.is_configurable(), 'c'),
+            (self.is_accessor(), 'a'),
         ]
         .into_iter()
         .filter_map(|(set, letter)| set.then_some(letter))
@@ -190,10 +201,34 @@ impl Attributes {
         self.0
     }
 
-    /// Attributes back out of bits, ignoring anything above the three that mean something.
+    /// Attributes back out of bits, ignoring anything above the four that mean something.
     #[must_use]
     pub const fn from_bits(bits: u8) -> Attributes {
-        Attributes(bits & (WRITABLE | ENUMERABLE | CONFIGURABLE))
+        Attributes(bits & KNOWN)
+    }
+
+    /// An accessor property's flags. There is no writable, because an accessor has no value to
+    /// write and the language does not give it one.
+    ///
+    /// A descriptor with a `get` or a `set` in it has four fields and not five, and asking for both
+    /// `get` and `writable` is a `TypeError` rather than a combination with a meaning. So this takes
+    /// the two flags that exist and sets the bit that says the slot holds a pair.
+    #[must_use]
+    pub const fn accessor(enumerable: bool, configurable: bool) -> Attributes {
+        let mut bits = ACCESSOR;
+        if enumerable {
+            bits |= ENUMERABLE;
+        }
+        if configurable {
+            bits |= CONFIGURABLE;
+        }
+        Attributes(bits)
+    }
+
+    /// Whether this property's slot holds a getter and a setter rather than a value.
+    #[must_use]
+    pub const fn is_accessor(self) -> bool {
+        self.0 & ACCESSOR != 0
     }
 }
 
@@ -802,9 +837,35 @@ mod tests {
         assert_eq!(Attributes::NONE, Attributes::new(false, false, false));
         assert_eq!(Attributes::DEFAULT, Attributes::new(true, true, true));
         assert_eq!(Attributes::BUILTIN, Attributes::new(true, false, true));
-        assert_eq!(Attributes::from_bits(0xff), Attributes::DEFAULT);
+        // Everything above the four bits that mean something is dropped, which is what makes it
+        // safe to read this field back out of a word that was widened for alignment.
+        assert_eq!(Attributes::from_bits(0xf0 | 0b0111), Attributes::DEFAULT);
+        let accessor = Attributes::accessor(true, true);
+        assert_eq!(Attributes::from_bits(accessor.bits()), accessor);
         assert_eq!(format!("{:?}", Attributes::BUILTIN), "attributes(wc)");
         assert_eq!(format!("{:?}", Attributes::NONE), "attributes()");
+    }
+
+    #[test]
+    fn an_accessor_has_no_writable_because_the_language_does_not_give_it_one() {
+        // A descriptor with a get in it has four fields and not five, and asking for get and
+        // writable together is a TypeError rather than a combination with a meaning.
+        let both = Attributes::accessor(true, true);
+        assert!(both.is_accessor());
+        assert!(both.is_enumerable());
+        assert!(both.is_configurable());
+        assert!(!both.is_writable());
+        assert_eq!(format!("{both:?}"), "attributes(eca)");
+
+        let hidden = Attributes::accessor(false, false);
+        assert!(hidden.is_accessor());
+        assert_eq!(format!("{hidden:?}"), "attributes(a)");
+
+        // A data property is never mistaken for one, which is the check every read does before it
+        // decides whether the slot holds a value or a pair.
+        assert!(!Attributes::DEFAULT.is_accessor());
+        assert!(!Attributes::NONE.is_accessor());
+        assert!(!Attributes::BUILTIN.is_accessor());
     }
 
     #[test]

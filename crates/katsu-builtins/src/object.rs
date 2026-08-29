@@ -342,9 +342,23 @@ fn get_prototype_of(
 #[derive(Clone, Copy, Default)]
 struct Descriptor {
     value: Option<Value>,
+    getter: Option<Value>,
+    setter: Option<Value>,
     writable: Option<bool>,
     enumerable: Option<bool>,
     configurable: Option<bool>,
+}
+
+impl Descriptor {
+    /// Whether this descriptor describes an accessor.
+    ///
+    /// Mentioning either half is enough, and mentioning it as `undefined` still counts.
+    /// `{get: undefined}` makes an accessor with no getter rather than a data property, which is
+    /// what stops `Object.defineProperty(o, 'x', {get: undefined})` from quietly making `o.x` a
+    /// property holding `undefined`.
+    fn is_accessor(self) -> bool {
+        self.getter.is_some() || self.setter.is_some()
+    }
 }
 
 /// `Object.defineProperty(target, key, descriptor)`.
@@ -396,7 +410,13 @@ fn define_properties(
     }
     let entries = interpreter.own_properties(source).unwrap_or_default();
     let mut read = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
+    for (key, value, attributes) in entries {
+        // A descriptors object that keeps its descriptors behind getters, which is legal and rare.
+        // Reading one means calling it, so this refuses by name rather than handing `read_descriptor`
+        // a pair of functions and letting it report that the descriptor is not an object.
+        if attributes.is_accessor() {
+            return Err(Interpreter::native_met_an_accessor(&key));
+        }
         read.push((key, read_descriptor(interpreter, value)?));
     }
     for (key, descriptor) in read {
@@ -427,9 +447,22 @@ fn describe(
     let Some((value, attributes)) = interpreter.own_descriptor(value, &key) else {
         return Ok(Value::UNDEFINED);
     };
-    let writable = Value::from_bool(attributes.is_writable());
     let enumerable = Value::from_bool(attributes.is_enumerable());
     let configurable = Value::from_bool(attributes.is_configurable());
+    // An accessor descriptor has four fields and not five, and the two it does not share with a data
+    // descriptor come first for the same reason `value` does. Reporting a getter is not calling it,
+    // so this is a question a builtin can answer about an accessor even though reading the property
+    // is not.
+    if attributes.is_accessor() {
+        let (getter, setter) = interpreter.accessor_halves(value);
+        return interpreter.host_object(&[
+            ("get", getter.unwrap_or(Value::UNDEFINED)),
+            ("set", setter.unwrap_or(Value::UNDEFINED)),
+            ("enumerable", enumerable),
+            ("configurable", configurable),
+        ]);
+    }
+    let writable = Value::from_bool(attributes.is_writable());
     // In this order, because it is the order Node prints and the order `JSON.stringify` writes, and
     // a descriptor is a thing people read rather than a thing programs mostly index into.
     interpreter.host_object(&[
@@ -476,40 +509,66 @@ fn read_descriptor(
             "Property description must be an object: {what}"
         )));
     }
-    let getter = interpreter.lookup(value, "get");
-    let setter = interpreter.lookup(value, "set");
-    let held = interpreter.lookup(value, "value");
-    let writable = interpreter.lookup(value, "writable");
-    let enumerable = interpreter.lookup(value, "enumerable");
-    let configurable = interpreter.lookup(value, "configurable");
+    let getter = interpreter.lookup(value, "get")?;
+    let setter = interpreter.lookup(value, "set")?;
+    let held = interpreter.lookup(value, "value")?;
+    let writable = interpreter.lookup(value, "writable")?;
+    let enumerable = interpreter.lookup(value, "enumerable")?;
+    let configurable = interpreter.lookup(value, "configurable")?;
     // A flag is whatever it is, converted. `{enumerable: 'yes'}` makes an enumerable property and
     // `{writable: 0}` makes a read only one, because the specification says `ToBoolean` and not
     // "must be a boolean".
     let descriptor = Descriptor {
         value: held,
+        getter,
+        setter,
         writable: writable.map(|flag| interpreter.is_truthy(flag)),
         enumerable: enumerable.map(|flag| interpreter.is_truthy(flag)),
         configurable: configurable.map(|flag| interpreter.is_truthy(flag)),
     };
-    // The contradiction is checked before the refusal, because it is an answer this build can give
-    // correctly and a program that asks for both is wrong however far along the runtime is.
-    if (getter.is_some() || setter.is_some())
-        && (descriptor.value.is_some() || descriptor.writable.is_some())
-    {
+    if descriptor.is_accessor() && (descriptor.value.is_some() || descriptor.writable.is_some()) {
         return Err(RuntimeError::Type(
             "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, #<Object>".to_owned(),
         ));
     }
-    if getter.is_some() || setter.is_some() {
-        return Err(RuntimeError::Unsupported(
-            "Object.defineProperty does not support accessors yet, because a property slot holds a value rather than a pair of functions".to_owned(),
-        ));
-    }
+    // A half that is present has to be callable or `undefined`, and the two halves are checked in
+    // the order they are written above because a descriptor with both wrong reports the getter.
+    callable_or_absent(interpreter, descriptor.getter, "Getter")?;
+    callable_or_absent(interpreter, descriptor.setter, "Setter")?;
     Ok(descriptor)
 }
 
-/// The specification's `ValidateAndApplyPropertyDescriptor`, for data properties on an object that
-/// is always extensible.
+/// Reject a `get` or a `set` that is neither a function nor `undefined`.
+///
+/// `undefined` is allowed and means the half is absent, which is not the same as the field being
+/// left out: `{get: undefined}` is still an accessor descriptor. `null` is not allowed, which looks
+/// arbitrary and is what the specification says and what Node does.
+fn callable_or_absent(
+    interpreter: &Interpreter,
+    half: Option<Value>,
+    which: &str,
+) -> Result<(), RuntimeError> {
+    let Some(half) = half else { return Ok(()) };
+    if half.is_undefined() || interpreter.is_callable(half) {
+        return Ok(());
+    }
+    let what = interpreter.display(half);
+    Err(RuntimeError::Type(format!(
+        "{which} must be a function: {what}"
+    )))
+}
+
+/// A half of an accessor descriptor as something to store, where `undefined` means absent.
+///
+/// The descriptor keeps `Some(undefined)` and `None` apart because whether the field was written
+/// decides whether the descriptor is an accessor at all. Once that question is settled, a half
+/// written as `undefined` and a half left out mean the same thing to the pair, which is that there
+/// is no function on that side.
+fn half(value: Option<Value>) -> Option<Value> {
+    value.filter(|value| !value.is_undefined())
+}
+
+/// The specification's `ValidateAndApplyPropertyDescriptor`, on an object that is always extensible.
 ///
 /// A name that is not there yet is created, and every flag the descriptor does not mention is false
 /// rather than true. That asymmetry against plain assignment catches people out and it is the rule:
@@ -517,11 +576,15 @@ fn read_descriptor(
 /// makes one that can do nothing.
 ///
 /// A name that is there and is configurable can be redefined into anything, because configurable
-/// means exactly that. A name that is there and is not configurable is nearly frozen: it cannot
-/// become configurable again, its enumerability cannot change, and if it is not writable then it
-/// cannot become writable and its value cannot change to a different value. Writing the same value
-/// back is allowed, which is why this needs `SameValue` and not `===`, and why a non writable `NaN`
-/// can be redefined to `NaN` while a positive zero cannot be redefined to a negative one.
+/// means exactly that, and that includes turning a data property into an accessor or back. A name
+/// that is there and is not configurable is nearly frozen: it cannot become configurable again, its
+/// enumerability cannot change, it cannot change which kind of property it is, and beyond that the
+/// two kinds are frozen differently. A non writable data property cannot become writable and its
+/// value cannot change to a different value, where writing the same value back is allowed, which is
+/// why this needs `SameValue` and not `===` and why a non writable `NaN` can be redefined to `NaN`
+/// while a positive zero cannot be redefined to a negative one. A non configurable accessor cannot
+/// have either half changed at all, because there is no writable flag standing between them and a
+/// caller.
 fn apply(
     interpreter: &mut Interpreter,
     target: Value,
@@ -529,6 +592,15 @@ fn apply(
     descriptor: Descriptor,
 ) -> Result<(), RuntimeError> {
     let Some((current, attributes)) = interpreter.own_descriptor(target, key) else {
+        if descriptor.is_accessor() {
+            let pair =
+                interpreter.accessor_pair(half(descriptor.getter), half(descriptor.setter))?;
+            let attributes = Attributes::accessor(
+                descriptor.enumerable.unwrap_or(false),
+                descriptor.configurable.unwrap_or(false),
+            );
+            return interpreter.define_property(target, key, pair, attributes);
+        }
         let value = descriptor.value.unwrap_or(Value::UNDEFINED);
         let attributes = Attributes::new(
             descriptor.writable.unwrap_or(false),
@@ -542,7 +614,10 @@ fn apply(
             || descriptor
                 .enumerable
                 .is_some_and(|wanted| wanted != attributes.is_enumerable())
-            || (!attributes.is_writable()
+            || changes_kind(descriptor, attributes)
+            || frozen_accessor_moves(interpreter, descriptor, current, attributes)
+            || (!attributes.is_accessor()
+                && !attributes.is_writable()
                 && (descriptor.writable == Some(true)
                     || descriptor
                         .value
@@ -553,6 +628,9 @@ fn apply(
             )));
         }
     }
+    if descriptor.is_accessor() || (attributes.is_accessor() && descriptor.value.is_none()) {
+        return redefine_accessor(interpreter, target, key, descriptor, current, attributes);
+    }
     let value = descriptor.value.unwrap_or(current);
     let attributes = Attributes::new(
         descriptor.writable.unwrap_or(attributes.is_writable()),
@@ -562,6 +640,81 @@ fn apply(
             .unwrap_or(attributes.is_configurable()),
     );
     interpreter.define_property(target, key, value, attributes)
+}
+
+/// Whether this descriptor would turn a data property into an accessor or the other way round.
+///
+/// A descriptor that mentions neither kind is not asking for either, which is what makes
+/// `Object.defineProperty(o, 'x', {enumerable: false})` legal against an accessor. Mentioning
+/// `writable` counts as asking for a data property even with no `value`, because a data property is
+/// the only kind that has one.
+fn changes_kind(descriptor: Descriptor, attributes: Attributes) -> bool {
+    let wants_data = descriptor.value.is_some() || descriptor.writable.is_some();
+    (descriptor.is_accessor() && !attributes.is_accessor())
+        || (wants_data && attributes.is_accessor())
+}
+
+/// Whether this descriptor would move either half of a non configurable accessor.
+///
+/// An accessor has no writable flag, so a non configurable one is frozen outright and redefining
+/// either half is refused. Writing the same function back is allowed, the way writing the same value
+/// back to a non writable data property is, which is the same `SameValue` rule reaching the same
+/// place from the other kind of property.
+fn frozen_accessor_moves(
+    interpreter: &Interpreter,
+    descriptor: Descriptor,
+    current: Value,
+    attributes: Attributes,
+) -> bool {
+    if !attributes.is_accessor() || !descriptor.is_accessor() {
+        return false;
+    }
+    let (getter, setter) = interpreter.accessor_halves(current);
+    let moved = |wanted: Option<Value>, have: Option<Value>| {
+        wanted
+            .is_some_and(|wanted| !interpreter.same_value(wanted, have.unwrap_or(Value::UNDEFINED)))
+    };
+    moved(descriptor.getter, getter) || moved(descriptor.setter, setter)
+}
+
+/// Store an accessor, keeping whatever halves and flags the descriptor did not mention.
+///
+/// Keeping the halves is what lets a getter and a setter be defined in two separate calls, which was
+/// measured against node rather than reasoned about: the second call mentions only `set` and the
+/// getter from the first call is still there afterwards. A property that was a data property has no
+/// halves to keep, and its value is dropped rather than carried, because it has just stopped being
+/// the kind of property that has one.
+fn redefine_accessor(
+    interpreter: &mut Interpreter,
+    target: Value,
+    key: &str,
+    descriptor: Descriptor,
+    current: Value,
+    attributes: Attributes,
+) -> Result<(), RuntimeError> {
+    let (getter, setter) = if attributes.is_accessor() {
+        interpreter.accessor_halves(current)
+    } else {
+        (None, None)
+    };
+    let getter = if descriptor.getter.is_some() {
+        half(descriptor.getter)
+    } else {
+        getter
+    };
+    let setter = if descriptor.setter.is_some() {
+        half(descriptor.setter)
+    } else {
+        setter
+    };
+    let pair = interpreter.accessor_pair(getter, setter)?;
+    let attributes = Attributes::accessor(
+        descriptor.enumerable.unwrap_or(attributes.is_enumerable()),
+        descriptor
+            .configurable
+            .unwrap_or(attributes.is_configurable()),
+    );
+    interpreter.define_property(target, key, pair, attributes)
 }
 
 #[cfg(test)]
@@ -1102,11 +1255,134 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_with_an_accessor_alone_refuses_by_name() {
-        let error = printed("Object.defineProperty({}, 'x', {get: function () {}});")
-            .expect_err("should throw");
+    fn a_getter_is_defined_and_called_by_reading_the_property() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 41 + 1; }}); console.log(o.x);"
+            ),
+            "42"
+        );
+    }
+
+    #[test]
+    fn a_setter_is_defined_and_called_by_writing_the_property() {
+        // The value written reaches the setter and the setter's `this` is the object, which is the
+        // whole reason a setter is worth having over a plain property.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {set: function (v) { this.seen = v * 2; }}); o.x = 21; console.log(o.seen);"
+            ),
+            "42"
+        );
+    }
+
+    #[test]
+    fn an_accessor_prints_as_what_it_is_rather_than_as_what_it_would_say() {
+        // Node's exact output, measured. Printing an object does not run the program's code.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'g', {get: function () { return 1; }, enumerable: true}); Object.defineProperty(o, 's', {set: function (v) {}, enumerable: true}); Object.defineProperty(o, 'b', {get: function () { return 1; }, set: function (v) {}, enumerable: true}); console.log(o);"
+            ),
+            "{ g: [Getter], s: [Setter], b: [Getter/Setter] }"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_reports_the_two_halves_instead_of_a_value() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 1; }, enumerable: true, configurable: true}); var d = Object.getOwnPropertyDescriptor(o, 'x'); console.log(typeof d.get, typeof d.set, d.enumerable, d.configurable);"
+            ),
+            "function undefined true true"
+        );
+    }
+
+    #[test]
+    fn a_half_the_descriptor_does_not_mention_is_kept() {
+        // Two calls, one naming the getter and one naming the setter, leave a property with both.
+        // Measured against node rather than reasoned about.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 1; }, configurable: true, enumerable: true}); Object.defineProperty(o, 'x', {set: function (v) {}}); var d = Object.getOwnPropertyDescriptor(o, 'x'); console.log(typeof d.get, typeof d.set, d.enumerable, d.configurable);"
+            ),
+            "function function true true"
+        );
+    }
+
+    #[test]
+    fn a_getter_with_no_setter_is_silent_in_sloppy_mode_and_throws_in_strict_mode() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 7; }}); o.x = 9; console.log(o.x);"
+            ),
+            "7"
+        );
+        assert_eq!(
+            logged(
+                "'use strict'; var o = {}; Object.defineProperty(o, 'x', {get: function () { return 7; }}); try { o.x = 9; } catch (e) { console.log(e.message); }"
+            ),
+            "Cannot set property x of #<Object> which has only a getter"
+        );
+    }
+
+    #[test]
+    fn a_setter_on_a_prototype_receives_the_writes_of_everything_below_it() {
+        // The mechanism that makes one accessor on a prototype answer for every instance. The write
+        // goes to the setter rather than adding an own property, and `this` inside it is the object
+        // that was written to and not the prototype the setter was found on.
+        assert_eq!(
+            logged(
+                "var proto = {}; Object.defineProperty(proto, 'p', {set: function (v) { this.stored = v; }, get: function () { return this.stored; }}); var child = Object.create(proto); child.p = 42; console.log(child.p, child);"
+            ),
+            "42 { stored: 42 }"
+        );
+    }
+
+    #[test]
+    fn a_half_that_is_not_a_function_is_refused_by_the_half_it_is() {
+        let error = printed("Object.defineProperty({}, 'x', {get: 5});").expect_err("should throw");
         assert!(
-            error.contains("does not support accessors yet"),
+            error.contains("Getter must be a function: 5"),
+            "unexpected error: {error}"
+        );
+        let error =
+            printed("Object.defineProperty({}, 'x', {set: 'no'});").expect_err("should throw");
+        assert!(
+            error.contains("Setter must be a function: no"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_non_configurable_accessor_cannot_have_either_half_moved() {
+        let error = printed(
+            "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 1; }}); Object.defineProperty(o, 'x', {get: function () { return 2; }});",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("Cannot redefine property: x"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_configurable_accessor_can_become_a_data_property_and_back() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 1; }, configurable: true}); Object.defineProperty(o, 'x', {value: 9}); var d = Object.getOwnPropertyDescriptor(o, 'x'); console.log(d.value, d.writable, d.enumerable, d.configurable);"
+            ),
+            "9 false false true"
+        );
+    }
+
+    #[test]
+    fn stringifying_an_accessor_refuses_by_name_because_it_would_have_to_call_it() {
+        let error = printed(
+            "var o = {}; Object.defineProperty(o, 'x', {get: function () { return 1; }, enumerable: true}); JSON.stringify(o);",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("means calling a getter"),
             "unexpected error: {error}"
         );
     }

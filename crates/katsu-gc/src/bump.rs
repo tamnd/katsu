@@ -54,6 +54,11 @@ pub enum ObjectKind {
     Shape,
     /// A property array that overflowed the inline slots.
     Properties,
+    /// A getter and a setter, in the slot where an ordinary property keeps its value.
+    ///
+    /// Its own line because a number that moves here means a program defined an accessor, which is
+    /// a thing worth being able to see separately from the objects that carry them.
+    AccessorPair,
     /// Anything the runtime has not categorised yet.
     ///
     /// This exists so that the census adds up. A category that quietly drops allocations is
@@ -63,7 +68,7 @@ pub enum ObjectKind {
 
 impl ObjectKind {
     /// Every category, in the order the census prints them.
-    pub const ALL: [ObjectKind; 9] = [
+    pub const ALL: [ObjectKind; 10] = [
         ObjectKind::Object,
         ObjectKind::Elements,
         ObjectKind::String,
@@ -72,6 +77,7 @@ impl ObjectKind {
         ObjectKind::Context,
         ObjectKind::Shape,
         ObjectKind::Properties,
+        ObjectKind::AccessorPair,
         ObjectKind::Other,
     ];
 
@@ -87,6 +93,7 @@ impl ObjectKind {
             ObjectKind::Context => "contexts",
             ObjectKind::Shape => "shapes",
             ObjectKind::Properties => "properties",
+            ObjectKind::AccessorPair => "accessor pairs",
             ObjectKind::Other => "other",
         }
     }
@@ -101,7 +108,8 @@ impl ObjectKind {
             ObjectKind::Context => 5,
             ObjectKind::Shape => 6,
             ObjectKind::Properties => 7,
-            ObjectKind::Other => 8,
+            ObjectKind::AccessorPair => 8,
+            ObjectKind::Other => 9,
         }
     }
 }
@@ -128,7 +136,7 @@ pub struct KindTotals {
 /// these ones learning to decrease.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Census {
-    totals: [KindTotals; 9],
+    totals: [KindTotals; 10],
     /// Bytes handed out in total, after alignment padding.
     pub allocated_bytes: u64,
     /// Allocations in total.

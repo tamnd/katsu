@@ -51,14 +51,13 @@
 //!
 //! # What is not here
 //!
-//! No accessors, so a property is always a value rather than a pair of functions. What that is
-//! waiting on is a place to put the second function rather than anything about receivers, which
-//! exist now: a getter needs the slot to hold a pair, and a shape node needs a flag saying that the
-//! slot holds one. No delete, which is the one operation a
-//! transition tree genuinely does not want and which needs the dictionary mode that every engine
-//! falls back to. No indexed properties. No setters, for the same reason there are no getters, which
-//! is why a write always makes an own property and never goes up the chain. Each of those is its own
-//! piece of work and each of them is in M1.
+//! Accessors do not change the layout below, which is the point of how they were added. A property
+//! is still one slot, and an accessor's slot holds one boxed pair of functions rather than two slots
+//! holding one function each, so nothing that steps through properties has to ask how wide one is.
+//! The flag that says the slot means a pair is in the shape with the other three, and the pair
+//! itself is in `function.rs`. No delete, which is the one operation a transition tree genuinely does
+//! not want and which needs the dictionary mode that every engine falls back to. No indexed
+//! properties. Each of those is its own piece of work and each of them is in M1.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
@@ -292,15 +291,20 @@ impl ObjectRef {
     /// hidden property still occupies a slot. Counting the visible ones and using that as an index
     /// would read the wrong value for every property after the first hidden one, which is the sort of
     /// bug that stays invisible until a builtin is installed next to a real property.
+    /// The flags come back too, because the caller cannot read the slot without them. An accessor's
+    /// slot holds a pair of functions rather than a value, and both callers of this need to know
+    /// which they are looking at before they touch it.
     #[must_use]
-    pub fn enumerable(self, cage: &Cage) -> Vec<(StringRef, u32)> {
+    pub fn enumerable(self, cage: &Cage) -> Vec<(StringRef, u32, Attributes)> {
         self.shape(cage)
             .entries(cage)
             .into_iter()
             .enumerate()
             .filter_map(|(index, (name, attributes))| {
                 let index = u32::try_from(index).ok()?;
-                attributes.is_enumerable().then_some((name, index))
+                attributes
+                    .is_enumerable()
+                    .then_some((name, index, attributes))
             })
             .collect()
     }
@@ -730,7 +734,7 @@ mod tests {
             object
                 .enumerable(heap.cage())
                 .into_iter()
-                .map(|(name, _)| name.to_utf8_lossy(heap.cage()).into_owned())
+                .map(|(name, _, _)| name.to_utf8_lossy(heap.cage()).into_owned())
                 .collect::<Vec<String>>(),
             ["shown"],
             "a non enumerable property is on the object and not in the walk of it"

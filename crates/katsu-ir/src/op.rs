@@ -37,8 +37,33 @@ use crate::constant::ConstIndex;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Register(pub u16);
 
+impl Register {
+    /// Where a return value goes when nothing wants it.
+    ///
+    /// Every call written in a program has a destination operand, because an expression has a value
+    /// and lowering allocated somewhere to put it. A setter does not. It is called for what it does
+    /// rather than for what it answers, and the call is synthesised by the interpreter when a store
+    /// lands on an accessor, so there is no operand to point at and nothing in the caller's frame
+    /// that is free to be clobbered: the register holding the value being assigned is the value of
+    /// the assignment expression and is still live.
+    ///
+    /// A sentinel rather than an option on the frame, and that is a measurement rather than a
+    /// preference. The frame header is thirty two bytes and an `Option<Register>` would push it to
+    /// forty, which is the same eight bytes the receiver field measured at fourteen percent on
+    /// `call/call_return`. This costs one comparison on the return path instead, which predicts
+    /// perfectly because it is false for every call a program makes.
+    ///
+    /// No blueprint can produce it. A frame has at most `u16::MAX` slots, so the last valid register
+    /// in the largest possible frame is `u16::MAX - 1`, and the verifier rejects anything above the
+    /// frame size before the interpreter ever sees it.
+    pub const NOWHERE: Register = Register(u16::MAX);
+}
+
 impl fmt::Debug for Register {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Register::NOWHERE {
+            return write!(f, "rnone");
+        }
         write!(f, "r{}", self.0)
     }
 }
@@ -817,6 +842,16 @@ mod tests {
     fn registers_print_the_way_a_disassembly_should_read() {
         assert_eq!(format!("{:?}", Register(7)), "r7");
         assert_eq!(Register(7).to_string(), "r7");
+    }
+
+    #[test]
+    fn the_register_that_is_nowhere_prints_as_itself_and_cannot_be_a_real_one() {
+        assert_eq!(format!("{:?}", Register::NOWHERE), "rnone");
+        // The reason a sentinel is safe. A frame has at most `u16::MAX` slots, so the highest
+        // register any blueprint can name is one below this, and the verifier rejects anything at or
+        // above the frame size before the interpreter sees it.
+        assert_eq!(Register::NOWHERE.0, u16::MAX);
+        assert_ne!(Register::NOWHERE, Register(u16::MAX - 1));
     }
 
     #[test]

@@ -341,9 +341,97 @@ impl ContextRef {
     }
 }
 
+/// Bytes in an accessor pair: the kind tag, the getter and the setter.
+///
+/// Twelve written and sixteen reserved, because everything in the cage is eight byte aligned. There
+/// is nothing worth putting in the spare four bytes yet, and saying so is more useful than leaving
+/// the reader to wonder whether it was overlooked.
+const PAIR_SIZE: usize = 12;
+/// The getter, as raw slot bits, or zero for a property that is write only.
+const GETTER_OFFSET: usize = 4;
+/// The setter, as raw slot bits, or zero for a property that is read only.
+const SETTER_OFFSET: usize = 8;
+
+/// A getter and a setter, living in the slot where an ordinary property keeps its value.
+///
+/// This is here rather than in `shape.rs` because what it holds is two functions, and it is one
+/// object rather than two slots for a reason worth stating. A property is one slot everywhere in
+/// this heap: in the inline area, in the overflow array, and in the index a shape hands back. Making
+/// an accessor take two slots would mean every one of those places had to ask how wide a property is
+/// before it could step to the next one, which is a branch on the path that reads a plain property
+/// and gains nothing. Boxing the pair puts the whole cost on the objects that actually have an
+/// accessor, and leaves the shape carrying the one bit that says the slot means something different.
+/// V8 spells the same object `AccessorPair` for the same reason.
+///
+/// Either half can be missing, and the two missing halves mean different things. No getter is a
+/// property that reads as `undefined`, no setter is a property that a write cannot change, and a
+/// pair with neither is what `Object.defineProperty(o, 'x', {get: undefined})` legally makes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccessorPairRef(Slot);
+
+impl std::fmt::Debug for AccessorPairRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "accessor@{:?}", self.0)
+    }
+}
+
+impl AccessorPairRef {
+    /// Put a getter and a setter in the heap, either of which may be absent.
+    ///
+    /// Returns `None` if the heap is full.
+    #[must_use]
+    pub fn new(heap: &mut BumpHeap, getter: Option<Slot>, setter: Option<Slot>) -> Option<Self> {
+        let pointer = heap.allocate(PAIR_SIZE, ObjectKind::AccessorPair)?;
+        let slot = slot_of(heap.cage(), pointer)?;
+        // SAFETY: the allocation is `PAIR_SIZE` bytes of freshly committed memory that nothing else
+        // holds a reference to, and all three writes are inside it.
+        unsafe {
+            write_kind(pointer, HeapKind::AccessorPair);
+            write_u32(pointer, GETTER_OFFSET, getter.map_or(0, Slot::to_bits));
+            write_u32(pointer, SETTER_OFFSET, setter.map_or(0, Slot::to_bits));
+        }
+        Some(AccessorPairRef(slot))
+    }
+
+    /// The getter, or `None` for a property that reads as `undefined`.
+    #[must_use]
+    pub fn getter(self, cage: &Cage) -> Option<Slot> {
+        // SAFETY: the slot points at a pair, which is `PAIR_SIZE` bytes long.
+        let bits = unsafe { read_u32(cage, self.offset(), GETTER_OFFSET) };
+        (bits != 0).then(|| Slot::from_bits(bits))
+    }
+
+    /// The setter, or `None` for a property a write cannot change.
+    #[must_use]
+    pub fn setter(self, cage: &Cage) -> Option<Slot> {
+        // SAFETY: as `getter`.
+        let bits = unsafe { read_u32(cage, self.offset(), SETTER_OFFSET) };
+        (bits != 0).then(|| Slot::from_bits(bits))
+    }
+
+    /// The slot this pair lives at, for writing into a property.
+    #[must_use]
+    pub const fn slot(self) -> Slot {
+        self.0
+    }
+
+    /// Read a pair back out of a slot, or `None` if the slot is not a pointer.
+    ///
+    /// As with [`ClosureRef::from_slot`], the kind is not rechecked, because the caller reached here
+    /// by asking the shape whether the property is an accessor and that answer is not in doubt.
+    #[must_use]
+    pub fn from_slot(slot: Slot) -> Option<Self> {
+        slot.is_pointer().then_some(AccessorPairRef(slot))
+    }
+
+    fn offset(self) -> u32 {
+        self.0.as_offset().unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ClosureRef, ContextRef, HeapKind, NativeRef};
+    use super::{AccessorPairRef, ClosureRef, ContextRef, HeapKind, NativeRef};
     use crate::bump::BumpHeap;
     use crate::string::StringRef;
 
@@ -514,5 +602,50 @@ mod tests {
             16
         );
         assert_eq!(heap.census().totals(ObjectKind::Closure).reserved_bytes, 16);
+    }
+
+    #[test]
+    fn an_accessor_pair_reads_back_both_halves_and_says_which_kind_it_is() {
+        let mut heap = heap();
+        let getter = ClosureRef::new(&mut heap, 0, None, None).expect("should have room");
+        let setter = ClosureRef::new(&mut heap, 1, None, None).expect("should have room");
+        let pair = AccessorPairRef::new(&mut heap, Some(getter.slot()), Some(setter.slot()))
+            .expect("should have room");
+        assert_eq!(pair.getter(heap.cage()), Some(getter.slot()));
+        assert_eq!(pair.setter(heap.cage()), Some(setter.slot()));
+        assert_eq!(
+            HeapKind::of(heap.cage(), pair.slot()),
+            Some(HeapKind::AccessorPair),
+            "a pair has to be tellable from a closure, because both are pointers in a slot"
+        );
+    }
+
+    #[test]
+    fn a_half_of_an_accessor_pair_can_be_missing_and_the_two_halves_are_independent() {
+        // A getter with no setter is a read only accessor and a setter with no getter is a property
+        // that reads as undefined, and they are different properties rather than one with a gap.
+        let mut heap = heap();
+        let function = ClosureRef::new(&mut heap, 0, None, None).expect("should have room");
+        let read_only =
+            AccessorPairRef::new(&mut heap, Some(function.slot()), None).expect("should have room");
+        assert_eq!(read_only.getter(heap.cage()), Some(function.slot()));
+        assert_eq!(read_only.setter(heap.cage()), None);
+
+        let write_only =
+            AccessorPairRef::new(&mut heap, None, Some(function.slot())).expect("should have room");
+        assert_eq!(write_only.getter(heap.cage()), None);
+        assert_eq!(write_only.setter(heap.cage()), Some(function.slot()));
+    }
+
+    #[test]
+    fn an_accessor_pair_asks_for_twelve_bytes_and_is_given_sixteen() {
+        // The four spare bytes are alignment rather than an oversight, which is the same trade the
+        // attribute bits took in the shape.
+        use crate::bump::ObjectKind;
+        let mut heap = heap();
+        AccessorPairRef::new(&mut heap, None, None).expect("should have room");
+        let totals = heap.census().totals(ObjectKind::AccessorPair);
+        assert_eq!(totals.requested_bytes, 12);
+        assert_eq!(totals.reserved_bytes, 16);
     }
 }
