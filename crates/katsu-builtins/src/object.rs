@@ -1,4 +1,4 @@
-//! `Object`, and the two of its statics that a prototype chain can be reached through.
+//! `Object`, and the statics of it that describe and reach a prototype chain.
 //!
 //! Every object a program makes now inherits from `Object.prototype`, and this is where a program
 //! can see that: `Object.getPrototypeOf({})` is that object, `Object.create(p)` makes something that
@@ -6,7 +6,23 @@
 //!
 //! # What is here
 //!
-//! `Object.prototype`, `Object.create` and `Object.getPrototypeOf`.
+//! `Object.prototype`, `Object.create`, `Object.getPrototypeOf`, `Object.defineProperty`,
+//! `Object.defineProperties` and `Object.getOwnPropertyDescriptor`.
+//!
+//! # Defining a property is not assigning to one
+//!
+//! They look alike and almost nothing about them is the same. Assignment asks the prototype chain
+//! whether the write is allowed and a definition does not, assignment cannot change what a property
+//! is allowed to do and a definition can, assignment to a read only property fails where a
+//! definition on a configurable one succeeds, and a definition leaves out any flag it is not given
+//! rather than defaulting it the way a fresh property does. Both eventually put a value in a slot,
+//! which is the only part they have in common.
+//!
+//! The rules for whether a definition is allowed are in [`apply`], written out as the specification
+//! writes them and measured against Node case by case rather than remembered. The short version is
+//! that a configurable property can be redefined however the caller likes, and a non configurable
+//! one can only have its value changed, only if it is writable, and can only ever become less
+//! permissive.
 //!
 //! # `typeof Object` says "object" here and "function" in Node
 //!
@@ -26,12 +42,18 @@
 //!
 //! `new Object()`, which needs `new`.
 //!
-//! Anything on `Object.prototype`. Not an oversight and not laziness: there are no property
-//! attributes yet, so a `toString` installed there would be enumerable, and it would then show up in
-//! `console.log(Object.prototype)`, in `JSON.stringify` and in every `for in` loop over any object in
-//! the program. An empty `Object.prototype` is wrong in one visible way, and a populated one would
-//! be wrong in five. Attributes are the next piece of object model work and the methods arrive with
-//! them.
+//! Accessors, meaning `get` and `set` in a descriptor. A getter is called with the object the
+//! property was read from and `this` is `undefined` everywhere in this build, so there is nothing to
+//! call one with. A descriptor carrying either one refuses by name rather than being read as a data
+//! descriptor and silently defining the wrong thing. The one case that is a real `TypeError` rather
+//! than a gap, a descriptor with both an accessor and a value, still throws what Node throws,
+//! because that answer does not need a receiver to be correct.
+//!
+//! Anything on `Object.prototype`, for the same reason. `toString`, `hasOwnProperty` and
+//! `valueOf` are all methods that read the object they were called on, so they are waiting on
+//! receivers and not on attributes. Attributes were the other half of what they needed and they are
+//! here now: a method installed there would be hidden from `console.log`, from `JSON.stringify` and
+//! from `for in`, which is what [`Attributes::BUILTIN`] means.
 //!
 //! What that costs today is that `({}).toString()` and `o.hasOwnProperty('x')` do not work. The
 //! conversion itself does, because `String({})` asks whether the chain reaches `Object.prototype`
@@ -46,47 +68,64 @@
 //! `Object.keys`, `Object.values`, `Object.entries` and `Object.getOwnPropertyNames`, all of which
 //! answer with an array, and there are no arrays yet.
 //!
-//! `Object.defineProperty` and the descriptor objects, which are the attributes work.
+//! `Object.freeze`, `Object.seal` and the two questions that go with them. Making every existing
+//! property non writable and non configurable is a loop over what is already here, but the other
+//! half of freezing is that the object stops accepting new properties, and there is nowhere to
+//! record that yet. Where extensibility lives is a decision about the object model rather than a few
+//! lines in this file, so the whole group waits for it.
 
-use katsu_vm::{Interpreter, RuntimeError, Value, arg};
+use katsu_vm::{Attributes, Interpreter, RuntimeError, Value, arg};
 
 /// Put `Object` in the global scope.
 ///
 /// # Errors
 ///
-/// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the object, its two functions
-/// or `Object.prototype`, which at startup means the heap is far too small rather than that anything
+/// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the object, its functions or
+/// `Object.prototype`, which at startup means the heap is far too small rather than that anything
 /// went wrong here.
 pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
     let prototype = interpreter.object_prototype()?;
     let create = interpreter.native_function("create", create)?;
     let get_prototype_of = interpreter.native_function("getPrototypeOf", get_prototype_of)?;
-    let object = interpreter.host_object(&[
-        ("prototype", prototype),
-        ("create", create),
-        ("getPrototypeOf", get_prototype_of),
-    ])?;
+    let define_property = interpreter.native_function("defineProperty", define_property)?;
+    let define_properties = interpreter.native_function("defineProperties", define_properties)?;
+    let describe = interpreter.native_function("getOwnPropertyDescriptor", describe)?;
+    // Non enumerable, like every namespace object in the language. `Object.keys(Object)` is empty in
+    // Node and it is empty here, and a `for in` over `Object` walks nothing.
+    let object = interpreter.host_object_with(
+        &[
+            ("create", create),
+            ("getPrototypeOf", get_prototype_of),
+            ("defineProperty", define_property),
+            ("defineProperties", define_properties),
+            ("getOwnPropertyDescriptor", describe),
+        ],
+        Attributes::BUILTIN,
+    )?;
+    // `Object.prototype` is the one property here that is none of the three things. Nothing can
+    // rewrite it, hide it or remove it, because the top of every prototype chain in the realm moving
+    // out from under running code is not something the language is willing to allow.
+    interpreter.define_property(object, "prototype", prototype, Attributes::NONE)?;
     interpreter.define_global("Object", object)
 }
 
-/// `Object.create(prototype)`.
+/// `Object.create(prototype, descriptors)`.
 ///
-/// The second argument is a map of property descriptors, and descriptors are the attributes work
-/// that has not happened, so passing one refuses by name rather than being ignored. Ignoring it
-/// would produce an object missing every property the caller asked for, which is a wrong answer
-/// dressed as a right one.
+/// The second argument is `Object.defineProperties` on the new object, and it is the same code
+/// rather than a second copy of the rules, because the specification defines it that way and two
+/// copies of `ValidateAndApplyPropertyDescriptor` would eventually disagree.
 ///
-/// `undefined` is not the same as absent here. `Object.create()` is a `TypeError` in Node, because
-/// the argument is required to be an object or `null` and `undefined` is neither, so the missing
-/// argument falls into the same message rather than being defaulted.
+/// `undefined` is not the same as absent for the first argument. `Object.create()` is a `TypeError`
+/// in Node, because the argument is required to be an object or `null` and `undefined` is neither,
+/// so the missing argument falls into the same message rather than being defaulted. It is the other
+/// way around for the second, where absent means there is nothing to define.
 fn create(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    let object = interpreter.new_object_with_prototype(arg(args, 0))?;
     let descriptors = arg(args, 1);
-    if !descriptors.is_undefined() {
-        return Err(RuntimeError::Unsupported(
-            "Object.create does not support the property descriptors argument yet".to_owned(),
-        ));
+    if descriptors.is_undefined() {
+        return Ok(object);
     }
-    interpreter.new_object_with_prototype(arg(args, 0))
+    define_properties(interpreter, &[object, descriptors])
 }
 
 /// `Object.getPrototypeOf(value)`.
@@ -116,6 +155,226 @@ fn get_prototype_of(interpreter: &mut Interpreter, args: &[Value]) -> Result<Val
     )))
 }
 
+/// A property descriptor as it was written, with the fields that were left out still left out.
+///
+/// Every field is an option and that is the whole point of the type. `{}` and `{value: undefined}`
+/// are different descriptors, `{writable: false}` against an existing property changes one flag and
+/// leaves two alone, and the same descriptor against a name that does not exist yet creates a
+/// property that is not writable, not enumerable and not configurable. None of that survives reading
+/// a descriptor into four booleans and a value.
+#[derive(Clone, Copy, Default)]
+struct Descriptor {
+    value: Option<Value>,
+    writable: Option<bool>,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+/// `Object.defineProperty(target, key, descriptor)`.
+///
+/// Answers with the target, which is what makes `Object.defineProperty(o, 'x', d).x` work and is the
+/// only reason it returns anything at all.
+fn define_property(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    let target = arg(args, 0);
+    if !interpreter.is_ordinary_object(target) {
+        return Err(RuntimeError::Type(
+            "Object.defineProperty called on non-object".to_owned(),
+        ));
+    }
+    let key = interpreter.to_text(arg(args, 1))?;
+    let descriptor = read_descriptor(interpreter, arg(args, 2))?;
+    apply(interpreter, target, &key, descriptor)?;
+    Ok(target)
+}
+
+/// `Object.defineProperties(target, descriptors)`.
+///
+/// Every descriptor is read before any of them is applied, which is the specification's order and is
+/// observable: `Object.defineProperties({}, {a: {value: 1}, b: 2})` throws over `b` and leaves `a`
+/// undefined rather than half done. That was measured against Node rather than assumed, because a
+/// loop that reads and applies one at a time is the obvious way to write this and it is wrong.
+///
+/// A primitive other than `undefined` and `null` has no own properties to read, so it defines
+/// nothing and does not complain, which is also what Node does.
+fn define_properties(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    let target = arg(args, 0);
+    if !interpreter.is_ordinary_object(target) {
+        return Err(RuntimeError::Type(
+            "Object.defineProperties called on non-object".to_owned(),
+        ));
+    }
+    let source = arg(args, 1);
+    if source.is_undefined() || source.is_null() {
+        return Err(RuntimeError::Type(
+            "Cannot convert undefined or null to object".to_owned(),
+        ));
+    }
+    let entries = interpreter.own_properties(source).unwrap_or_default();
+    let mut read = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        read.push((key, read_descriptor(interpreter, value)?));
+    }
+    for (key, descriptor) in read {
+        apply(interpreter, target, &key, descriptor)?;
+    }
+    Ok(target)
+}
+
+/// `Object.getOwnPropertyDescriptor(object, key)`.
+///
+/// `undefined` for a name the object does not have of its own, including one it inherits, because
+/// this question is about the object and not about its chain.
+fn describe(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+    let value = arg(args, 0);
+    if value.is_undefined() || value.is_null() {
+        return Err(RuntimeError::Type(
+            "Cannot convert undefined or null to object".to_owned(),
+        ));
+    }
+    let key = interpreter.to_text(arg(args, 1))?;
+    if !interpreter.is_ordinary_object(value) {
+        return unwrappable(interpreter, value);
+    }
+    let Some((value, attributes)) = interpreter.own_descriptor(value, &key) else {
+        return Ok(Value::UNDEFINED);
+    };
+    let writable = Value::from_bool(attributes.is_writable());
+    let enumerable = Value::from_bool(attributes.is_enumerable());
+    let configurable = Value::from_bool(attributes.is_configurable());
+    // In this order, because it is the order Node prints and the order `JSON.stringify` writes, and
+    // a descriptor is a thing people read rather than a thing programs mostly index into.
+    interpreter.host_object(&[
+        ("value", value),
+        ("writable", writable),
+        ("enumerable", enumerable),
+        ("configurable", configurable),
+    ])
+}
+
+/// What to say about a primitive or a function that was asked to describe a property of itself.
+///
+/// A number, a boolean or a symbol boxes into a wrapper that never has own properties, so the honest
+/// answer is `undefined` and it happens to be the same answer Node gives. A string is different: its
+/// wrapper carries `length` and one property per character, so answering `undefined` would be a
+/// wrong answer rather than a missing one, and it refuses by name instead. So does a function, which
+/// has `name` and `length` of its own once functions are objects.
+fn unwrappable(interpreter: &Interpreter, value: Value) -> Result<Value, RuntimeError> {
+    if interpreter.is_callable(value) {
+        return Err(RuntimeError::Unsupported(
+            "Object.getOwnPropertyDescriptor is not supported yet for a function, because it needs functions to be objects".to_owned(),
+        ));
+    }
+    if interpreter.as_text(value).is_some() {
+        return Err(RuntimeError::Unsupported(
+            "Object.getOwnPropertyDescriptor is not supported yet for a string, because it needs the wrapper prototypes".to_owned(),
+        ));
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// Read a descriptor object into the fields it actually mentions.
+///
+/// The reads walk the prototype chain, because the specification uses `Get` and not a own property
+/// lookup, so `Object.create({value: 7})` is a descriptor that says `value` is seven. That is not a
+/// hypothetical: it is how a program shares one descriptor between many definitions.
+fn read_descriptor(
+    interpreter: &mut Interpreter,
+    value: Value,
+) -> Result<Descriptor, RuntimeError> {
+    if !interpreter.is_ordinary_object(value) {
+        let what = interpreter.display(value);
+        return Err(RuntimeError::Type(format!(
+            "Property description must be an object: {what}"
+        )));
+    }
+    let getter = interpreter.lookup(value, "get");
+    let setter = interpreter.lookup(value, "set");
+    let held = interpreter.lookup(value, "value");
+    let writable = interpreter.lookup(value, "writable");
+    let enumerable = interpreter.lookup(value, "enumerable");
+    let configurable = interpreter.lookup(value, "configurable");
+    // A flag is whatever it is, converted. `{enumerable: 'yes'}` makes an enumerable property and
+    // `{writable: 0}` makes a read only one, because the specification says `ToBoolean` and not
+    // "must be a boolean".
+    let descriptor = Descriptor {
+        value: held,
+        writable: writable.map(|flag| interpreter.is_truthy(flag)),
+        enumerable: enumerable.map(|flag| interpreter.is_truthy(flag)),
+        configurable: configurable.map(|flag| interpreter.is_truthy(flag)),
+    };
+    // The contradiction is checked before the refusal, because it is an answer this build can give
+    // correctly and a program that asks for both is wrong however far along the runtime is.
+    if (getter.is_some() || setter.is_some())
+        && (descriptor.value.is_some() || descriptor.writable.is_some())
+    {
+        return Err(RuntimeError::Type(
+            "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute, #<Object>".to_owned(),
+        ));
+    }
+    if getter.is_some() || setter.is_some() {
+        return Err(RuntimeError::Unsupported(
+            "Object.defineProperty does not support accessors yet, because a getter needs the receiver it was read from and this is undefined everywhere in this build".to_owned(),
+        ));
+    }
+    Ok(descriptor)
+}
+
+/// The specification's `ValidateAndApplyPropertyDescriptor`, for data properties on an object that
+/// is always extensible.
+///
+/// A name that is not there yet is created, and every flag the descriptor does not mention is false
+/// rather than true. That asymmetry against plain assignment catches people out and it is the rule:
+/// `o.x = 1` makes a property that can do everything and `Object.defineProperty(o, 'x', {value: 1})`
+/// makes one that can do nothing.
+///
+/// A name that is there and is configurable can be redefined into anything, because configurable
+/// means exactly that. A name that is there and is not configurable is nearly frozen: it cannot
+/// become configurable again, its enumerability cannot change, and if it is not writable then it
+/// cannot become writable and its value cannot change to a different value. Writing the same value
+/// back is allowed, which is why this needs `SameValue` and not `===`, and why a non writable `NaN`
+/// can be redefined to `NaN` while a positive zero cannot be redefined to a negative one.
+fn apply(
+    interpreter: &mut Interpreter,
+    target: Value,
+    key: &str,
+    descriptor: Descriptor,
+) -> Result<(), RuntimeError> {
+    let Some((current, attributes)) = interpreter.own_descriptor(target, key) else {
+        let value = descriptor.value.unwrap_or(Value::UNDEFINED);
+        let attributes = Attributes::new(
+            descriptor.writable.unwrap_or(false),
+            descriptor.enumerable.unwrap_or(false),
+            descriptor.configurable.unwrap_or(false),
+        );
+        return interpreter.define_property(target, key, value, attributes);
+    };
+    if !attributes.is_configurable() {
+        let asks_for_more = descriptor.configurable == Some(true)
+            || descriptor
+                .enumerable
+                .is_some_and(|wanted| wanted != attributes.is_enumerable())
+            || (!attributes.is_writable()
+                && (descriptor.writable == Some(true)
+                    || descriptor
+                        .value
+                        .is_some_and(|wanted| !interpreter.same_value(wanted, current))));
+        if asks_for_more {
+            return Err(RuntimeError::Type(format!(
+                "Cannot redefine property: {key}"
+            )));
+        }
+    }
+    let value = descriptor.value.unwrap_or(current);
+    let attributes = Attributes::new(
+        descriptor.writable.unwrap_or(attributes.is_writable()),
+        descriptor.enumerable.unwrap_or(attributes.is_enumerable()),
+        descriptor
+            .configurable
+            .unwrap_or(attributes.is_configurable()),
+    );
+    interpreter.define_property(target, key, value, attributes)
+}
+
 #[cfg(test)]
 mod tests {
     use katsu_vm::{Interpreter, Recorder};
@@ -132,6 +391,7 @@ mod tests {
         crate::globals::install(&mut interpreter).expect("should install");
         super::install(&mut interpreter).expect("should install");
         crate::string::install(&mut interpreter).expect("should install");
+        crate::json::install(&mut interpreter).expect("should install");
         crate::console::install(&mut interpreter).expect("should install");
         let recorder = Recorder::new();
         interpreter.set_output(Box::new(recorder.clone()));
@@ -280,11 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn the_descriptors_argument_refuses_by_name_rather_than_being_ignored() {
-        let error = printed("Object.create(null, {x: {value: 1}});").expect_err("should throw");
-        assert!(
-            error.contains("Object.create does not support the property descriptors argument yet"),
-            "unexpected error: {error}"
+    fn the_descriptors_argument_defines_properties_on_the_object_that_was_made() {
+        assert_eq!(
+            logged(
+                "var o = Object.create(null, {x: {value: 1}}); console.log(o, o.x, Object.getPrototypeOf(o));"
+            ),
+            "[Object: null prototype] {} 1 null"
         );
     }
 
@@ -319,6 +580,298 @@ mod tests {
         assert!(
             error.contains("it needs Function.prototype"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_defined_property_gets_nothing_it_was_not_asked_for() {
+        // The asymmetry against assignment. `o.a = 1` makes a property that can do all three things
+        // and this makes one that can do none of them.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'a', {value: 1}); console.log(Object.getOwnPropertyDescriptor(o, 'a'));"
+            ),
+            "{ value: 1, writable: false, enumerable: false, configurable: false }"
+        );
+    }
+
+    #[test]
+    fn an_assigned_property_gets_all_three() {
+        assert_eq!(
+            logged("var o = {a: 1}; console.log(Object.getOwnPropertyDescriptor(o, 'a'));"),
+            "{ value: 1, writable: true, enumerable: true, configurable: true }"
+        );
+    }
+
+    #[test]
+    fn a_hidden_property_is_still_there_and_is_not_printed_or_serialised() {
+        // The three places enumerability shows, all of which a method on a prototype has to be
+        // invisible to before it can be installed.
+        assert_eq!(
+            logged(
+                "var o = {x: 1}; Object.defineProperty(o, 'x', {enumerable: false}); console.log(o, JSON.stringify(o), o.x);"
+            ),
+            "{} {} 1"
+        );
+    }
+
+    #[test]
+    fn defining_answers_with_the_object_so_it_can_be_used_in_place() {
+        assert_eq!(
+            logged("console.log(Object.defineProperty({}, 'z', {value: 5}).z);"),
+            "5"
+        );
+    }
+
+    #[test]
+    fn a_read_only_property_refuses_a_write_in_strict_mode_and_ignores_one_otherwise() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'a', {value: 1}); o.a = 2; console.log(o.a);"
+            ),
+            "1"
+        );
+        let error = printed(
+            "'use strict'; var o = {}; Object.defineProperty(o, 'a', {value: 1}); o.a = 2;",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("Cannot assign to read only property 'a' of object '#<Object>'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_property_on_a_prototype_stops_a_write_to_everything_below_it() {
+        // The part that is easy to get wrong. The object being written to does not have the
+        // property at all, and the answer still comes from the chain.
+        assert_eq!(
+            logged(
+                "var p = {}; Object.defineProperty(p, 'a', {value: 1}); var o = Object.create(p); o.a = 2; console.log(o.a, Object.getOwnPropertyDescriptor(o, 'a'));"
+            ),
+            "1 undefined"
+        );
+    }
+
+    #[test]
+    fn an_object_with_no_prototype_is_named_differently_in_the_same_refusal() {
+        let error = printed(
+            "'use strict'; var o = Object.create(null); Object.defineProperty(o, 'r', {value: 1}); o.r = 2;",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("Cannot assign to read only property 'r' of object '[object Object]'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_configurable_property_can_be_redefined_into_anything() {
+        assert_eq!(
+            logged(
+                "var o = {a: 1}; Object.defineProperty(o, 'a', {value: 2, writable: false, enumerable: false, configurable: false}); console.log(Object.getOwnPropertyDescriptor(o, 'a'));"
+            ),
+            "{ value: 2, writable: false, enumerable: false, configurable: false }"
+        );
+    }
+
+    #[test]
+    fn a_non_configurable_property_can_only_ever_become_less_permissive() {
+        for source in [
+            "Object.defineProperty(o, 'a', {configurable: true});",
+            "Object.defineProperty(o, 'a', {enumerable: true});",
+            "Object.defineProperty(o, 'a', {writable: true});",
+            "Object.defineProperty(o, 'a', {value: 2});",
+        ] {
+            let program =
+                format!("var o = {{}}; Object.defineProperty(o, 'a', {{value: 1}}); {source}");
+            let error = printed(&program).expect_err("should throw");
+            assert!(
+                error.contains("Cannot redefine property: a"),
+                "unexpected error for {source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redefinition_that_changes_nothing_is_allowed_however_locked_down_it_is() {
+        // Every one of these asks for exactly what is already true, and asking for what is already
+        // true is not a change. An empty descriptor asks for nothing at all.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'a', {value: 1}); Object.defineProperty(o, 'a', {}); Object.defineProperty(o, 'a', {value: 1}); Object.defineProperty(o, 'a', {enumerable: false, writable: false, configurable: false}); console.log(o.a);"
+            ),
+            "1"
+        );
+    }
+
+    #[test]
+    fn writing_the_same_value_back_is_the_same_value_and_not_strict_equality() {
+        // `NaN === NaN` is false and `SameValue(NaN, NaN)` is true, so a non writable `NaN` can be
+        // redefined to `NaN`. Negative zero is the case that goes the other way.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'a', {value: NaN}); Object.defineProperty(o, 'a', {value: NaN}); console.log(o.a);"
+            ),
+            "NaN"
+        );
+        let error = printed(
+            "var o = {}; Object.defineProperty(o, 'a', {value: 0}); Object.defineProperty(o, 'a', {value: -0});",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("Cannot redefine property: a"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_writable_property_that_cannot_be_configured_can_still_change_its_value() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'w', {value: 1, writable: true}); Object.defineProperty(o, 'w', {value: 2}); console.log(o.w);"
+            ),
+            "2"
+        );
+    }
+
+    #[test]
+    fn a_flag_is_converted_rather_than_having_to_be_a_boolean() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'k', {value: 1, writable: 0, enumerable: 'yes'}); console.log(Object.getOwnPropertyDescriptor(o, 'k'));"
+            ),
+            "{ value: 1, writable: false, enumerable: true, configurable: false }"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_is_read_through_its_prototype_chain_like_any_other_object() {
+        assert_eq!(
+            logged("console.log(Object.defineProperty({}, 'x', Object.create({value: 7})).x);"),
+            "7"
+        );
+    }
+
+    #[test]
+    fn defining_on_something_that_is_not_an_object_names_the_builtin_that_refused() {
+        let error = printed("Object.defineProperty(1, 'x', {});").expect_err("should throw");
+        assert!(
+            error.contains("Object.defineProperty called on non-object"),
+            "unexpected error: {error}"
+        );
+        let error = printed("Object.defineProperties(1, {});").expect_err("should throw");
+        assert!(
+            error.contains("Object.defineProperties called on non-object"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_an_object_says_what_was_passed_instead() {
+        let error = printed("Object.defineProperty({}, 'x', 1);").expect_err("should throw");
+        assert!(
+            error.contains("Property description must be an object: 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_with_an_accessor_and_a_value_is_a_type_error_and_not_a_gap() {
+        // This one does not need receivers to be answered correctly, so it is answered rather than
+        // refused, and in the words node uses.
+        let error = printed("Object.defineProperty({}, 'x', {get: function () {}, value: 1});")
+            .expect_err("should throw");
+        assert!(
+            error.contains(
+                "Cannot both specify accessors and a value or writable attribute, #<Object>"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_descriptor_with_an_accessor_alone_refuses_by_name() {
+        let error = printed("Object.defineProperty({}, 'x', {get: function () {}});")
+            .expect_err("should throw");
+        assert!(
+            error.contains("does not support accessors yet"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn every_descriptor_is_read_before_any_of_them_is_applied() {
+        // Measured against node rather than assumed. A loop that reads and applies one at a time is
+        // the obvious way to write this and it leaves the object half changed.
+        assert_eq!(
+            logged(
+                "var o = {}; try { Object.defineProperties(o, {a: {value: 1}, b: 2}); } catch (e) { console.log(e.message); } console.log(o.a);"
+            ),
+            "Property description must be an object: 2\nundefined"
+        );
+    }
+
+    #[test]
+    fn defining_many_properties_at_once_applies_all_of_them() {
+        assert_eq!(
+            logged(
+                "var o = Object.defineProperties({}, {a: {value: 1, enumerable: true}, b: {value: 2}}); console.log(o, o.b);"
+            ),
+            "{ a: 1 } 2"
+        );
+    }
+
+    #[test]
+    fn describing_a_name_the_object_does_not_have_of_its_own_is_undefined() {
+        assert_eq!(
+            logged(
+                "var o = Object.create({up: 1}); console.log(Object.getOwnPropertyDescriptor(o, 'up'), Object.getOwnPropertyDescriptor(o, 'nope'));"
+            ),
+            "undefined undefined"
+        );
+    }
+
+    #[test]
+    fn describing_undefined_or_null_throws_and_describing_a_number_does_not() {
+        let error =
+            printed("Object.getOwnPropertyDescriptor(null, 'x');").expect_err("should throw");
+        assert!(
+            error.contains("Cannot convert undefined or null to object"),
+            "unexpected error: {error}"
+        );
+        // A number boxes into a wrapper that never has own properties, so `undefined` is the honest
+        // answer as well as node's.
+        assert_eq!(
+            logged("console.log(Object.getOwnPropertyDescriptor(1, 'x'));"),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn describing_a_string_refuses_rather_than_answering_undefined() {
+        // A string wrapper really does have `length` and one property per character, so `undefined`
+        // would be a wrong answer rather than a missing one.
+        let error =
+            printed("Object.getOwnPropertyDescriptor('ab', 'length');").expect_err("should throw");
+        assert!(
+            error.contains("it needs the wrapper prototypes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_statics_on_object_are_hidden_the_way_every_namespace_object_is() {
+        assert_eq!(logged("console.log(Object, JSON);"), "{} {}");
+    }
+
+    #[test]
+    fn object_prototype_cannot_be_moved_out_from_under_running_code() {
+        assert_eq!(
+            logged(
+                "console.log(Object.getOwnPropertyDescriptor(Object, 'prototype').writable, Object.getOwnPropertyDescriptor(Object, 'prototype').configurable);"
+            ),
+            "false false"
         );
     }
 

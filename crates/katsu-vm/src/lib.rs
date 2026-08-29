@@ -24,6 +24,9 @@ use katsu_ir::FunctionBlueprint;
 pub use clock::{now_ms, origin_ms, start as start_clock};
 pub use global::Globals;
 pub use interpret::{Interpreter, Interrupt, RuntimeError};
+/// What a property is allowed to do, re exported so that a builtin can say it without depending on
+/// the heap crate. See [`katsu_gc::Attributes`].
+pub use katsu_gc::Attributes;
 pub use native::{NativeFn, Natives, arg};
 pub use output::{Discard, Output, Recorder, Standard, Stream};
 pub use stack::{Frame, Invocation, Stack, StackError};

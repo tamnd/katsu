@@ -50,6 +50,20 @@
 //!
 //! This is what V8 does with the map and what JavaScriptCore does with the structure, and it is the
 //! same reason in all three places rather than a coincidence.
+//!
+//! # Why the attributes are in here too
+//!
+//! Each node adds one property, so the three flags that property carries are one more field on the
+//! node that added it rather than a parallel array anywhere. They also became part of a transition's
+//! identity: adding `x` as a plain property and adding `x` as a non enumerable one are two different
+//! edges out of the same shape, because two objects that differ in whether a name shows up in
+//! `for in` are not two objects with one layout.
+//!
+//! The reason this is worth doing before almost anything else is that without it there is no way to
+//! put a method on a prototype. `Object.prototype.toString` has to be invisible to `for in`, to
+//! `JSON.stringify` and to `console.log`, and every builtin in the language is installed the same
+//! way, so an object model with no attributes is one that cannot have a standard library on top of
+//! it.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
@@ -57,16 +71,16 @@ use crate::object::{HeapKind, read_u32, slot_of, write_kind, write_u32, write_u3
 use crate::ordinary::ObjectRef;
 use crate::string::StringRef;
 
-/// Bytes a shape occupies, which is the same for every shape because they all hold the same seven
-/// words: the kind tag, the count, the name, the parent, the first child, the next sibling and the
-/// prototype.
+/// Bytes a shape occupies, which is the same for every shape because they all hold the same eight
+/// words: the kind tag, the count, the name, the parent, the first child, the next sibling, the
+/// prototype and the attributes.
 ///
-/// Twenty eight asked for and thirty two taken, because the heap aligns to eight. The padding word
-/// is not free and it is also not per object: there is one shape per layout and a million objects
-/// can share it, so four bytes here is nothing like four bytes in `ordinary.rs`. It is where the
-/// next field goes at no further cost, and the attributes bitmap in the next piece of object model
-/// work is the obvious candidate.
-pub(crate) const SHAPE_SIZE: usize = 28;
+/// Thirty two, which is what the previous seven words already took: they asked for twenty eight and
+/// the heap's eight byte alignment reserved thirty two anyway. So the attributes went into padding
+/// that was already being paid for and a shape costs exactly what it cost before. The field list in
+/// the last version of this comment said the padding word was where the attributes bitmap would go,
+/// and this is that.
+pub(crate) const SHAPE_SIZE: usize = 32;
 /// How many properties an object with this shape has, which is also the depth of this node.
 const COUNT_OFFSET: usize = 4;
 /// The name this shape added to its parent, or a small integer zero at the root.
@@ -82,6 +96,106 @@ const SIBLING_OFFSET: usize = 20;
 /// Copied down every transition, so the whole tree under a root shares one prototype and asking a
 /// shape for it is a load rather than a walk to the root.
 const PROTOTYPE_OFFSET: usize = 24;
+/// What the property this shape added is allowed to do, as [`Attributes`] widened to a word.
+///
+/// Not copied down the way the prototype is, because it describes one property rather than the
+/// object, so the node that added `x` is the only node that knows anything about `x`.
+const ATTRIBUTES_OFFSET: usize = 28;
+
+/// Bit for a property that can be assigned to.
+const WRITABLE: u8 = 1;
+/// Bit for a property that `for in`, `Object.keys` and `JSON.stringify` can see.
+const ENUMERABLE: u8 = 2;
+/// Bit for a property that can be deleted or redefined.
+const CONFIGURABLE: u8 = 4;
+
+/// What a property is allowed to do: the three flags every own property in the language has.
+///
+/// Writable is whether an assignment to it lands, enumerable is whether anything that walks an
+/// object can see it, and configurable is whether it can be deleted or given different flags later.
+/// They are three bits rather than three bytes because they are stored on the shape, and a shape is
+/// shared by every object with that layout, so the packing is about the field count rather than the
+/// size.
+///
+/// The default is all three, which is what an assignment and an object literal produce, and the
+/// default when a descriptor does not mention a flag is none of them, which is the opposite. That is
+/// not an inconsistency in this type, it is the language: `Object.defineProperty(o, "x", {value: 1})`
+/// really does make a property that cannot be written, seen or removed, and getting that backwards
+/// is the single most common way to get `defineProperty` wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Attributes(u8);
+
+impl std::fmt::Debug for Attributes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let letters: String = [
+            (self.is_writable(), 'w'),
+            (self.is_enumerable(), 'e'),
+            (self.is_configurable(), 'c'),
+        ]
+        .into_iter()
+        .filter_map(|(set, letter)| set.then_some(letter))
+        .collect();
+        write!(f, "attributes({letters})")
+    }
+}
+
+impl Attributes {
+    /// Writable, enumerable and configurable, which is what an assignment and a literal make.
+    pub const DEFAULT: Attributes = Attributes(WRITABLE | ENUMERABLE | CONFIGURABLE);
+    /// None of the three, which is what a descriptor that mentions none of them means.
+    pub const NONE: Attributes = Attributes(0);
+    /// Writable and configurable but not enumerable, which is how the language installs a builtin.
+    ///
+    /// Every method on every standard prototype has exactly these, which is why it has a name here
+    /// rather than being spelled out at each of the places that will install one.
+    pub const BUILTIN: Attributes = Attributes(WRITABLE | CONFIGURABLE);
+
+    /// Attributes with exactly the flags asked for.
+    #[must_use]
+    pub const fn new(writable: bool, enumerable: bool, configurable: bool) -> Attributes {
+        let mut bits = 0;
+        if writable {
+            bits |= WRITABLE;
+        }
+        if enumerable {
+            bits |= ENUMERABLE;
+        }
+        if configurable {
+            bits |= CONFIGURABLE;
+        }
+        Attributes(bits)
+    }
+
+    /// Whether an assignment to this property lands.
+    #[must_use]
+    pub const fn is_writable(self) -> bool {
+        self.0 & WRITABLE != 0
+    }
+
+    /// Whether anything that walks an object can see this property.
+    #[must_use]
+    pub const fn is_enumerable(self) -> bool {
+        self.0 & ENUMERABLE != 0
+    }
+
+    /// Whether this property can be deleted or given different flags.
+    #[must_use]
+    pub const fn is_configurable(self) -> bool {
+        self.0 & CONFIGURABLE != 0
+    }
+
+    /// The three bits, for storing.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Attributes back out of bits, ignoring anything above the three that mean something.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Attributes {
+        Attributes(bits & (WRITABLE | ENUMERABLE | CONFIGURABLE))
+    }
+}
 
 /// One node in the transition tree: a property layout that objects share.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,6 +259,20 @@ impl ShapeRef {
         ObjectRef::from_slot(Slot::from_bits(self.field(cage, PROTOTYPE_OFFSET)))
     }
 
+    /// What the property this shape added is allowed to do.
+    ///
+    /// About the one property this node contributed and not about the object, so the answer for a
+    /// name further down the chain comes from the node that added that name. The root added nothing
+    /// and answers [`Attributes::NONE`], which no caller should be asking for.
+    #[must_use]
+    pub fn attributes(self, cage: &Cage) -> Attributes {
+        // The field is a word wide and only its low three bits are ever written, so masking to a
+        // byte cannot lose anything. Written as a mask rather than a cast so that stays true because
+        // of what the code does and not because of a comment saying so.
+        let bits = self.field(cage, ATTRIBUTES_OFFSET) & u32::from(u8::MAX);
+        Attributes::from_bits(u8::try_from(bits).unwrap_or_default())
+    }
+
     /// Where `name` sits in an object with this shape, or `None` if it has no such property.
     ///
     /// The index is a property number and not a byte offset, because where the value physically
@@ -170,11 +298,37 @@ impl ShapeRef {
         }
     }
 
-    /// The shape an object of this shape has after `name` is added to it.
+    /// Where `name` sits and what it is allowed to do, or `None` if this shape has no such property.
     ///
-    /// Reuses the transition if this shape has been given that name before, and creates one
-    /// otherwise, which is what makes two objects built the same way share a shape rather than
-    /// merely have equal layouts.
+    /// One walk for both answers, because everything that cares about a property's flags also cares
+    /// about where its value is, and walking the chain twice to learn two things about one node is
+    /// the sort of thing that is invisible until an object has thirty properties on it.
+    #[must_use]
+    pub fn find(self, cage: &Cage, name: StringRef) -> Option<(u32, Attributes)> {
+        let wanted = name.slot().to_bits();
+        let mut shape = self;
+        loop {
+            let count = shape.count(cage);
+            if count == 0 {
+                return None;
+            }
+            if shape.field(cage, NAME_OFFSET) == wanted {
+                return Some((count - 1, shape.attributes(cage)));
+            }
+            shape = shape.parent(cage)?;
+        }
+    }
+
+    /// The shape an object of this shape has after `name` is added to it with `attributes`.
+    ///
+    /// Reuses the transition if this shape has been given that name with those attributes before,
+    /// and creates one otherwise, which is what makes two objects built the same way share a shape
+    /// rather than merely have equal layouts.
+    ///
+    /// The attributes are part of the edge and not just cargo written into the node. Adding `x` as
+    /// an ordinary property and adding `x` as a non enumerable one have to reach different shapes,
+    /// because a shape is supposed to answer every question about layout on its own, and whether a
+    /// name turns up in `for in` is one of those questions.
     ///
     /// The caller is responsible for having asked [`ShapeRef::index_of`] first. Adding a name that
     /// is already in the chain would build a shape with the same name twice, where the second is
@@ -182,8 +336,13 @@ impl ShapeRef {
     ///
     /// Returns `None` if the heap is full.
     #[must_use]
-    pub fn transition(self, heap: &mut BumpHeap, name: StringRef) -> Option<ShapeRef> {
-        if let Some(existing) = self.child_named(heap.cage(), name) {
+    pub fn transition(
+        self,
+        heap: &mut BumpHeap,
+        name: StringRef,
+        attributes: Attributes,
+    ) -> Option<ShapeRef> {
+        if let Some(existing) = self.child_named(heap.cage(), name, attributes) {
             return Some(existing);
         }
         let count = self.count(heap.cage()).checked_add(1)?;
@@ -202,6 +361,7 @@ impl ShapeRef {
             write_u32(pointer, PARENT_OFFSET, self.0.to_bits());
             write_u32(pointer, SIBLING_OFFSET, first_child);
             write_u32(pointer, PROTOTYPE_OFFSET, above);
+            write_u32(pointer, ATTRIBUTES_OFFSET, u32::from(attributes.bits()));
         }
 
         // The new child goes on the front of the parent's list, which is one store rather than a
@@ -234,6 +394,71 @@ impl ShapeRef {
         names
     }
 
+    /// Every name an object with this shape has and what each one is allowed to do.
+    ///
+    /// The enumeration path, same as [`ShapeRef::names`] and in the same order. Anything that has to
+    /// decide whether to show a property wants both halves, and reading the names and then asking
+    /// after each one's flags would walk the chain once per property.
+    #[must_use]
+    pub fn entries(self, cage: &Cage) -> Vec<(StringRef, Attributes)> {
+        let mut entries = Vec::with_capacity(self.count(cage) as usize);
+        let mut shape = self;
+        while let Some(name) = shape.name(cage) {
+            entries.push((name, shape.attributes(cage)));
+            let Some(parent) = shape.parent(cage) else {
+                break;
+            };
+            shape = parent;
+        }
+        entries.reverse();
+        entries
+    }
+
+    /// The same layout with the property at `index` given different attributes.
+    ///
+    /// This is the expensive operation in the object model and it is expensive on purpose. A
+    /// transition tree records how an object was built, so changing a property that was not the last
+    /// one added means every node after it describes a layout that no longer exists, and the only
+    /// honest answer is to walk back to the root and take the edges again with the one change made.
+    /// The values do not move, because the order does not change and the order is what decides the
+    /// indices.
+    ///
+    /// It is affordable because of what reaches it. An assignment never does, an object literal
+    /// never does, and a builtin being installed never does, because all three add a property that
+    /// was not there. Only `Object.defineProperty` against a name an object already has arrives here,
+    /// and the rebuilt path is usually made of nodes that already exist, because the transition cache
+    /// hands back the ones another object took first.
+    ///
+    /// Returns `None` if the heap is full or `index` is past the end.
+    #[must_use]
+    pub fn redefine(
+        self,
+        heap: &mut BumpHeap,
+        index: u32,
+        attributes: Attributes,
+    ) -> Option<ShapeRef> {
+        let mut entries = self.entries(heap.cage());
+        entries.get_mut(index as usize)?.1 = attributes;
+        let mut shape = self.base(heap.cage());
+        for (name, attributes) in entries {
+            shape = shape.transition(heap, name, attributes)?;
+        }
+        Some(shape)
+    }
+
+    /// The root of the tree this shape is in, which is the empty object with the same prototype.
+    ///
+    /// A walk up the parent chain rather than a stored pointer, because it is only wanted by
+    /// [`ShapeRef::redefine`], which is already walking the whole chain to read the names out.
+    #[must_use]
+    pub fn base(self, cage: &Cage) -> ShapeRef {
+        let mut shape = self;
+        while let Some(parent) = shape.parent(cage) {
+            shape = parent;
+        }
+        shape
+    }
+
     /// The slot this shape lives at, for writing into an object's first word.
     #[must_use]
     pub const fn slot(self) -> Slot {
@@ -250,12 +475,19 @@ impl ShapeRef {
         }
     }
 
-    /// The transition out of this shape under `name`, if there has ever been one.
-    fn child_named(self, cage: &Cage, name: StringRef) -> Option<ShapeRef> {
+    /// The transition out of this shape under `name` with `attributes`, if there has ever been one.
+    ///
+    /// Both halves have to match. A child with the right name and different flags is a different
+    /// layout, and handing it back would give an object the flags whichever object got there first
+    /// happened to use.
+    fn child_named(self, cage: &Cage, name: StringRef, attributes: Attributes) -> Option<ShapeRef> {
         let wanted = name.slot().to_bits();
+        let bits = u32::from(attributes.bits());
         let mut child = ShapeRef::from_slot(Slot::from_bits(self.field(cage, CHILD_OFFSET)));
         while let Some(shape) = child {
-            if shape.field(cage, NAME_OFFSET) == wanted {
+            if shape.field(cage, NAME_OFFSET) == wanted
+                && shape.field(cage, ATTRIBUTES_OFFSET) == bits
+            {
                 return Some(shape);
             }
             child = ShapeRef::from_slot(Slot::from_bits(shape.field(cage, SIBLING_OFFSET)));
@@ -277,7 +509,7 @@ impl ShapeRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{SHAPE_SIZE, ShapeRef};
+    use super::{Attributes, SHAPE_SIZE, ShapeRef};
     use crate::bump::{BumpHeap, ObjectKind};
     use crate::cage::Slot;
     use crate::object::HeapKind;
@@ -318,7 +550,9 @@ mod tests {
         let mut heap = heap();
         let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
-        let with_x = root.transition(&mut heap, x).expect("should have room");
+        let with_x = root
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .expect("should have room");
         assert_eq!(with_x.count(heap.cage()), 1);
         assert_eq!(with_x.index_of(heap.cage(), x), Some(0));
         assert_eq!(root.index_of(heap.cage(), x), None);
@@ -334,13 +568,13 @@ mod tests {
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let first = root
-            .transition(&mut heap, x)
-            .and_then(|shape| shape.transition(&mut heap, y))
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .and_then(|shape| shape.transition(&mut heap, y, Attributes::DEFAULT))
             .expect("should have room");
         let before = heap.census().totals(ObjectKind::Shape).count;
         let second = root
-            .transition(&mut heap, x)
-            .and_then(|shape| shape.transition(&mut heap, y))
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .and_then(|shape| shape.transition(&mut heap, y, Attributes::DEFAULT))
             .expect("should have room");
         assert_eq!(first, second);
         assert_eq!(
@@ -359,12 +593,12 @@ mod tests {
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let xy = root
-            .transition(&mut heap, x)
-            .and_then(|shape| shape.transition(&mut heap, y))
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .and_then(|shape| shape.transition(&mut heap, y, Attributes::DEFAULT))
             .expect("should have room");
         let yx = root
-            .transition(&mut heap, y)
-            .and_then(|shape| shape.transition(&mut heap, x))
+            .transition(&mut heap, y, Attributes::DEFAULT)
+            .and_then(|shape| shape.transition(&mut heap, x, Attributes::DEFAULT))
             .expect("should have room");
         assert_ne!(xy, yx);
         assert_eq!(xy.index_of(heap.cage(), x), Some(0));
@@ -380,9 +614,15 @@ mod tests {
         let a = name(&mut heap, "a");
         let b = name(&mut heap, "b");
         let c = name(&mut heap, "c");
-        let with_a = root.transition(&mut heap, a).expect("should have room");
-        let ab = with_a.transition(&mut heap, b).expect("should have room");
-        let ac = with_a.transition(&mut heap, c).expect("should have room");
+        let with_a = root
+            .transition(&mut heap, a, Attributes::DEFAULT)
+            .expect("should have room");
+        let ab = with_a
+            .transition(&mut heap, b, Attributes::DEFAULT)
+            .expect("should have room");
+        let ac = with_a
+            .transition(&mut heap, c, Attributes::DEFAULT)
+            .expect("should have room");
         assert_ne!(ab, ac);
         assert_eq!(ab.parent(heap.cage()), Some(with_a));
         assert_eq!(ac.parent(heap.cage()), Some(with_a));
@@ -397,7 +637,9 @@ mod tests {
         let mut shape = root;
         for text in ["first", "second", "third"] {
             let name = name(&mut heap, text);
-            shape = shape.transition(&mut heap, name).expect("should have room");
+            shape = shape
+                .transition(&mut heap, name, Attributes::DEFAULT)
+                .expect("should have room");
         }
         assert_eq!(texts(&heap, shape), ["first", "second", "third"]);
         assert_eq!(texts(&heap, root), Vec::<String>::new());
@@ -409,7 +651,9 @@ mod tests {
         let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let missing = name(&mut heap, "nope");
-        let with_x = root.transition(&mut heap, x).expect("should have room");
+        let with_x = root
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .expect("should have room");
         assert_eq!(with_x.index_of(heap.cage(), missing), None);
     }
 
@@ -417,18 +661,150 @@ mod tests {
     fn a_shape_costs_one_object_and_thirty_two_bytes() {
         // The layout claim from the field list, checked rather than asserted in prose, because the
         // per shape cost is what decides whether a program with many small layouts is affordable.
-        // Twenty eight of fields and four of alignment padding, which is the price of the prototype
-        // word and is paid once per layout rather than once per object.
+        // Eight words with nothing left over, and the number to read it against is the thirty two
+        // this reserved when it was seven words and four bytes of padding: the attributes were free.
         let mut heap = heap();
         let before = heap.census().totals(ObjectKind::Shape);
         let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
-        root.transition(&mut heap, x).expect("should have room");
+        root.transition(&mut heap, x, Attributes::DEFAULT)
+            .expect("should have room");
         let after = heap.census().totals(ObjectKind::Shape);
         assert_eq!(after.count - before.count, 2);
-        assert_eq!(after.requested_bytes - before.requested_bytes, 2 * 28);
+        assert_eq!(after.requested_bytes - before.requested_bytes, 2 * 32);
         assert_eq!(after.reserved_bytes - before.reserved_bytes, 2 * 32);
-        assert_eq!(SHAPE_SIZE, 28);
+        assert_eq!(SHAPE_SIZE, 32);
+    }
+
+    #[test]
+    fn a_property_remembers_what_it_is_allowed_to_do() {
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let x = name(&mut heap, "x");
+        let hidden = Attributes::new(true, false, true);
+        let shape = root
+            .transition(&mut heap, x, hidden)
+            .expect("should have room");
+        assert_eq!(shape.find(heap.cage(), x), Some((0, hidden)));
+        assert!(hidden.is_writable());
+        assert!(!hidden.is_enumerable());
+        assert!(hidden.is_configurable());
+    }
+
+    #[test]
+    fn the_same_name_with_different_flags_is_a_different_shape() {
+        // What makes attributes part of a transition rather than cargo on it. If these shared a
+        // node, the second object would silently get whichever flags the first one used, and the
+        // symptom would be a builtin method turning up in somebody's `for in`.
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let x = name(&mut heap, "x");
+        let plain = root
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .expect("should have room");
+        let hidden = root
+            .transition(&mut heap, x, Attributes::BUILTIN)
+            .expect("should have room");
+        assert_ne!(plain, hidden);
+        assert_eq!(plain.index_of(heap.cage(), x), Some(0));
+        assert_eq!(hidden.index_of(heap.cage(), x), Some(0));
+        assert!(plain.attributes(heap.cage()).is_enumerable());
+        assert!(!hidden.attributes(heap.cage()).is_enumerable());
+    }
+
+    #[test]
+    fn the_same_name_with_the_same_flags_is_still_one_shape() {
+        // The other half of the previous test, and the one that would fail if the attribute check in
+        // the transition cache were written as "never reuse anything".
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let x = name(&mut heap, "x");
+        let first = root
+            .transition(&mut heap, x, Attributes::BUILTIN)
+            .expect("should have room");
+        let before = heap.census().totals(ObjectKind::Shape).count;
+        let second = root
+            .transition(&mut heap, x, Attributes::BUILTIN)
+            .expect("should have room");
+        assert_eq!(first, second);
+        assert_eq!(heap.census().totals(ObjectKind::Shape).count, before);
+    }
+
+    #[test]
+    fn changing_the_flags_of_a_property_keeps_every_name_where_it_was() {
+        // The property that makes `redefine` safe to write values through: the rebuilt chain has the
+        // same names in the same order, so every index is still the index it was and the object's
+        // values do not have to move.
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let names: Vec<StringRef> = ["a", "b", "c"]
+            .into_iter()
+            .map(|text| name(&mut heap, text))
+            .collect();
+        let mut shape = root;
+        for &name in &names {
+            shape = shape
+                .transition(&mut heap, name, Attributes::DEFAULT)
+                .expect("should have room");
+        }
+        let a = names[0];
+        let frozen = shape
+            .redefine(&mut heap, 0, Attributes::NONE)
+            .expect("should have room");
+        assert_eq!(texts(&heap, frozen), ["a", "b", "c"]);
+        assert_eq!(frozen.find(heap.cage(), a), Some((0, Attributes::NONE)));
+        assert_ne!(frozen, shape);
+        assert_eq!(frozen.base(heap.cage()), root);
+    }
+
+    #[test]
+    fn two_objects_frozen_the_same_way_still_reach_one_shape() {
+        // Rebuilding from the root goes back through the transition cache, so the second object to
+        // be redefined the same way finds the nodes the first one made rather than making its own.
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let x = name(&mut heap, "x");
+        let y = name(&mut heap, "y");
+        let shape = root
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .and_then(|shape| shape.transition(&mut heap, y, Attributes::DEFAULT))
+            .expect("should have room");
+        let first = shape
+            .redefine(&mut heap, 0, Attributes::NONE)
+            .expect("should have room");
+        let before = heap.census().totals(ObjectKind::Shape).count;
+        let second = shape
+            .redefine(&mut heap, 0, Attributes::NONE)
+            .expect("should have room");
+        assert_eq!(first, second);
+        assert_eq!(
+            heap.census().totals(ObjectKind::Shape).count,
+            before,
+            "the second redefinition should not have allocated anything"
+        );
+    }
+
+    #[test]
+    fn a_property_past_the_end_cannot_be_redefined() {
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let x = name(&mut heap, "x");
+        let shape = root
+            .transition(&mut heap, x, Attributes::DEFAULT)
+            .expect("should have room");
+        assert_eq!(shape.redefine(&mut heap, 1, Attributes::NONE), None);
+    }
+
+    #[test]
+    fn a_descriptor_that_says_nothing_allows_nothing() {
+        // The rule that catches people out, written down as a test because the two defaults in this
+        // module point in opposite directions on purpose.
+        assert_eq!(Attributes::NONE, Attributes::new(false, false, false));
+        assert_eq!(Attributes::DEFAULT, Attributes::new(true, true, true));
+        assert_eq!(Attributes::BUILTIN, Attributes::new(true, false, true));
+        assert_eq!(Attributes::from_bits(0xff), Attributes::DEFAULT);
+        assert_eq!(format!("{:?}", Attributes::BUILTIN), "attributes(wc)");
+        assert_eq!(format!("{:?}", Attributes::NONE), "attributes()");
     }
 
     #[test]
@@ -453,7 +829,9 @@ mod tests {
         let mut shape = root;
         for text in ["a", "b", "c"] {
             let name = name(&mut heap, text);
-            shape = shape.transition(&mut heap, name).expect("should have room");
+            shape = shape
+                .transition(&mut heap, name, Attributes::DEFAULT)
+                .expect("should have room");
         }
         assert_eq!(shape.prototype(heap.cage()), Some(above));
     }
@@ -469,10 +847,10 @@ mod tests {
         let second = ObjectRef::new(&mut heap, bare, 0).expect("should have room");
         let x = name(&mut heap, "x");
         let one = ShapeRef::root(&mut heap, Some(first))
-            .and_then(|root| root.transition(&mut heap, x))
+            .and_then(|root| root.transition(&mut heap, x, Attributes::DEFAULT))
             .expect("should have room");
         let two = ShapeRef::root(&mut heap, Some(second))
-            .and_then(|root| root.transition(&mut heap, x))
+            .and_then(|root| root.transition(&mut heap, x, Attributes::DEFAULT))
             .expect("should have room");
         assert_ne!(one, two);
         assert_eq!(one.index_of(heap.cage(), x), two.index_of(heap.cage(), x));
