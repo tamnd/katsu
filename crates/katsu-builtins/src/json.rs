@@ -169,7 +169,7 @@ fn write(
         // The one place JSON is narrower than the language. There is no spelling for NaN or for an
         // infinity, so both become null and the program is not told.
         if number.is_finite() {
-            out.push_str(&interpreter.to_text(value));
+            out.push_str(&interpreter.to_text(value)?);
         } else {
             out.push_str("null");
         }

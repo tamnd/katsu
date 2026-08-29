@@ -98,6 +98,14 @@ pub(crate) fn circular(number: usize) -> String {
     format!("[Circular *{number}]")
 }
 
+/// What goes in front of an object that inherits from nothing.
+///
+/// Node says this because a bare object behaves differently from an ordinary one in ways its
+/// contents do not show. It has no `toString`, no `hasOwnProperty` and nothing else, so printing it
+/// as `{}` would be printing two different kinds of thing the same way. It is also what the depth
+/// limit prints instead of `[Object]`, for the same reason.
+pub(crate) const NULL_PROTOTYPE: &str = "[Object: null prototype]";
+
 /// Wrap the printed properties of one object in braces, on one line if they fit.
 ///
 /// Node's width rule is not "is the line under eighty characters", it is a count with a constant of

@@ -93,6 +93,7 @@ impl Runtime {
         katsu_builtins::install_globals(&mut interpreter)?;
         katsu_builtins::install_console(&mut interpreter)?;
         katsu_builtins::install_performance(&mut interpreter)?;
+        katsu_builtins::install_object(&mut interpreter)?;
         katsu_builtins::install_string(&mut interpreter)?;
         katsu_builtins::install_json(&mut interpreter)?;
         Ok(Runtime { interpreter })

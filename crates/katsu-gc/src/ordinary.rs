@@ -35,13 +35,22 @@
 //! stop being shared between those two paths, which costs more than the word saves until there is
 //! the slack tracking that makes V8's version work.
 //!
+//! # Where the prototype is
+//!
+//! Not here. It is in the shape, and `shape.rs` says why at length: it makes one shape comparison
+//! enough to guard an inherited property, which is what an inline cache needs. So an object carries
+//! no prototype word of its own and asking one for its prototype is a load of the shape and a load
+//! out of it.
+//!
 //! # What is not here
 //!
-//! No prototype, so a property that is missing is missing rather than looked for further up. No
-//! attributes, so nothing is read only, non enumerable or an accessor. No delete, which is the one
+//! No attributes, so nothing is read only, non enumerable or an accessor. That is the reason there
+//! is nothing installed on `Object.prototype` yet: a method there would show up in `console.log` and
+//! in enumeration, because there is no way to say that it should not. No delete, which is the one
 //! operation a transition tree genuinely does not want and which needs the dictionary mode that
-//! every engine falls back to. No indexed properties. Each of those is its own piece of work and
-//! each of them is in M1.
+//! every engine falls back to. No indexed properties. No setters, which is why a write always makes
+//! an own property and never goes up the chain. Each of those is its own piece of work and each of
+//! them is in M1.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
@@ -131,10 +140,20 @@ impl ObjectRef {
         self.len(cage) == 0
     }
 
-    /// The value stored under `name`, or `None` if this object has no such property.
+    /// What this object inherits from, or `None` if it inherits from nothing.
     ///
-    /// There is no prototype chain yet, so a miss here is the final answer rather than the start of
-    /// a walk.
+    /// A load of the shape and a load out of it, because the prototype lives in the shape. See
+    /// `shape.rs`.
+    #[must_use]
+    pub fn prototype(self, cage: &Cage) -> Option<ObjectRef> {
+        self.shape(cage).prototype(cage)
+    }
+
+    /// The value stored under `name` on this object itself, or `None` if it has none.
+    ///
+    /// Own properties only, which is `Object.getOwnPropertyDescriptor` and not `o.name`. Walking the
+    /// prototype chain is the interpreter's job rather than this one's, because a chain walk is a
+    /// language operation with its own rules and this is the layer that knows where bytes are.
     #[must_use]
     pub fn get(self, cage: &Cage, name: StringRef) -> Option<u64> {
         let index = self.shape(cage).index_of(cage, name)?;
@@ -398,7 +417,7 @@ mod tests {
     }
 
     fn empty(heap: &mut BumpHeap, inline: u32) -> ObjectRef {
-        let root = ShapeRef::root(heap).expect("should have room");
+        let root = ShapeRef::root(heap, None).expect("should have room");
         ObjectRef::new(heap, root, inline).expect("should have room")
     }
 
@@ -515,7 +534,7 @@ mod tests {
     #[test]
     fn two_objects_built_the_same_way_share_one_shape() {
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let first = ObjectRef::new(&mut heap, root, 2).expect("should have room");
@@ -549,7 +568,7 @@ mod tests {
         // What an object literal pays, and the number the memory budget is spent against: a header
         // and one eight byte value per property, with no second object anywhere.
         let mut heap = heap();
-        let root = ShapeRef::root(&mut heap).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
         let x = name(&mut heap, "x");
         let y = name(&mut heap, "y");
         let before = heap.census().totals(ObjectKind::Object);

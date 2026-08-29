@@ -48,7 +48,7 @@ fn string(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, Runtim
     let text = if args.is_empty() {
         String::new()
     } else {
-        interpreter.to_text(arg(args, 0))
+        interpreter.to_text(arg(args, 0))?
     };
     interpreter.new_string(&text)
 }
