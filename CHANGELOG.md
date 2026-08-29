@@ -2,6 +2,67 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.4
+
+The fourth patch release of M1, three pull requests on from 0.1.3, and all three are the object model. An object now has a prototype chain that is really walked, properties that know what they are allowed to do, and a `this` that is bound where the call happens. The theme underneath all three is that the shape carries the answer, so that an inline cache which has compared one shape has in that one comparison also checked everything else it needed to know.
+
+### The prototype lives in the shape
+
+In #64. A property that is not on an object is now looked for above it, all the way up rather than one step, and `Object.create` and `Object.getPrototypeOf` are there to build a chain and to read one.
+
+Keeping the prototype in the shape rather than in the object is the decision the rest of the object model is aimed at. An inline cache that has compared one shape has in that single comparison also checked every prototype between the object and wherever the property was found, so an inherited property is guarded exactly as cheaply as an own one. It is what V8 does with the map and what JavaScriptCore does with the structure, for the same reason in all three places.
+
+A write always makes an own property and leaves the prototype alone, because there are no setters yet for it to reach.
+
+### Properties know what they are allowed to do
+
+In #65. A property carries three flags, and `Object.defineProperty`, `Object.defineProperties` and `Object.getOwnPropertyDescriptor` set them and read them back.
+
+The flags live in the shape next to the prototype, on the node that added the property, and they became part of a transition's identity. Adding `x` as a plain property and adding `x` as a hidden one are two different edges out of the same shape, because two objects that differ in what a `for in` sees are not two objects with one layout. It cost nothing: a shape asked for 28 bytes and the heap reserved 32 for alignment, so the flags went into padding that was already being paid for.
+
+Defining a property is not assigning to one, and almost nothing about the two is the same. Assignment asks the prototype chain for permission and a definition does not, a definition can change what a property is allowed to do and an assignment cannot, and a definition leaves out any flag it was not given rather than defaulting it. So `o.x = 1` makes a property that can do all three things and `Object.defineProperty(o, 'x', {value: 1})` makes one that can do none of them.
+
+A read only property on a prototype stops a write to every object below it, even though none of those objects has the property, because the chain is searched before the write and what is found there decides the answer. That search made stores faster rather than slower, by about a tenth, because the write now goes straight to the slot the search returned instead of looking the name up a second time.
+
+The rules for redefining were run under node case by case rather than remembered. A non configurable property can only ever become less permissive, a non writable one can be redefined to the same value and not to a different one, and the comparison is `SameValue`, which is why a non writable `NaN` can be redefined to `NaN` and a positive zero cannot be redefined to a negative one.
+
+### this is bound at call sites
+
+In #66. A method call knows the object the method was read from and carries it onto the frame the call pushes. That is what `CallMethod` was always for, and it is why the property read and the call are one opcode rather than two: keeping them together is the only way the receiver survives between them.
+
+Nothing supplied is not the same as `undefined` supplied, and that third state is the whole design. What `this` means in a plain call depends on where the code is and whether it is strict, both of which are properties of the callee rather than of the caller, so the call site cannot answer it and `Op::LoadThis` can. A strict function called on nothing gets `undefined`. A sloppy one gets `globalThis` and there is no global object yet. The outermost frame in a file gets `module.exports` and there is no module system yet. The last two refuse by name rather than answering `undefined`, because `undefined` is a legal answer that a program will act on and a refusal is not.
+
+That third state ended up costing nothing, after first costing something, and the detour is worth recording because the same trap waits in every frame field added from here. An `Option<Value>` is what the type wants and it took the frame header from 24 bytes to 40, because a NaN boxed value has no spare bit pattern for a discriminant to hide in, and it measured 14 percent on `call/call_return` and on `call/fib`. `Value::EMPTY` is what the encoding already uses for "there is no value here", no call site can produce it, and it says the same thing in the eight bytes the value was going to take anyway.
+
+`Object.prototype` has methods on it now, which is what receivers were blocking: `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` and `valueOf`. All five are non enumerable, writable and configurable, which is what node reports for each of them, and that is not a detail to wave through, because they sit at the top of nearly every prototype chain in the realm and an enumerable one would appear in every `for in` over every object in the program. Every one of them begins with `ToObject(this)`, which throws in node's exact words for `undefined` and `null`, returns an ordinary object unchanged, and refuses by name for anything that would need a wrapper prototype.
+
+Accessors are still not here, and the reason changed. They were blocked on receivers and they are now blocked on storage: a property slot holds a value rather than a pair of functions, so a getter needs the slot to hold a pair and a shape node needs a flag saying that it does. The refusal message says so.
+
+### Where the numbers stand
+
+`fib.js` from tamnd/katsu-bench, medians of five runs of each runtime interleaved in one session on the same m4, timed by the workload's own `performance.now()` rather than by wall clock around the process.
+
+| Runtime | fib(35) compute | Against katsu |
+|---|---|---|
+| katsu | 821 ms | |
+| node v26.8.1 | 49.5 ms | 16.6x faster |
+| bun 1.4.0 | 34.2 ms | 24.0x faster |
+| deno 2.9.6 | 51.3 ms | 16.0x faster |
+
+The absolute improved from 1,055 ms and the ratio did not, and the second half of that sentence is the real one. Node measured 63 ms in the 0.1.3 session and 49.5 ms here, which is the same 21 percent the katsu number moved by, so what changed between the two sessions was how busy the laptop was rather than how fast the interpreter is. The ratio against node went from 16.7x to 16.6x, which is nothing, and it is nothing for a good reason: `fib` is a call benchmark wearing an arithmetic benchmark's clothes, and none of the three pull requests in this release touched the call path or the arithmetic. They touched properties, and `fib` does not have any. This is what a paired ratio is for and it is why the table is read down the last column.
+
+The two changes that were expected to move a number did, on the microbenchmarks that actually cover them. `property/prop_store` got about a tenth faster from the chain search in #65. `stack/push_pop` got 15 percent slower from the frame header growing 24 bytes to 32 in #66, measured over forty ABBA pairs, and it is the only benchmark that moved: it pushes and pops a frame and does nothing else, so it is the one place where eight more bytes of header is the entire workload. `call/call_return` at 0.999 and `stack/call_and_return` at 0.983 say that anything which then runs a call amortises it away.
+
+Still one of six compute workloads running, and what stops the other five is unchanged: `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` fills the 4 GiB cage and dies because there is no collector.
+
+### Where the conformance number stands
+
+6.66%, 5,410 cases, unchanged again and expected to be. 75,808 cases still stop on the `new` in `throw new Test262Error(message)` before reaching any line the object model could answer. Three releases have now described the same wall, and the object model work in this one is part of what it takes to get past it, since a constructor needs a prototype to hang off and `new` needs somewhere to put it.
+
+### Also
+
+The differential corpus gained `receivers.js`, and a full run is 1,013 programs with 1,012 agreements, 0 differences and 1 gap. One divergence in the receiver area was deliberately kept out of the corpus because it is pre-existing rather than new: node says `bare.toString is not a function` where katsu says `toString is not a function`, since katsu does not keep call site source spans yet.
+
 ## 0.1.3
 
 The third patch release of M1, three pull requests on from 0.1.2, and all three exist so that a program can measure itself and say what it found. `performance.now()` and `performance.timeOrigin` are there, `String()` and `JSON.stringify()` are there, and with those four names the `fib` workload in tamnd/katsu-bench runs end to end. This release is the first one that publishes a compute number about katsu, and the number is bad.
