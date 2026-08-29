@@ -18,7 +18,7 @@ mod position;
 
 pub use blueprint::{BlueprintError, FunctionBlueprint, Handler};
 pub use constant::{ConstIndex, Constant, ConstantPool};
-pub use op::{BlueprintIndex, CacheIndex, CodeOffset, Op, Register};
+pub use op::{AccessorHalf, BlueprintIndex, CacheIndex, CodeOffset, Op, Register};
 pub use position::SourcePositions;
 
 /// The version of the bytecode format itself, independent of the crate version.

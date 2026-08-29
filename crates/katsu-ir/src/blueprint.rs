@@ -457,7 +457,11 @@ fn highest_register(op: Op) -> Option<Register> {
         | Op::In { dst, lhs, rhs, .. }
         | Op::InstanceOf { dst, lhs, rhs, .. } => smallvec![dst, lhs, rhs],
         Op::GetProp { dst, obj, .. } | Op::DeleteProp { dst, obj, .. } => smallvec![dst, obj],
-        Op::SetProp { obj, value, .. } => smallvec![obj, value],
+        Op::SetProp { obj, value, .. }
+        | Op::DefineAccessor { obj, value, .. }
+        | Op::DefineValue { obj, value, .. } => {
+            smallvec![obj, value]
+        }
         Op::GetIndex {
             dst, obj, index, ..
         }

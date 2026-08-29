@@ -30,8 +30,8 @@ use oxc_ast::ast as oxc;
 use crate::ParseError;
 use crate::ast::{
     AssignOp, BinaryOp, Binding, Block, Case, Catch, DeclKind, Expr, ExprKind, ForInit, Func,
-    Ident, LogicalOp, Module, Property, Span, Stmt, StmtKind, Target, TargetKind, UnaryOp,
-    UpdateOp,
+    Ident, LogicalOp, Module, Property, PropertyKind, Span, Stmt, StmtKind, Target, TargetKind,
+    UnaryOp, UpdateOp,
 };
 
 /// Turn one parsed program into our tree.
@@ -728,8 +728,8 @@ impl Adapter<'_> {
     ///
     /// That is the subset the object model can build today. Everything else in the grammar is
     /// refused by name rather than approximated, and each refusal says which construct it was, so a
-    /// program that uses a getter gets told about the getter instead of being told that object
-    /// literals are unsupported.
+    /// program that uses spread gets told about spread instead of being told that object literals
+    /// are unsupported.
     ///
     /// Shorthand needs no work here. `{x}` arrives with an identifier key and an identifier value,
     /// which is exactly the shape `{x: x}` arrives in, and the two lower identically because they
@@ -742,12 +742,15 @@ impl Adapter<'_> {
             let oxc::ObjectPropertyKind::ObjectProperty(property) = property else {
                 return self.refuse("spread in an object literal", property.span());
             };
-            match property.kind {
-                oxc::PropertyKind::Init => {}
-                oxc::PropertyKind::Get => return self.refuse("a getter", property.span),
-                oxc::PropertyKind::Set => return self.refuse("a setter", property.span),
-            }
-            if property.method {
+            let kind = match property.kind {
+                oxc::PropertyKind::Init => PropertyKind::Value,
+                oxc::PropertyKind::Get => PropertyKind::Getter,
+                oxc::PropertyKind::Set => PropertyKind::Setter,
+            };
+            // A getter and a setter are both marked as methods here, because they are: the grammar
+            // that produces them is `MethodDefinition`. The refusal is about the third thing that
+            // grammar produces, which is `{x() {}}`, so it asks about the kind as well.
+            if property.method && kind == PropertyKind::Value {
                 return self.refuse("a method in an object literal", property.span);
             }
             if property.computed {
@@ -774,6 +777,7 @@ impl Adapter<'_> {
             properties.push(Property {
                 span: span(property.span),
                 name,
+                kind,
                 value: self.expression(&property.value, strict)?,
             });
         }
@@ -1137,8 +1141,8 @@ pub(crate) fn line_and_column(source: &str, offset: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use crate::ast::{
-        AssignOp, BinaryOp, DeclKind, Expr, ExprKind, LogicalOp, Stmt, StmtKind, TargetKind,
-        UnaryOp, UpdateOp,
+        AssignOp, BinaryOp, DeclKind, Expr, ExprKind, LogicalOp, PropertyKind, Stmt, StmtKind,
+        TargetKind, UnaryOp, UpdateOp,
     };
     use crate::{ParseError, parse};
 
@@ -1449,6 +1453,27 @@ mod tests {
     }
 
     #[test]
+    fn the_two_halves_of_an_accessor_arrive_marked_as_different_things_from_a_plain_value() {
+        let ExprKind::Object { properties } =
+            init("let o = { get a() { return 1; }, set a(v) {}, b: 2 };").kind
+        else {
+            panic!("expected an object literal");
+        };
+        // Three entries and not two. Joining the halves of `a` into one property is the object
+        // model's job at run time, and doing it here would lose the order the two were written in.
+        let kinds: Vec<_> = properties.iter().map(|property| property.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                PropertyKind::Getter,
+                PropertyKind::Setter,
+                PropertyKind::Value
+            ]
+        );
+        assert_eq!(properties[0].name.name, properties[1].name.name);
+    }
+
+    #[test]
     fn every_part_of_an_object_literal_we_cannot_build_yet_is_refused_by_its_own_name() {
         // One message per construct rather than one for object literals as a whole, because a
         // program that used a getter should be told about the getter.
@@ -1456,11 +1481,6 @@ mod tests {
             refused("t.js", "let o = { ...rest };"),
             "spread in an object literal"
         );
-        assert_eq!(
-            refused("t.js", "let o = { get a() { return 1; } };"),
-            "a getter"
-        );
-        assert_eq!(refused("t.js", "let o = { set a(v) {} };"), "a setter");
         assert_eq!(
             refused("t.js", "let o = { m() {} };"),
             "a method in an object literal"

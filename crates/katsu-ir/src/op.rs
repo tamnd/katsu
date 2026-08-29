@@ -111,6 +111,24 @@ impl fmt::Display for BlueprintIndex {
     }
 }
 
+/// Which half of an accessor an instruction is talking about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessorHalf {
+    /// The function a read of the property calls.
+    Getter,
+    /// The function a write to the property calls.
+    Setter,
+}
+
+impl fmt::Display for AccessorHalf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Getter => f.write_str("get"),
+            Self::Setter => f.write_str("set"),
+        }
+    }
+}
+
 /// A three address bytecode instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -416,6 +434,43 @@ pub enum Op {
         obj: Register,
         index: Register,
     },
+    /// Give `obj` an accessor property named `constants[key]` with `value` as one of its halves.
+    ///
+    /// One half at a time and not both, because the two halves of one property are two properties in
+    /// the source. `{get x() {}, set x(v) {}}` is two entries in the literal, they can be written in
+    /// either order and with other properties between them, and the language says the second one
+    /// joins the first rather than replacing it. An opcode that took both would have to be built by
+    /// something that had already paired them up, which means the parser deciding what a literal
+    /// means instead of describing what it says.
+    ///
+    /// This is defining and not assigning, so a setter on the prototype chain is not consulted and
+    /// the flags are the ones a literal gives: enumerable and configurable, both true, which is what
+    /// makes it different from `Object.defineProperty` where the default for each is false.
+    DefineAccessor {
+        obj: Register,
+        key: ConstIndex,
+        value: Register,
+        half: AccessorHalf,
+    },
+    /// Give `obj` an ordinary property named `constants[key]` holding `value`.
+    ///
+    /// This is what an object literal does with `{x: 1}`, and it is not the same operation as the
+    /// store that `o.x = 1` does. A store asks the prototype chain for permission first, so with a
+    /// setter installed on `Object.prototype` a literal would call it and take no property of its
+    /// own, which is not what the language says a literal does. A store also cannot replace an
+    /// accessor with a value, which is what `{get x() {}, x: 5}` has to end up doing.
+    ///
+    /// The three flags are all true, so this reaches the same shape a store would have reached and
+    /// an object built by a literal is the same object as one grown a property at a time.
+    ///
+    /// The cache index is here for the same reason it is on a store: this is the site where a shape
+    /// transition happens, and a transition is worth caching.
+    DefineValue {
+        obj: Register,
+        key: ConstIndex,
+        value: Register,
+        cache: CacheIndex,
+    },
 
     /// `dst = callee(args...)`, with the arguments in consecutive registers from `args`.
     ///
@@ -508,6 +563,8 @@ impl Op {
             Self::GetProp { key, .. }
             | Self::SetProp { key, .. }
             | Self::DeleteProp { key, .. }
+            | Self::DefineAccessor { key, .. }
+            | Self::DefineValue { key, .. }
             | Self::CallMethod { key, .. } => Some(key),
             _ => None,
         }
@@ -650,6 +707,18 @@ impl fmt::Display for Op {
             Self::DeleteProp { dst, obj, key } => {
                 write!(f, "delete_prop {dst}, {obj}, k{}", key.0)
             }
+            Self::DefineAccessor {
+                obj,
+                key,
+                value,
+                half,
+            } => write!(f, "define_accessor {obj}, k{}, {value}, {half}", key.0),
+            Self::DefineValue {
+                obj,
+                key,
+                value,
+                cache,
+            } => write!(f, "define_value {obj}, k{}, {value}, {cache}", key.0),
             Self::DeleteIndex { dst, obj, index } => {
                 write!(f, "delete_index {dst}, {obj}, {index}")
             }
