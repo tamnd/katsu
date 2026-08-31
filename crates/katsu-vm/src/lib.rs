@@ -100,6 +100,7 @@ pub struct Isolate {
     heap: BumpHeap,
     atoms: AtomTable,
     object_prototype: Option<ObjectRef>,
+    function_prototype: Option<ObjectRef>,
     roots: HashMap<u32, ShapeRef>,
     globals: Globals,
     natives: Natives,
@@ -112,6 +113,7 @@ impl fmt::Debug for Isolate {
             .field("heap_used", &self.heap.cursor())
             .field("atoms", &self.atoms.len())
             .field("has_object_prototype", &self.object_prototype.is_some())
+            .field("has_function_prototype", &self.function_prototype.is_some())
             .field("root_shapes", &self.roots.len())
             .field("globals", &self.globals.len())
             .field("natives", &self.natives)
@@ -132,6 +134,7 @@ impl Isolate {
             heap: BumpHeap::new()?,
             atoms: AtomTable::new(),
             object_prototype: None,
+            function_prototype: None,
             roots: HashMap::new(),
             globals: Globals::new(),
             natives: Natives::new(),
@@ -259,6 +262,30 @@ impl Isolate {
         let bare = self.root_shape_for(None)?;
         let object = ObjectRef::new(&mut self.heap, bare, 0)?;
         self.object_prototype = Some(object);
+        Some(object)
+    }
+
+    /// The object every function in this realm inherits from.
+    ///
+    /// It is where `call`, `apply` and `bind` will live, and today it is empty and still worth
+    /// having, because it is what makes the prototype chain of a function the right shape before
+    /// there is anything on it to find. It inherits from `Object.prototype`, which is why a
+    /// function answers `hasOwnProperty`.
+    ///
+    /// Not callable, which is the one thing the specification says about it that this does not do.
+    /// `Function.prototype` is a function that takes any arguments and returns `undefined`, and
+    /// making it one means a value that is both an ordinary object and callable, which is the same
+    /// piece of work as `Function` itself. Written down here rather than discovered by a test.
+    ///
+    /// Returns `None` if the heap is full.
+    pub fn function_prototype(&mut self) -> Option<ObjectRef> {
+        if let Some(object) = self.function_prototype {
+            return Some(object);
+        }
+        let above = self.object_prototype()?;
+        let shape = self.root_shape_for(Some(above))?;
+        let object = ObjectRef::new(&mut self.heap, shape, 0)?;
+        self.function_prototype = Some(object);
         Some(object)
     }
 

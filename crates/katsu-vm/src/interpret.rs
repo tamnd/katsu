@@ -489,10 +489,12 @@ impl Interpreter {
             return string.to_utf8_lossy(self.isolate.cage()).into_owned();
         }
         if let Some(closure) = self.as_closure(value) {
-            return self.function_text(closure);
+            let base = self.function_text(closure);
+            return self.callable_text(value, base, inspect::DEPTH, 0, &mut Cycles::default());
         }
         if let Some(native) = self.as_native(value) {
-            return self.native_text(native);
+            let base = self.native_text(native);
+            return self.callable_text(value, base, inspect::DEPTH, 0, &mut Cycles::default());
         }
         if let Some(object) = self.as_object(value) {
             // A fresh cycle set per printed value, because the numbering restarts for each one.
@@ -1428,12 +1430,11 @@ impl Interpreter {
                     pc = frame.return_pc as usize;
                 }
 
-                // The operation the whole architecture is judged on, in the form it has before there
-                // is a cache to fill. The cache operand is carried and ignored: there is a shape to
-                // compare against now, which is the thing that was missing, and filling it is the
-                // next piece of work rather than this one. What it costs until then is that every
-                // read walks the shape chain, which is the cost the module documentation in
-                // `shape.rs` is explicit about.
+                // The operation the whole architecture is judged on. A hit is a shape comparison and
+                // a load, and a miss walks the shape chain once and leaves behind what the next
+                // pass through will hit on. The object being read from is the value itself for
+                // everything a program makes with `{}`, and for a function it is the object the
+                // function keeps its properties in, which caches exactly the same way.
                 Op::GetProp {
                     dst,
                     obj,
@@ -1442,7 +1443,7 @@ impl Interpreter {
                 } => {
                     let object = self.stack.get(obj);
                     let site = Site::new(&unit.function(function).caches, cache);
-                    let probe = self.probe(object);
+                    let probe = guard!(self.holder(object));
                     if let Some(value) = self.cached(probe, site) {
                         self.stack.set(dst, value);
                         continue;
@@ -1486,47 +1487,55 @@ impl Interpreter {
                     if object.is_nullish() {
                         raise!(Self::nothing_to_write(object, blueprint, key));
                     }
-                    match self.as_object(object) {
-                        Some(target) => match guard!(self.assign(target, name, new)) {
-                            Wrote::Yes => {}
-                            Wrote::Refused if blueprint.strict => {
-                                raise!(self.read_only(target, blueprint, key));
+                    // The object test is written out here rather than hidden behind a helper that
+                    // answers for both cases, because a store to an ordinary object is the common
+                    // one by a wide margin and putting anything in front of it is measurable. A
+                    // function is asked about only once the answer is already known not to be an
+                    // ordinary object.
+                    let target = match self.as_object(object) {
+                        Some(target) => target,
+                        None => match guard!(self.function_object(object)) {
+                            Some(target) => target,
+                            None if blueprint.strict => {
+                                raise!(self.nowhere_to_write(object, blueprint, key));
                             }
-                            Wrote::NoSetter if blueprint.strict => {
-                                raise!(self.only_a_getter(target, blueprint, key));
-                            }
-                            Wrote::Refused | Wrote::NoSetter => {}
-                            // A write that is a call. The one argument is the value being assigned,
-                            // which is already in a register, so it is passed where it sits. The
-                            // answer goes nowhere: a setter's return value is specified to be
-                            // discarded, and the value of the assignment expression is the value
-                            // that went in rather than anything the setter said about it.
-                            Wrote::Setter(setter) => {
-                                let return_pc =
-                                    u32::try_from(pc).map_err(|_| Self::code_too_long())?;
-                                let call = Call {
-                                    target: setter,
-                                    receiver: object,
-                                    first: value,
-                                    passed: 1,
-                                    return_to: Register::NOWHERE,
-                                    return_pc,
-                                };
-                                match guard!(self.enter(call, unit)) {
-                                    Entered::Frame { index, callee } => {
-                                        function = index;
-                                        blueprint = callee;
-                                        constants = unit.function(index).constants.as_slice();
-                                        pc = 0;
-                                    }
-                                    Entered::Answered(_) => {}
-                                }
-                            }
+                            None => continue,
                         },
-                        None if blueprint.strict => {
-                            raise!(self.nowhere_to_write(object, blueprint, key));
+                    };
+                    match guard!(self.assign(target, name, new)) {
+                        Wrote::Yes => {}
+                        Wrote::Refused if blueprint.strict => {
+                            raise!(self.read_only(target, blueprint, key));
                         }
-                        None => {}
+                        Wrote::NoSetter if blueprint.strict => {
+                            raise!(self.only_a_getter(target, blueprint, key));
+                        }
+                        Wrote::Refused | Wrote::NoSetter => {}
+                        // A write that is a call. The one argument is the value being assigned,
+                        // which is already in a register, so it is passed where it sits. The
+                        // answer goes nowhere: a setter's return value is specified to be
+                        // discarded, and the value of the assignment expression is the value
+                        // that went in rather than anything the setter said about it.
+                        Wrote::Setter(setter) => {
+                            let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                            let call = Call {
+                                target: setter,
+                                receiver: object,
+                                first: value,
+                                passed: 1,
+                                return_to: Register::NOWHERE,
+                                return_pc,
+                            };
+                            match guard!(self.enter(call, unit)) {
+                                Entered::Frame { index, callee } => {
+                                    function = index;
+                                    blueprint = callee;
+                                    constants = unit.function(index).constants.as_slice();
+                                    pc = 0;
+                                }
+                                Entered::Answered(_) => {}
+                            }
+                        }
                     }
                 }
 
@@ -1582,7 +1591,7 @@ impl Interpreter {
                 } => {
                     let object = self.stack.get(obj);
                     let site = Site::new(&unit.function(function).caches, cache);
-                    let probe = self.probe(object);
+                    let probe = guard!(self.holder(object));
                     let target = if let Some(value) = self.cached(probe, site) {
                         value
                     } else {
@@ -1900,11 +1909,11 @@ impl Interpreter {
     /// The one place a value becomes an object with properties on it.
     ///
     /// The check is that the first word holds a shape, which is one tag test on a word the property
-    /// read is about to load anyway. Strings and functions have properties in the language and do
-    /// not have them here, because those properties live on `String.prototype` and
-    /// `Function.prototype`, and a primitive reaching its prototype means the wrapper conversion
-    /// that is still ahead. Prototype chains themselves work: it is the two prototypes that do not
-    /// exist, not the mechanism.
+    /// read is about to load anyway. Strings do not answer here, because their properties live on
+    /// `String.prototype` and a primitive reaching its prototype means the wrapper conversion that
+    /// is still ahead. Functions do not answer here either, and they do have properties: theirs are
+    /// on an object of their own that [`Interpreter::holder`] reaches, because a function is a
+    /// different kind in this heap and its own first word is a tag rather than a shape.
     fn as_object(&self, value: Value) -> Option<ObjectRef> {
         let slot = value.to_slot(self.isolate.cage())?;
         match HeapKind::of(self.isolate.cage(), slot)? {
@@ -1917,6 +1926,146 @@ impl Interpreter {
             | HeapKind::Properties
             | HeapKind::AccessorPair => None,
         }
+    }
+
+    /// The object a property access on `value` actually reads from and writes to, and its shape.
+    ///
+    /// For everything a program makes with `{}` that is the value itself, and this is [`probe`]
+    /// under another name. For a function it is the object the function keeps its properties in,
+    /// built here the first time anybody asks. A function that is only ever called never reaches
+    /// this and never pays for it, which is why the field starts empty rather than being filled in
+    /// when the closure is made.
+    ///
+    /// The shape comes back with the object because the caller is about to compare it against an
+    /// inline cache, and that means a site reading `Foo.prototype` caches exactly as a site reading
+    /// `o.x` does. The guard is the properties object's shape rather than the function's, which is
+    /// correct for the same reason the rest of the cache is: two functions have two properties
+    /// objects, and two objects with the same shape have the same properties in the same places.
+    ///
+    /// The probe is inline and the rest is not, so a read from an ordinary object compiles to what
+    /// it compiled to before a function could hold properties, and the function case is a call out
+    /// to code that is allowed to be as slow as it likes.
+    ///
+    /// [`probe`]: Interpreter::probe
+    #[inline]
+    fn holder(&mut self, value: Value) -> Result<Option<(ObjectRef, u32)>, RuntimeError> {
+        if let Some(found) = self.probe(value) {
+            return Ok(Some(found));
+        }
+        self.function_holder(value)
+    }
+
+    /// The cold half of [`Interpreter::holder`]: what is being read from is not an ordinary object.
+    #[cold]
+    #[inline(never)]
+    fn function_holder(&mut self, value: Value) -> Result<Option<(ObjectRef, u32)>, RuntimeError> {
+        let Some(properties) = self.function_object(value)? else {
+            return Ok(None);
+        };
+        Ok(Some((properties, properties.guard(self.isolate.cage()))))
+    }
+
+    /// The object holding a function's properties, built on first use.
+    ///
+    /// Answers `None` for anything that is not a function, which is how [`Interpreter::holder`]
+    /// tells a function apart from a number without asking the kind word twice.
+    ///
+    /// A closure gets a `prototype` at the same time, because a function somebody is reading
+    /// properties off is usually a constructor and building it now saves a second lazy check on
+    /// every later read. That object is the one `new` will hang the instance off, and its
+    /// `constructor` points back at the function, which is the cycle every JavaScript program relies
+    /// on and reads as `Foo.prototype.constructor === Foo`.
+    ///
+    /// A native gets no `prototype`, because nothing written in Rust is constructible yet. When
+    /// `Object` and `Array` become real constructors that stops being true and this is where it
+    /// changes.
+    #[cold]
+    #[inline(never)]
+    fn function_object(&mut self, value: Value) -> Result<Option<ObjectRef>, RuntimeError> {
+        if let Some(closure) = self.as_closure(value) {
+            if let Some(properties) = closure.properties(self.isolate.cage()) {
+                return Ok(Some(properties));
+            }
+            let properties = self.new_function_object(1)?;
+            closure.set_properties(self.isolate.heap_mut(), properties);
+            self.install_prototype(properties, value)?;
+            return Ok(Some(properties));
+        }
+        if let Some(native) = self.as_native(value) {
+            if let Some(properties) = native.properties(self.isolate.cage()) {
+                return Ok(Some(properties));
+            }
+            let properties = self.new_function_object(0)?;
+            native.set_properties(self.isolate.heap_mut(), properties);
+            return Ok(Some(properties));
+        }
+        Ok(None)
+    }
+
+    /// An empty object that inherits from `Function.prototype`, with room for `properties` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for the object, the root shape
+    /// or `Function.prototype` itself, which is built by the first function anybody reads from.
+    fn new_function_object(&mut self, properties: u32) -> Result<ObjectRef, RuntimeError> {
+        let above = self
+            .isolate
+            .function_prototype()
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let shape = self
+            .isolate
+            .root_shape_for(Some(above))
+            .ok_or(RuntimeError::OutOfMemory)?;
+        ObjectRef::new(self.isolate.heap_mut(), shape, properties).ok_or(RuntimeError::OutOfMemory)
+    }
+
+    /// Give a function a `prototype`, and give that prototype a `constructor`.
+    ///
+    /// The flags are the ones a function declaration gets and they are not the default. `prototype`
+    /// is writable so that `Foo.prototype = something` works, and neither enumerable nor
+    /// configurable, so it does not show up in a `for in` over the function and cannot be deleted.
+    /// `constructor` is writable and configurable and not enumerable, which is what every method a
+    /// realm installs gets. Both were read off node rather than remembered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::OutOfMemory`] if the heap has no room for either object, either name
+    /// or either shape transition.
+    fn install_prototype(
+        &mut self,
+        properties: ObjectRef,
+        function: Value,
+    ) -> Result<(), RuntimeError> {
+        let prototype = self.new_object(1)?;
+        let constructor = self
+            .isolate
+            .intern("constructor")
+            .ok_or(RuntimeError::OutOfMemory)?
+            .as_string();
+        prototype
+            .define(
+                self.isolate.heap_mut(),
+                constructor,
+                function.to_bits(),
+                Attributes::BUILTIN,
+            )
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let name = self
+            .isolate
+            .intern("prototype")
+            .ok_or(RuntimeError::OutOfMemory)?
+            .as_string();
+        let value = Value::from_slot(prototype.slot(), self.isolate.cage());
+        properties
+            .define(
+                self.isolate.heap_mut(),
+                name,
+                value.to_bits(),
+                Attributes::new(true, false, false),
+            )
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(())
     }
 
     /// Leave the dispatch loop and run some Rust.
@@ -2577,11 +2726,41 @@ impl Interpreter {
             };
         }
         cycles.enter(slot);
-        let entries: Vec<String> = names
-            .into_iter()
+        let entries = self.entries_of(object, &names, depth, indent, cycles);
+        cycles.leave();
+        // Read after the walk and not before it, because whether anything points back at this
+        // object is only known once everything under it has been printed.
+        let base = match (cycles.assigned(slot), tag) {
+            (Some(number), "") => inspect::reference(number),
+            (Some(number), tag) => format!("{} {tag}", inspect::reference(number)),
+            (None, tag) => tag.to_owned(),
+        };
+        inspect::braces(&entries, indent, &base)
+    }
+
+    /// One `name: value` for each property, which is the inside of a printed object.
+    ///
+    /// Split out from [`Interpreter::object_text`] because a function prints its properties in the
+    /// same braces with something other than a back reference in front of them, and the two would
+    /// otherwise be the same forty lines written twice.
+    ///
+    /// The walk into each value has already been guarded by the caller, which entered the object
+    /// holding them into the cycle set. Doing it here instead would enter the wrong object for a
+    /// function, whose properties live somewhere the program cannot name.
+    fn entries_of(
+        &self,
+        object: ObjectRef,
+        names: &[(StringRef, u32, Attributes)],
+        depth: u32,
+        indent: usize,
+        cycles: &mut Cycles,
+    ) -> Vec<String> {
+        let cage = self.isolate.cage();
+        names
+            .iter()
             .map(|(name, index, attributes)| {
                 let value = object
-                    .value_at(cage, index)
+                    .value_at(cage, *index)
                     .expect("a name at this index means there is a value at it");
                 let key = inspect::key(&name.to_utf8_lossy(cage));
                 // An accessor prints as what it is rather than as what it would say, because
@@ -2610,14 +2789,54 @@ impl Interpreter {
                 );
                 format!("{key}: {value}")
             })
-            .collect();
+            .collect()
+    }
+
+    /// The text `console.log` prints for a function, with anything hung off it in braces after it.
+    ///
+    /// `[Function: Foo]` on its own until somebody writes `Foo.x = 1`, and `[Function: Foo] { x: 1 }`
+    /// after they do, which is what node prints. Only the enumerable own properties, so `prototype`
+    /// and `constructor` are not in there, which is why a function that has been read from but not
+    /// written to still prints the way it always did.
+    ///
+    /// The cycle set is entered on the function rather than on the object its properties live in.
+    /// `Foo.self = Foo` is a cycle a program can write and it has to be reported against the name a
+    /// program can see, and entering the properties object would let the walk come back round
+    /// through the function and never stop.
+    fn callable_text(
+        &self,
+        value: Value,
+        base: String,
+        depth: u32,
+        indent: usize,
+        cycles: &mut Cycles,
+    ) -> String {
+        let Some(slot) = value.to_slot(self.isolate.cage()) else {
+            return base;
+        };
+        if cycles.inside(slot) {
+            return inspect::circular(cycles.number(slot));
+        }
+        let properties = self
+            .as_closure(value)
+            .and_then(|closure| closure.properties(self.isolate.cage()))
+            .or_else(|| {
+                self.as_native(value)
+                    .and_then(|native| native.properties(self.isolate.cage()))
+            });
+        let Some(properties) = properties else {
+            return base;
+        };
+        let names = properties.enumerable(self.isolate.cage());
+        if names.is_empty() || depth == 0 {
+            return base;
+        }
+        cycles.enter(slot);
+        let entries = self.entries_of(properties, &names, depth, indent, cycles);
         cycles.leave();
-        // Read after the walk and not before it, because whether anything points back at this
-        // object is only known once everything under it has been printed.
-        let base = match (cycles.assigned(slot), tag) {
-            (Some(number), "") => inspect::reference(number),
-            (Some(number), tag) => format!("{} {tag}", inspect::reference(number)),
-            (None, tag) => tag.to_owned(),
+        let base = match cycles.assigned(slot) {
+            Some(number) => format!("{} {base}", inspect::reference(number)),
+            None => base,
         };
         inspect::braces(&entries, indent, &base)
     }
@@ -2632,6 +2851,17 @@ impl Interpreter {
         }
         if let Some(object) = self.as_object(value) {
             return self.object_text(object, depth, indent, cycles);
+        }
+        // A function nested inside something being printed shares that walk's cycle set, which is
+        // what makes `let o = {f: function () {}}; o.f.o = o` print a back reference rather than
+        // recursing until the stack runs out.
+        if let Some(closure) = self.as_closure(value) {
+            let base = self.function_text(closure);
+            return self.callable_text(value, base, depth, indent, cycles);
+        }
+        if let Some(native) = self.as_native(value) {
+            let base = self.native_text(native);
+            return self.callable_text(value, base, depth, indent, cycles);
         }
         self.display(value)
     }
@@ -5985,6 +6215,116 @@ mod tests {
         let mut interpreter = realm();
         let empty = interpreter.host_object(&[]).expect("should have room");
         assert_eq!(interpreter.display(empty), "{}");
+    }
+
+    #[test]
+    fn a_property_written_on_a_function_reads_back_off_it() {
+        assert_eq!(evaluate_number("function f() {} f.x = 41; f.x + 1"), 42.0);
+    }
+
+    #[test]
+    fn a_property_a_function_was_never_given_is_undefined_rather_than_an_error() {
+        assert_eq!(evaluate_display("function f() {} f.x"), "undefined");
+    }
+
+    #[test]
+    fn a_function_has_a_prototype_that_points_back_at_it() {
+        // The cycle every constructor in every program relies on, and the reason a function needs a
+        // properties object at all.
+        assert_eq!(
+            evaluate_display("function Foo() {} Foo.prototype.constructor === Foo"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn two_functions_get_a_prototype_each() {
+        assert_eq!(
+            evaluate_display("function Foo() {} function Bar() {} Foo.prototype === Bar.prototype"),
+            "false"
+        );
+    }
+
+    #[test]
+    fn a_prototype_can_be_written_over_because_it_is_writable() {
+        // Writable, and neither enumerable nor configurable. This is the half of those flags a
+        // program can see today, and node answers 5 here too.
+        assert_eq!(
+            evaluate_number("function Foo() {} Foo.prototype = 5; Foo.prototype"),
+            5.0
+        );
+    }
+
+    #[test]
+    fn a_method_hung_off_a_prototype_reads_back_off_it() {
+        assert_eq!(
+            evaluate_number(
+                "function Foo() {}\n\
+                 Foo.prototype.answer = function () { return 42; };\n\
+                 Foo.prototype.answer();"
+            ),
+            42.0
+        );
+    }
+
+    #[test]
+    fn a_function_prints_what_was_hung_off_it_and_not_its_prototype() {
+        // `node -e "function Foo() {}; Foo.x = 1; console.log(Foo)"` writes the first of these.
+        // `prototype` is there in both runtimes and shows in neither, because it is not enumerable.
+        assert_eq!(
+            evaluate_value("function Foo() {} Foo.x = 1;", "Foo"),
+            "[Function: Foo] { x: 1 }"
+        );
+        assert_eq!(
+            evaluate_value("function Foo() {} Foo.prototype.x = 1;", "Foo"),
+            "[Function: Foo]"
+        );
+    }
+
+    #[test]
+    fn a_function_that_holds_itself_prints_the_way_node_marks_a_cycle() {
+        // The mark goes on the function rather than on the object its properties live in, because
+        // the properties object is an implementation detail that no program can name.
+        assert_eq!(
+            evaluate_value("function Foo() {} Foo.self = Foo;", "Foo"),
+            "<ref *1> [Function: Foo] { self: [Circular *1] }"
+        );
+    }
+
+    #[test]
+    fn a_function_inside_an_object_prints_its_properties_too() {
+        assert_eq!(
+            evaluate_value("function Foo() {} Foo.x = 1; var o = { f: Foo };", "o"),
+            "{ f: [Function: Foo] { x: 1 } }"
+        );
+    }
+
+    #[test]
+    fn a_function_that_is_only_called_never_pays_for_a_properties_object() {
+        // The whole reason the field starts empty. Reading the field rather than the heap size
+        // because the heap size moves whenever anything else in the program allocates.
+        let mut interpreter = Interpreter::new().expect("should reserve a stack");
+        let value = interpreter
+            .run(&as_expression(
+                "function id(v) { return v; } function f() { return 1; } f(); f(); id(f)",
+            ))
+            .expect("should not throw");
+        let closure = interpreter.as_closure(value).expect("should be a closure");
+        assert!(closure.properties(interpreter.isolate.cage()).is_none());
+        interpreter.holder(value).expect("should have room");
+        assert!(closure.properties(interpreter.isolate.cage()).is_some());
+    }
+
+    #[test]
+    fn a_function_written_in_rust_carries_properties_the_same_way() {
+        // A native has no `prototype`, because nothing written in Rust is constructible yet, so an
+        // empty one prints as bare as it did before it could hold anything.
+        assert_eq!(hosted_display("host.log.tag = 'x'; host.log.tag"), "x");
+        let mut interpreter = hosted();
+        let value = interpreter
+            .run(&as_expression("function id(v) { return v; } id(host.log)"))
+            .expect("should not throw");
+        assert_eq!(interpreter.display(value), "[Function: log]");
     }
 
     // The binary operators as functions, so that a table driven test can name one without writing
