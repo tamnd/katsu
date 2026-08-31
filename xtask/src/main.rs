@@ -27,6 +27,16 @@ enum Task {
     Bench(BenchArgs),
     /// List the reference machines and say whether each one is reachable.
     Machines,
+    /// Check that the workspace is in a state crates.io will accept.
+    Release(ReleaseArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ReleaseArgs {
+    /// The tag being released, so that `v0.1.7` and a workspace at 0.1.6 is a failure rather
+    /// than a release of the wrong version. Omitted outside the release workflow.
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -75,6 +85,13 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    version: String,
+    description: Option<String>,
+    license: Option<String>,
+    readme: Option<String>,
+    /// The registries this crate may go to. `None` is every registry, and an empty list is
+    /// `publish = false`, which is how cargo says a crate stays in this repository.
+    publish: Option<Vec<String>>,
     dependencies: Vec<Dependency>,
 }
 
@@ -82,6 +99,11 @@ struct Package {
 struct Dependency {
     name: String,
     kind: Option<String>,
+    /// The version requirement as cargo parsed it, so `version = "0.1.6"` arrives as `^0.1.6`.
+    req: String,
+    /// Set for a dependency that names a directory. Every edge between two crates in this
+    /// workspace has one, and nothing outside the workspace does.
+    path: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -102,6 +124,7 @@ fn run() -> Result<()> {
             list_machines();
             Ok(())
         }
+        Task::Release(args) => check_release(args.tag.as_deref()),
     }
 }
 
@@ -416,9 +439,8 @@ fn git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn check_layers() -> Result<()> {
-    let ranks: BTreeMap<&str, u8> = LAYERS.iter().copied().collect();
-
+/// The workspace as cargo sees it, which is the only description of it that cannot drift.
+fn metadata() -> Result<Metadata> {
     let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .output()
@@ -429,8 +451,12 @@ fn check_layers() -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let metadata: Metadata =
-        serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
+    serde_json::from_slice(&output.stdout).context("parsing cargo metadata")
+}
+
+fn check_layers() -> Result<()> {
+    let ranks: BTreeMap<&str, u8> = LAYERS.iter().copied().collect();
+    let metadata = metadata()?;
 
     let mut violations = Vec::new();
     let mut checked = 0usize;
@@ -484,6 +510,126 @@ fn check_layers() -> Result<()> {
          and it is a rule, not a suggestion.",
         violations.len()
     )
+}
+
+/// Check that the workspace is in a state crates.io will accept.
+///
+/// A publish is the one operation in this repository that cannot be taken back. A version on
+/// crates.io can be yanked but never replaced, so every mistake worth catching has to be caught
+/// before the upload rather than after it, and the release workflow runs this before it publishes
+/// anything. Every rule here is one that produced a bad release somewhere else first.
+///
+/// The version an internal dependency asks for is the rule that matters most. Cargo resolves a
+/// path dependency by path when it builds the workspace and by version when somebody else builds
+/// the published crate, so a stale version requirement is invisible here and wrong everywhere
+/// else. Requiring it to be exactly the version being released means the two resolutions cannot
+/// disagree.
+fn check_release(tag: Option<&str>) -> Result<()> {
+    let metadata = metadata()?;
+    let members: Vec<&Package> = metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .collect();
+    let names: Vec<&str> = members
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+
+    // An empty registry list is `publish = false`. Those crates are the tools and the repository
+    // automation, they are not part of the product, and they are checked only for the one thing
+    // that would break the publish of everything else.
+    let (published, held): (Vec<&&Package>, Vec<&&Package>) = members
+        .iter()
+        .partition(|package| package.publish.as_ref().is_none_or(|to| !to.is_empty()));
+    if published.is_empty() {
+        bail!("no crate in this workspace is publishable, which cannot be right");
+    }
+
+    let mut problems = Vec::new();
+
+    // One version across the workspace, because the crates are released in lockstep and a reader
+    // who sees katsu 0.1.7 has no way to know which katsu-vm went into it otherwise.
+    let version = published[0].version.clone();
+    for package in &published {
+        if package.version != version {
+            problems.push(format!(
+                "{} is at {} and {} is at {}, and the workspace releases in lockstep",
+                package.name, package.version, published[0].name, version
+            ));
+        }
+        // crates.io rejects an upload without either of these, and finding that out from a failed
+        // release job means the tag is already pushed.
+        if package
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            problems.push(format!("{} has no description", package.name));
+        }
+        if package.license.as_deref().unwrap_or("").trim().is_empty() {
+            problems.push(format!("{} has no license", package.name));
+        }
+        // Not required by the registry, and the crates.io page for a crate without one is a
+        // title and a single sentence, which is not what somebody deciding whether to depend
+        // on this needs to see.
+        if package.readme.as_deref().unwrap_or("").trim().is_empty() {
+            problems.push(format!("{} has no readme", package.name));
+        }
+    }
+
+    let wanted = format!("^{version}");
+    for package in &published {
+        for dependency in &package.dependencies {
+            if dependency.kind.as_deref() == Some("dev") || dependency.path.is_none() {
+                continue;
+            }
+            if !names.contains(&dependency.name.as_str()) {
+                continue;
+            }
+            if held.iter().any(|held| held.name == dependency.name) {
+                problems.push(format!(
+                    "{} depends on {}, which is not published, so the upload would not resolve",
+                    package.name, dependency.name
+                ));
+            }
+            if dependency.req != wanted {
+                problems.push(format!(
+                    "{} asks for {} {} and the workspace is at {version}",
+                    package.name, dependency.name, dependency.req
+                ));
+            }
+        }
+    }
+
+    // The tag is what triggers the release, so it is the one input nothing else can check.
+    if let Some(tag) = tag {
+        let expected = format!("v{version}");
+        if tag != expected {
+            problems.push(format!(
+                "the tag is {tag} and the workspace is at {version}, which would publish {expected}"
+            ));
+        }
+    }
+
+    if !problems.is_empty() {
+        for problem in &problems {
+            eprintln!("  {problem}");
+        }
+        bail!(
+            "{} problem(s) between this workspace and crates.io",
+            problems.len()
+        );
+    }
+
+    println!(
+        "release: {} crates at {version}, {} held back, ready to publish",
+        published.len(),
+        held.len()
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -156,6 +156,34 @@ jobs:
           node-version: "26"
       - run: cargo run --release -p differential -- --count 2000 --seed 0
 
+  # A publish cannot be taken back, so everything about it that can be checked without a tag is
+  # checked on every commit. The failure this is really guarding against is a crate that only
+  # builds because the crate it depends on is a directory next to it, which is invisible in a
+  # workspace build and breaks for the first person who runs `cargo add katsu-runtime`.
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo run -p xtask -- release
+      - name: Ask crates.io whether this version is already published
+        id: published
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "katsu") | .version')
+          if curl -sfo /dev/null -A "katsu ci" "https://crates.io/api/v1/crates/katsu/$version"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Skipped between a release and the version bump that follows it, because cargo cannot
+      # package a version that is already on the registry. The check above is what decides,
+      # rather than a rule about which branch this is.
+      - name: Package every crate as crates.io would
+        if: steps.published.outputs.exists != 'true'
+        run: cargo publish --workspace --dry-run --locked
+
   supply-chain:
     name: Supply chain
     runs-on: ubuntu-latest
