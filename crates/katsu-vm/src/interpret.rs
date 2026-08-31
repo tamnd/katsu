@@ -1708,27 +1708,7 @@ impl Interpreter {
                         raise!(self.cannot_construct(target));
                     };
                     let site = Site::new(&unit.function(function).caches, cache);
-                    let probe = guard!(self.holder(target));
-                    let prototype = if let Some(value) = self.cached(probe, site) {
-                        value
-                    } else {
-                        let name = self.name_at(constants, key);
-                        match guard!(self.property(target, probe, name, site, blueprint, key)) {
-                            Found::Value(value) => value,
-                            // `Foo.prototype` as an accessor is the same wall a method call hits
-                            // when the method is a getter, and it is here for the same reason: the
-                            // loop has nowhere to keep a call that is waiting on another call.
-                            Found::Getter(_) => {
-                                raise!(RuntimeError::Unsupported(
-                                    "reading 'prototype' to construct means calling a getter, and \
-                                     the interpreter has nowhere to keep a call that is waiting on \
-                                     another call"
-                                        .to_owned()
-                                ));
-                            }
-                        }
-                    };
-                    let this = guard!(self.new_instance(prototype));
+                    let this = guard!(self.instance_for(target, site, constants, key, blueprint));
                     // On top of the function, which is the register lowering set aside for it, and
                     // which `construct_result` reads once the call has returned.
                     self.stack.set(callee, this);
@@ -2211,6 +2191,57 @@ impl Interpreter {
         }
         let text = self.display(target);
         RuntimeError::Type(format!("{text} is not a constructor"))
+    }
+
+    /// Everything a `new` does before the call: read `prototype` off the function and build the
+    /// object that the constructor will be run on.
+    ///
+    /// It is out of line and that is the point of it. The dispatch loop is one function, so
+    /// everything written inside an arm competes for registers with every other arm, and a body
+    /// this size is paid for by the opcodes around it rather than by the one it belongs to.
+    /// Measured on gamingpc, having it inline cost 5 percent on `call/call_return` and 8 percent on
+    /// `call/closure_call`, neither of which constructs anything. One call per `new`, next to an
+    /// allocation that costs far more, does not show up beside that.
+    ///
+    /// The read goes through the same inline cache a `get_prop` would, because a constructor called
+    /// in a loop reads the same property off the same function every turn, which is what a cache is
+    /// for. It builds the function's properties object rather than merely looking for it, because a
+    /// function nobody has read a property off has no `prototype` yet and this is a read a program
+    /// asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the read of `prototype` and the allocation return, and
+    /// [`RuntimeError::Unsupported`] when `prototype` turns out to be an accessor.
+    #[inline(never)]
+    fn instance_for(
+        &mut self,
+        target: Value,
+        site: Site,
+        constants: &[Value],
+        key: katsu_ir::ConstIndex,
+        blueprint: &FunctionBlueprint,
+    ) -> Result<Value, RuntimeError> {
+        let probe = self.holder(target)?;
+        let prototype = if let Some(value) = self.cached(probe, site) {
+            value
+        } else {
+            let name = self.name_at(constants, key);
+            match self.property(target, probe, name, site, blueprint, key)? {
+                Found::Value(value) => value,
+                // `Foo.prototype` as an accessor is the same wall a method call hits when the
+                // method is a getter, and it is here for the same reason: the loop has nowhere to
+                // keep a call that is waiting on another call.
+                Found::Getter(_) => {
+                    return Err(RuntimeError::Unsupported(
+                        "reading 'prototype' to construct means calling a getter, and the \
+                         interpreter has nowhere to keep a call that is waiting on another call"
+                            .to_owned(),
+                    ));
+                }
+            }
+        };
+        self.new_instance(prototype)
     }
 
     /// The object a constructor is handed, built out of what its `prototype` property holds.
