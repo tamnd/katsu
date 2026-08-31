@@ -12,6 +12,8 @@ What failed is worth writing down rather than quietly correcting. The first rele
 
 `katsu-ir 0.1.7` stays on crates.io as the only piece of that tag. Yanking it would say the version is broken and it is not, it is simply alone, and the answer to a partial release is another release.
 
+The 0.1.8 upload got no further, and the reason is a second thing worth writing down. Waiting until the moment the rate limit message names is not enough, because the bucket charges a token for a request it refuses as well as for one it accepts: asking the second the deadline passes takes the refilled slot away from the attempt that would have used it, and the next deadline moves another ten minutes out. Three runs did that, one deadline at a time, and none of them got past the second crate. A publish now paces itself between new crate names instead of reacting to refusals, waits a whole refill period past the second deadline when it is refused twice, and shares one concurrency lane so two runs cannot spend the same allowance on each other. That fix is on main rather than in this tag, because a tag cannot be changed and a re-run of the release job runs the code as it was at the tag, so a manual `Publish crates` workflow runs the same publish from the default branch and finishing 0.1.8 goes through it. It ships as code in 0.1.9.
+
 The workload baseline for this release is measured against the 0.1.8 tarball rather than a local build, so it lands after the tag and is quoted in the pull request that follows this one, the same way 0.1.6 was done.
 
 ## 0.1.7

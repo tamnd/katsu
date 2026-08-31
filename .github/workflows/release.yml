@@ -111,6 +111,10 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
+    # Shared with the manual publish in crates.yml, so a release and somebody finishing an older
+    # one cannot spend the same rate limit allowance on each other's refusals.
+    concurrency:
+      group: crates-io
     # A first release of a workspace this size is mostly waiting. crates.io lets an account create
     # a burst of five crate names and then one every ten minutes, so fifteen new names take a little
     # over two hours of sitting still. Once the names exist the limit is the one for new versions,
@@ -122,8 +126,9 @@ jobs:
       # One command for fifteen crates. It runs the release check first, so a tag that does not
       # match the version in the tree stops here rather than publishing the previous version under
       # the new name, then uploads in dependency order, skips anything already on crates.io and
-      # waits out the rate limit rather than failing on it. Skipping is what makes a stopped run
-      # resumable by re-running the job, which cargo cannot do on its own.
+      # keeps to the pace the registry allows rather than asking early and being refused. Skipping
+      # is what makes a stopped run resumable by re-running the job, which cargo cannot do on its
+      # own.
       # The tag arrives through the environment rather than pasted into the command, because a
       # ref name is text somebody chose and text somebody chose does not belong in a shell line.
       - name: Publish

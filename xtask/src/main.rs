@@ -665,6 +665,25 @@ const MONTHS: [&str; 12] = [
 /// is never more than that plus a little, and a much longer one means the message was misread.
 const LONGEST_WAIT: Duration = Duration::from_mins(45);
 
+/// How long one crate may sit in the rate limit before the release stops rather than waits.
+///
+/// A wait that goes past this is not a queue any more. Two refills and a bit is enough for every
+/// shape of the limit we have actually seen, and something that outlasts it is an account level
+/// limit that no amount of patience clears, which is worth being told about rather than sitting
+/// through for the rest of the job's timeout.
+const LONGEST_STALL: Duration = Duration::from_mins(60);
+
+/// How often crates.io lets one account create a crate name that nobody has published before.
+///
+/// Published at <https://crates.io/docs/rate-limits> as a burst of five and then one every ten
+/// minutes. The limit for a new version of a crate that already exists is a burst of thirty and one
+/// a minute, which fifteen crates never come close to.
+const NEW_NAME_REFILL: Duration = Duration::from_mins(10);
+
+/// How far past a deadline to ask, so that a clock a second out of step is not the reason a release
+/// fails.
+const SLACK: Duration = Duration::from_secs(15);
+
 /// Upload every crate that is not on crates.io yet, in dependency order, one at a time.
 ///
 /// `cargo publish --workspace` is the better command and it is what CI dry runs, because it works
@@ -678,6 +697,9 @@ const LONGEST_WAIT: Duration = Duration::from_mins(45);
 /// This is slow on a first release and free afterwards. Once every name exists the limit is the
 /// one for new versions of existing crates, which is a burst of thirty, and fifteen crates never
 /// reach it.
+///
+/// The pace between new names is deliberate rather than reactive. See [`pace`] for what the
+/// registry taught us about asking early.
 fn publish(args: &PublishArgs) -> Result<()> {
     // Every rule this checks is one that cannot be undone once an upload has happened, so it runs
     // before the first one rather than being trusted from an earlier job.
@@ -702,6 +724,7 @@ fn publish(args: &PublishArgs) -> Result<()> {
 
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
+    let mut last_new_name: Option<SystemTime> = None;
     for package in order {
         if on_crates_io(&package.name, &package.version)? {
             println!(
@@ -711,15 +734,31 @@ fn publish(args: &PublishArgs) -> Result<()> {
             skipped += 1;
             continue;
         }
+        // A name nobody has published before is the expensive kind of upload, and it is worth one
+        // extra request to find out which kind this is, because the two limits are two orders of
+        // magnitude apart and pacing a new version the way a new name has to be paced would turn a
+        // two minute release into a two hour one.
+        let new_name = !name_on_crates_io(&package.name)?;
         if args.dry_run {
+            let kind = if new_name {
+                "a new name"
+            } else {
+                "a new version"
+            };
             println!(
-                "publish: {} {} would be uploaded",
+                "publish: {} {} would be uploaded, {kind}",
                 package.name, package.version
             );
             uploaded += 1;
             continue;
         }
+        if new_name && let Some(previous) = last_new_name {
+            pace(previous);
+        }
         upload(&package.name)?;
+        if new_name {
+            last_new_name = Some(SystemTime::now());
+        }
         uploaded += 1;
     }
 
@@ -801,9 +840,23 @@ fn publish_order<'a>(members: &[&'a Package]) -> Result<Vec<&'a Package>> {
 /// that is neither 200 nor 404 stops the release, since a registry that cannot answer the question
 /// is not a registry to start uploading to.
 fn on_crates_io(name: &str, version: &str) -> Result<bool> {
+    ask_crates_io(&format!("https://crates.io/api/v1/crates/{name}/{version}"))
+}
+
+/// Ask crates.io whether a crate name exists at all, whoever owns it.
+///
+/// This decides which of the two rate limits the upload is subject to, which decides how long to
+/// wait before the one after it. It is a different question from whether the version is there: a
+/// crate that stopped halfway through a release has some names taken and some free, and the free
+/// ones are the slow ones.
+fn name_on_crates_io(name: &str) -> Result<bool> {
+    ask_crates_io(&format!("https://crates.io/api/v1/crates/{name}"))
+}
+
+/// One question to the registry, answered as a yes or a no.
+fn ask_crates_io(url: &str) -> Result<bool> {
     // crates.io asks for one request a second and for a user agent that says who is calling.
     std::thread::sleep(Duration::from_secs(1));
-    let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
     let output = Command::new("curl")
         .args([
             "-s",
@@ -813,20 +866,56 @@ fn on_crates_io(name: &str, version: &str) -> Result<bool> {
             "%{http_code}",
             "-A",
             "katsu release automation (https://github.com/tamnd/katsu)",
-            &url,
+            url,
         ])
         .output()
         .context("running curl")?;
     match String::from_utf8_lossy(&output.stdout).trim() {
         "200" => Ok(true),
         "404" => Ok(false),
-        other => bail!("crates.io answered {other} for {name} {version}, which is not an answer"),
+        other => bail!("crates.io answered {other} for {url}, which is not an answer"),
     }
 }
 
+/// Wait for crates.io to refill the slot the next new crate name needs.
+///
+/// Waiting only when the registry says to is not enough, because a request it refuses costs the
+/// same token as one it accepts. Every attempt `v0.1.8` made the moment the message said it may
+/// moved the next deadline ten minutes further out, three runs in a row, and the only reading of
+/// the bucket in `rate_limiter.rs` that produces that is one where a refusal spends the token that
+/// had just arrived. Asking early does not only fail, it takes the slot away from the attempt after
+/// it, so a run that keeps asking never publishes anything again.
+///
+/// Ten minutes a crate is the rate the registry publishes, so this is the fastest a first release
+/// of a workspace this size can honestly go. Everything after the first release is a new version
+/// rather than a new name and none of this runs.
+fn pace(previous: SystemTime) {
+    let since = SystemTime::now()
+        .duration_since(previous)
+        .unwrap_or(Duration::ZERO);
+    let left = (NEW_NAME_REFILL + SLACK).saturating_sub(since);
+    if left.is_zero() {
+        return;
+    }
+    println!(
+        "publish: waiting {} seconds for crates.io to refill a new crate name slot",
+        left.as_secs()
+    );
+    std::thread::sleep(left);
+}
+
 /// Upload one crate, waiting out a rate limit rather than failing the release on one.
+///
+/// There is no attempt count, because a count is the wrong thing to spend: what the release can
+/// afford is time, and [`LONGEST_STALL`] says how much of it one crate may have. Giving up after
+/// three tries meant giving up thirty minutes into a limit that refills every ten, which is a
+/// failure with the answer already in sight.
 fn upload(name: &str) -> Result<()> {
-    for attempt in 1..=3 {
+    let mut before: Option<SystemTime> = None;
+    let mut waited = Duration::ZERO;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
         println!("publish: uploading {name}");
         let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args(["publish", "-p", name, "--locked"])
@@ -842,15 +931,23 @@ fn upload(name: &str) -> Result<()> {
         let Some(until) = rate_limited_until(&stderr) else {
             bail!("publishing {name} failed");
         };
-        let wait = until
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO)
-            + Duration::from_secs(15);
+        let wait = backoff(until, before, SystemTime::now());
+        before = Some(until);
         if wait > LONGEST_WAIT {
             bail!(
                 "crates.io asked us to wait {} minutes before uploading {name}, which is longer \
                  than a rate limit should ever be",
                 wait.as_secs() / 60
+            );
+        }
+        waited += wait;
+        if waited > LONGEST_STALL {
+            bail!(
+                "crates.io has refused {name} for {} minutes without letting it through, which is \
+                 longer than the limit it names takes to refill, so this is an account level limit \
+                 rather than a queue and waiting is not going to clear it. help@crates.io is the \
+                 address that raises one.",
+                waited.as_secs() / 60
             );
         }
         println!(
@@ -861,7 +958,31 @@ fn upload(name: &str) -> Result<()> {
         );
         std::thread::sleep(wait);
     }
-    bail!("publishing {name} kept hitting the crates.io rate limit")
+}
+
+/// How long to wait after a refusal, given the deadline crates.io just named and the one it named
+/// before it.
+///
+/// The first refusal is waited out to the deadline and no further, since the deadline is the
+/// registry's own answer to when the slot is there. A second refusal means the deadline was not the
+/// whole story, and the gap between the two is the refill period the registry is working to, so the
+/// wait after it is a whole period longer. That is what breaks the loop described in [`pace`]: two
+/// periods of not asking is what it takes to get back a token that repeated asking has been
+/// spending.
+///
+/// The period comes out of the two deadlines rather than a constant, because the same message
+/// carries both limits and they are ten minutes apart and one minute apart.
+fn backoff(until: SystemTime, before: Option<SystemTime>, now: SystemTime) -> Duration {
+    let extra = match before {
+        None => Duration::ZERO,
+        Some(before) => match until.duration_since(before) {
+            // A deadline that did not move says nothing about the period, so fall back to the
+            // slower of the two limits, which is the one a stuck release is always stuck on.
+            Ok(gap) if !gap.is_zero() => gap,
+            _ => NEW_NAME_REFILL,
+        },
+    };
+    until.duration_since(now).unwrap_or(Duration::ZERO) + extra + SLACK
 }
 
 /// The time crates.io said to try again, out of the message it says it in.
@@ -919,8 +1040,8 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
-        MACHINES, base64, days_since_epoch, http_date, machine, rate_limited_until, unix_script,
-        windows_script,
+        MACHINES, NEW_NAME_REFILL, SLACK, backoff, base64, days_since_epoch, http_date, machine,
+        rate_limited_until, unix_script, windows_script,
     };
 
     #[test]
@@ -1060,6 +1181,39 @@ mod tests {
         assert_eq!(
             rate_limited_until("error: failed to verify package tarball"),
             None
+        );
+    }
+
+    #[test]
+    fn the_first_refusal_is_waited_out_to_the_deadline_and_no_further() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_788_180_961);
+        let until = now + Duration::from_secs(200);
+        assert_eq!(backoff(until, None, now), Duration::from_secs(200) + SLACK);
+    }
+
+    #[test]
+    fn a_second_refusal_waits_a_whole_refill_longer() {
+        // The two deadlines v0.1.8 was given, ten minutes apart, and the moment the run asked
+        // again, which was fifteen seconds after the first of them and was refused for it.
+        let first = UNIX_EPOCH + Duration::from_secs(1_788_180_961);
+        let second = first + NEW_NAME_REFILL;
+        let now = first + SLACK;
+        // Five hundred and eighty five seconds to the second deadline, then ten minutes past it
+        // so that two refills have gone by rather than one, then the slack.
+        assert_eq!(
+            backoff(second, Some(first), now),
+            Duration::from_secs(585) + NEW_NAME_REFILL + SLACK
+        );
+    }
+
+    #[test]
+    fn a_deadline_the_registry_did_not_move_still_costs_a_refill() {
+        let deadline = UNIX_EPOCH + Duration::from_secs(1_788_180_961);
+        let now = deadline + Duration::from_secs(31);
+        // The deadline is already past, so all of the wait is the refill and the slack.
+        assert_eq!(
+            backoff(deadline, Some(deadline), now),
+            NEW_NAME_REFILL + SLACK
         );
     }
 
