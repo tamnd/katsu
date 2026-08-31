@@ -152,6 +152,60 @@ impl From<StackError> for RuntimeError {
     }
 }
 
+/// One of the error constructors the language defines, named so that a realm and the engine can
+/// agree on which prototype an error gets.
+///
+/// The engine raises three of these on its own and a program can build all seven, so the list is the
+/// language's rather than the interpreter's. It is an enum and not a string because the answer is
+/// looked up on the path where something has already gone wrong, and a hash of `"TypeError"` on the
+/// way out of a failing operation is work spent on the slow path of the slow path.
+///
+/// The prototype a kind names is the intrinsic one, captured when the realm was built. It is not the
+/// global of the same name, and the difference is observable: a program that writes `TypeError = 5`
+/// changes what its own `new TypeError` means and does not change what the engine throws, which is
+/// what Node does and what the specification says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorKind {
+    /// `Error`, the one the other six inherit from.
+    Error,
+    /// `TypeError`, which is most of what an engine raises.
+    Type,
+    /// `RangeError`, which a stack overflow is.
+    Range,
+    /// `ReferenceError`, which a name nobody bound is.
+    Reference,
+    /// `SyntaxError`, which the parser raises before anything runs.
+    Syntax,
+    /// `EvalError`, which nothing raises any more and which the language still defines.
+    Eval,
+    /// `URIError`, which the four URI functions raise.
+    Uri,
+}
+
+impl ErrorKind {
+    /// How many kinds there are, which is the size of the table a realm keeps.
+    pub(crate) const COUNT: usize = 7;
+
+    /// The name the constructor is bound to and the `name` its prototype carries.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            ErrorKind::Error => "Error",
+            ErrorKind::Type => "TypeError",
+            ErrorKind::Range => "RangeError",
+            ErrorKind::Reference => "ReferenceError",
+            ErrorKind::Syntax => "SyntaxError",
+            ErrorKind::Eval => "EvalError",
+            ErrorKind::Uri => "URIError",
+        }
+    }
+
+    /// Where this kind's prototype sits in a realm's table.
+    pub(crate) const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
 /// Where an unwind ended up: which function is running now, and where in it.
 ///
 /// Two numbers rather than the four variables the loop keeps, because the other two are derived
@@ -286,16 +340,37 @@ impl Interrupt {
 /// The isolate is behind a pointer and the stack is not. An isolate is two hundred and eighty bytes
 /// of heap bookkeeping that the dispatch loop only touches when a string is involved, and the stack
 /// is what every single instruction reads and writes. Holding the isolate inline makes the
-/// interpreter three hundred and forty four bytes instead of seventy two, and that measured slower
-/// on both reference machines: a move, the cheapest instruction there is, went from 0.86 ns to 1.07
-/// ns on a pinned 13900K and from 0.79 ns to 0.94 ns on an M4. Putting the stack first with
-/// `repr(C)` recovered almost none of it, so it is the size of the thing the loop holds and not the
-/// offsets inside it.
+/// interpreter three hundred and forty four bytes instead of eighty, and that measured slower on
+/// both reference machines: a move, the cheapest instruction there is, went from 0.86 ns to 1.07 ns
+/// on a pinned 13900K and from 0.79 ns to 0.94 ns on an M4. Putting the stack first with `repr(C)`
+/// recovered almost none of it, so it is the size of the thing the loop holds and not the offsets
+/// inside it.
+///
+/// Eighty and not seventy two because of the two small fields below. The first byte of them took the
+/// struct to its next multiple of eight and the second is free beside it, which is worth knowing
+/// before a third one is added: the next byte after these seven is another eight bytes of the thing
+/// the dispatch loop carries, and that is the size the measurement above says to be careful with.
 #[derive(Debug)]
 pub struct Interpreter {
     isolate: Box<Isolate>,
     stack: Stack,
     interrupt: Interrupt,
+    /// Whether the native running right now was reached by `new` rather than by a call.
+    ///
+    /// A native is handed the fresh object as its receiver, which is what makes one Rust function
+    /// serve seven error constructors, and a receiver alone cannot say how the call was written:
+    /// `new Error('x')` and `holder.Error('x')` both arrive with an object in it. The two differ,
+    /// because `Error` called as a method ignores what it was called on and answers with a new
+    /// error, so the difference has to be recorded somewhere and this is the cheapest place. It is
+    /// saved and restored around each native call rather than merely cleared, so that a native
+    /// reached by `new` that calls another native does not lie to the second one.
+    constructing: bool,
+    /// How many conversions to text are running one inside another.
+    ///
+    /// Free where it sits. The flag above it forced the interpreter up to its next multiple of eight
+    /// and left seven bytes of padding behind, so a counter that only a conversion ever reads costs
+    /// nothing to keep here rather than a pointer away on the isolate.
+    converting: u8,
 }
 
 impl Interpreter {
@@ -313,6 +388,8 @@ impl Interpreter {
             ),
             stack: Stack::new()?,
             interrupt: Interrupt::default(),
+            constructing: false,
+            converting: 0,
         })
     }
 
@@ -320,6 +397,17 @@ impl Interpreter {
     #[must_use]
     pub const fn isolate(&self) -> &Isolate {
         &self.isolate
+    }
+
+    /// Whether the native asking was reached by `new`.
+    ///
+    /// Only a constructor written in Rust needs this, and it needs it because the language treats
+    /// the two ways of reaching it differently: `new Error('x')` fills in the object it was handed
+    /// and `Error('x')` makes one of its own, and both of them answer with an error either way.
+    /// Anything else reading it is asking a question about its caller that it should not be asking.
+    #[must_use]
+    pub const fn called_with_new(&self) -> bool {
+        self.constructing
     }
 
     /// A handle another thread can use to stop this interpreter at its next back edge.
@@ -386,6 +474,68 @@ impl Interpreter {
         let native =
             NativeRef::new(self.isolate.heap_mut(), ordinal).ok_or(RuntimeError::OutOfMemory)?;
         Ok(Value::from_slot(native.slot(), self.isolate.cage()))
+    }
+
+    /// Make a function value whose body is Rust and which `new` is allowed to reach.
+    ///
+    /// The body is handed the fresh object as its receiver, built from this function's own
+    /// `prototype` property, so a constructor written in Rust fills an object in rather than making
+    /// one. That is what makes one Rust function serve seven error constructors: `new TypeError` and
+    /// `new RangeError` reach the same body with two different objects.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpreter::native_function`].
+    pub fn native_constructor(
+        &mut self,
+        name: &str,
+        call: crate::NativeFn,
+    ) -> Result<Value, RuntimeError> {
+        let ordinal = self
+            .isolate
+            .natives_mut()
+            .add_constructor(name, call)
+            .ok_or(RuntimeError::OutOfMemory)?;
+        let native =
+            NativeRef::new(self.isolate.heap_mut(), ordinal).ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(native.slot(), self.isolate.cage()))
+    }
+
+    /// The prototype an error of this kind is built with, or `None` on a realm with no error
+    /// constructors installed.
+    ///
+    /// This is the intrinsic and not the global, so a constructor written in Rust reaches the same
+    /// object whatever a program has done to the name it was bound to.
+    #[must_use]
+    pub fn error_prototype(&self, kind: ErrorKind) -> Option<Value> {
+        let object = self.isolate.error_prototype(kind)?;
+        Some(Value::from_slot(object.slot(), self.isolate.cage()))
+    }
+
+    /// Tell the realm which prototype an error of this kind is built with.
+    ///
+    /// Called once per kind while the standard library is installed. What the engine throws is built
+    /// from what is remembered here, so a realm that installs `Error` gets engine errors that are
+    /// instances of it and a realm that does not gets what it got before there were any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Type`] if the value is not an ordinary object, which is a mistake in
+    /// the embedder rather than in a program: a prototype is an object and nothing else.
+    pub fn set_error_prototype(
+        &mut self,
+        kind: ErrorKind,
+        prototype: Value,
+    ) -> Result<(), RuntimeError> {
+        let Some(object) = self.as_object(prototype) else {
+            let what = self.display(prototype);
+            return Err(RuntimeError::Type(format!(
+                "the prototype for {} has to be an object and is {what}",
+                kind.name()
+            )));
+        };
+        self.isolate.set_error_prototype(kind, object);
+        Ok(())
     }
 
     /// Make a function written in Rust and bind it in the global scope under the same name.
@@ -523,16 +673,20 @@ impl Interpreter {
     /// negative zero is `"0"`. [`Interpreter::display`] is the other one and the two differ on
     /// exactly those two cases on purpose.
     ///
-    /// It goes through the same private `text_of` that `'' + x` goes through, rather than
-    /// reimplementing the rules, because the one thing `String(x)` must never do is disagree with
-    /// concatenation about what a value's text is.
+    /// It goes through the same private path that `'' + x` goes through, rather than reimplementing
+    /// the rules, because the one thing `String(x)` must never do is disagree with concatenation
+    /// about what a value's text is.
+    ///
+    /// It takes the interpreter mutably because converting an object can call the object's
+    /// `toString`, and that is a call like any other.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::Type`] for an object with no `toString` anywhere on its prototype
-    /// chain, which is what `Object.create(null)` makes. Every other value has a text.
-    pub fn to_text(&self, value: Value) -> Result<String, RuntimeError> {
-        self.text_of(value)
+    /// chain, which is what `Object.create(null)` makes. Every other value has a text. Whatever the
+    /// object's own `toString` throws comes back through here too.
+    pub fn to_text(&mut self, value: Value) -> Result<String, RuntimeError> {
+        self.converted_text(value)
     }
 
     /// Put text on the heap and hand back a value pointing at it.
@@ -1705,6 +1859,27 @@ impl Interpreter {
                 } => {
                     let target = self.stack.get(callee);
                     let Some(closure) = self.as_closure(target) else {
+                        // A constructor written in Rust, which is how `new Error` and `new TypeError`
+                        // are reached. The object is built here from the same `prototype` a
+                        // constructor written in JavaScript would use, so one Rust function serves
+                        // all seven error constructors and each of them gets its own prototype. No
+                        // frame is pushed, because a native does not run instructions, and the
+                        // `construct_result` that follows does the rest: the object is in the callee
+                        // register and whatever the native answered is in the destination.
+                        if let Some(native) = self.as_native(target)
+                            && self
+                                .isolate
+                                .natives()
+                                .builds(native.ordinal(self.isolate.cage()))
+                        {
+                            let site = Site::new(&unit.function(function).caches, cache);
+                            let this =
+                                guard!(self.instance_for(target, site, constants, key, blueprint));
+                            self.stack.set(callee, this);
+                            let value = guard!(self.construct_native(native, this, args, argc));
+                            self.stack.set(dst, value);
+                            continue;
+                        }
                         raise!(self.cannot_construct(target));
                     };
                     let site = Site::new(&unit.function(function).caches, cache);
@@ -1855,32 +2030,50 @@ impl Interpreter {
     /// are a name and a message until this point, and become an object with those two as own
     /// properties, which is what `e.name` and `e.message` read.
     ///
-    /// It is not an `Error` yet, in the sense that there is no `Error` to be an instance of:
-    /// `e instanceof Error` needs an `Error` constructor with a prototype on it, which needs `new`,
-    /// and `e.stack` needs the source spans that stack traces need, and both are ahead on M1. So `console.log(e)` prints the object rather than
-    /// `TypeError: ...`, which is a difference from Node that is visible and deliberate rather than
-    /// quietly wrong.
+    /// It is a real instance when there is a realm to take a prototype from, so `e instanceof
+    /// TypeError` is true and `e.name` is read off `TypeError.prototype` rather than being an own
+    /// property. On an interpreter with no standard library installed there is no `TypeError` to be
+    /// an instance of, and the object carries its own `name` and `message` instead, which is what
+    /// this did for everybody before there were error constructors.
+    ///
+    /// The prototype comes from the realm and not from the global of the same name. A program that
+    /// writes `TypeError = 5` has changed its own binding and has not changed what the engine
+    /// throws, which is what the specification means by an intrinsic.
+    ///
+    /// There is no `stack` on it. Every frame it would name is known, since a frame carries its
+    /// function and its program counter and a blueprint carries the source offset of each
+    /// instruction, so what is missing is the decision about what a katsu stack trace should say
+    /// rather than the information. Node's own traces name node's internal module frames, which
+    /// nothing here will ever have, so this is a divergence that a format cannot close.
     fn exception(&mut self, error: RuntimeError) -> Result<Value, RuntimeError> {
-        let (name, message) = match error {
+        let (kind, message) = match error {
             RuntimeError::Thrown(value) => return Ok(value),
-            RuntimeError::Reference(message) => ("ReferenceError", message),
-            RuntimeError::Type(message) => ("TypeError", message),
-            RuntimeError::Range(message) => ("RangeError", message),
+            RuntimeError::Reference(message) => (ErrorKind::Reference, message),
+            RuntimeError::Type(message) => (ErrorKind::Type, message),
+            RuntimeError::Range(message) => (ErrorKind::Range, message),
             // Unreachable, because `handle` returns the uncatchable ones before it starts looking
             // for a handler. Handing it back rather than panicking keeps that a fact about one
             // function instead of a claim two functions have to agree on.
             other => return Err(other),
         };
-        // The name is interned and the message is not, on purpose. There are three names and a
-        // program that throws will mention them again, while a message is built by `format!` and
-        // is usually seen once, so hashing it would be work spent on a string with no second use.
-        let name = self.intern(name)?;
-        let message = self
+        // The message is allocated rather than interned. There are three names and a program that
+        // throws will mention them again, while a message is built by `format!` and is usually seen
+        // once, so hashing it would be work spent on a string with no second use.
+        let text = self
             .isolate
             .allocate_string(&message)
             .ok_or(RuntimeError::OutOfMemory)?;
-        let message = self.string_value(message);
-        self.host_object(&[("name", name), ("message", message)])
+        let text = self.string_value(text);
+        let Some(prototype) = self.isolate.error_prototype(kind) else {
+            let name = self.intern(kind.name())?;
+            return self.host_object(&[("name", name), ("message", text)]);
+        };
+        let prototype = Value::from_slot(prototype.slot(), self.isolate.cage());
+        let object = self.new_object_with_prototype(prototype)?;
+        // Hidden, writable and configurable, which is the descriptor Node gives it and the one every
+        // error built by a program gets from the constructor below.
+        self.define_property(object, "message", text, Attributes::BUILTIN)?;
+        Ok(object)
     }
 
     /// The environment the running frame reads captured variables through.
@@ -2367,12 +2560,66 @@ impl Interpreter {
         first: Register,
         count: u16,
     ) -> Result<Value, RuntimeError> {
+        self.invoke_native(native, receiver, first, count, false)
+    }
+
+    /// The same, for a native that `new` reached rather than a call.
+    ///
+    /// The object the loop built is the receiver, which is what makes one Rust function able to
+    /// serve seven constructors, and the flag is what tells that function which of the two ways it
+    /// was reached.
+    #[inline(never)]
+    fn construct_native(
+        &mut self,
+        native: NativeRef,
+        this: Value,
+        first: Register,
+        count: u16,
+    ) -> Result<Value, RuntimeError> {
+        self.invoke_native(native, Some(this), first, count, true)
+    }
+
+    /// The half of the two that copies the arguments out of the caller's registers.
+    ///
+    /// They are copied because the native is handed the whole interpreter and the registers it would
+    /// otherwise be reading are inside it. Eight fit without allocating, which covers every builtin
+    /// worth writing.
+    fn invoke_native(
+        &mut self,
+        native: NativeRef,
+        receiver: Option<Value>,
+        first: Register,
+        count: u16,
+        constructing: bool,
+    ) -> Result<Value, RuntimeError> {
+        let arguments: SmallVec<[Value; 8]> = SmallVec::from_slice(self.stack.range(first, count));
+        self.dispatch_native(native, receiver, &arguments, constructing)
+    }
+
+    /// Call a function written in Rust with arguments that are already in hand.
+    ///
+    /// The bottom of every path that reaches a native, whether the program wrote the call or the
+    /// engine did. `ToString` of an object is the second kind: nothing is on the stack, because the
+    /// call is part of a conversion rather than something the program asked for.
+    ///
+    /// The flag is saved and restored rather than set and cleared, so that a native reached by `new`
+    /// which reaches another native leaves the answer about the call that is running rather than
+    /// about the last one that started.
+    fn dispatch_native(
+        &mut self,
+        native: NativeRef,
+        receiver: Option<Value>,
+        arguments: &[Value],
+        constructing: bool,
+    ) -> Result<Value, RuntimeError> {
         let ordinal = native.ordinal(self.isolate.cage());
         let Some(call) = self.isolate.natives().get(ordinal) else {
             return Err(Self::broken_native());
         };
-        let arguments: SmallVec<[Value; 8]> = SmallVec::from_slice(self.stack.range(first, count));
-        call(self, receiver, &arguments)
+        let was = std::mem::replace(&mut self.constructing, constructing);
+        let answer = call(self, receiver, arguments);
+        self.constructing = was;
+        answer
     }
 
     /// Make a call the program did not write, which today means calling an accessor.
@@ -3014,13 +3261,25 @@ impl Interpreter {
         } else {
             self.constructor_name(object).unwrap_or_default()
         };
+        // An error prints as what it says rather than as what it holds, so the whole of the braces
+        // is replaced by `[TypeError: message]` and any property somebody added is printed after it.
+        // Node reads the two names off the object rather than off the class, which is why an error
+        // with `name` assigned prints the assigned one.
+        let head = if bare { None } else { self.error_head(object) };
+        // An error prints a different set of properties from the one it holds, and the difference is
+        // decided here rather than in the walk below so that an error with nothing left to print
+        // takes the empty path and one with only a hidden `cause` does not.
+        let names = match &head {
+            Some(head) => self.error_names(object, head, names),
+            None => names,
+        };
         // Also before the depth check, and also measured. An object with nothing in it prints as
         // `{}` however deep it is, because there is nothing below it for the limit to be protecting
         // anybody from, and `[Object]` would be six characters longer as well as less informative.
         // The differential harness found this one: `[Object]` is long enough to push the object
         // holding it over the width limit, so getting it wrong breaks a line that Node keeps whole.
         if names.is_empty() {
-            return inspect::braces(&[], indent, "", &tag);
+            return head.unwrap_or_else(|| inspect::braces(&[], indent, "", &tag));
         }
         if depth == 0 {
             // What is left when the contents are not printed is what built the object, so an
@@ -3044,7 +3303,141 @@ impl Interpreter {
             Some(number) => inspect::reference(number),
             None => String::new(),
         };
-        inspect::braces(&entries, indent, &pointed_at, &tag)
+        let Some(head) = head else {
+            return inspect::braces(&entries, indent, &pointed_at, &tag);
+        };
+        // Both in front and both charged, which is what the boundary sweep against node says: an
+        // error carrying a back reference breaks nine characters earlier than the same error
+        // without one, which is the reference and the space after it.
+        let first_line = if pointed_at.is_empty() {
+            head
+        } else {
+            format!("{pointed_at} {head}")
+        };
+        inspect::braces(&entries, indent, &first_line, "")
+    }
+
+    /// What node prints for an error instead of an object's braces, or `None` for anything that is
+    /// not an error.
+    ///
+    /// An error is an object whose chain reaches this realm's `Error.prototype`, which is the same
+    /// question `e instanceof Error` asks and is how node decides too. A realm with no error
+    /// constructors in it has no such object, so nothing is an error there and every object prints
+    /// as an object.
+    ///
+    /// The text is `Error.prototype.toString` and then one substitution. Node replaces a name that
+    /// ends in `Error` with the name of whatever built the object, so `class MyError extends Error`
+    /// prints as `[MyError: ...]` even though its `name` is still `Error`, and a `TypeError` whose
+    /// `name` was set to `Error` prints as `[TypeError: ...]`. A name that does not end in `Error`
+    /// is left alone, which is why assigning `name` shows the assigned one. All four of those were
+    /// measured rather than reasoned about.
+    ///
+    /// An accessor in `name` or `message` reads as absent rather than being called. Printing cannot
+    /// run a program, and node would call the getter here, so that is a known divergence in a corner
+    /// nobody writes on purpose.
+    fn error_head(&self, object: ObjectRef) -> Option<String> {
+        let cage = self.isolate.cage();
+        let top = self.isolate.error_prototype(ErrorKind::Error)?;
+        let mut step = object.prototype(cage);
+        while step != Some(top) {
+            step = step?.prototype(cage);
+        }
+        let name = self
+            .printed_property(object, "name")
+            .map_or_else(|| "Error".to_owned(), |value| self.printed_text(value));
+        let message = self
+            .printed_property(object, "message")
+            .map_or_else(String::new, |value| self.printed_text(value));
+        let text = match (name.is_empty(), message.is_empty()) {
+            (true, _) => message,
+            (false, true) => name.clone(),
+            (false, false) => format!("{name}: {message}"),
+        };
+        let rest = text.strip_prefix(&name).filter(|_| name.ends_with("Error"));
+        let text = match (rest, self.constructor_name(object)) {
+            (Some(rest), Some(built_by)) if rest.is_empty() || rest.starts_with(':') => {
+                format!("{built_by}{rest}")
+            }
+            _ => text,
+        };
+        Some(format!("[{text}]"))
+    }
+
+    /// The properties node prints after an error's first line, which are not the ones it holds.
+    ///
+    /// Two changes, both node's and both visible in ordinary code. `name` and `message` are dropped
+    /// when their text is already part of the first line, because `[Boom: m] { name: 'Boom' }` says
+    /// the same thing twice, and dropped as well when they hold something that is not a string,
+    /// which is the case where node's own first line stops looking like an error and it hides them
+    /// rather than explaining. And an own `cause` is printed even though the constructor made it
+    /// hidden, because what an error was caused by is the most useful thing it carries. Node puts it
+    /// last and brackets the name, which is how a `cause` the program made enumerable itself is told
+    /// apart from this one.
+    fn error_names(
+        &self,
+        object: ObjectRef,
+        head: &str,
+        mut names: Vec<(StringRef, u32, Attributes)>,
+    ) -> Vec<(StringRef, u32, Attributes)> {
+        let cage = self.isolate.cage();
+        let atoms = self.isolate.atoms();
+        names.retain(|(name, index, _)| {
+            let text = name.to_utf8_lossy(cage);
+            if text != "name" && text != "message" {
+                return true;
+            }
+            let value = object
+                .value_at(cage, *index)
+                .map_or(Value::UNDEFINED, Value::from_bits);
+            self.as_text(value)
+                .is_some_and(|text| !head.contains(&text))
+        });
+        if let Some(cause) = atoms.lookup(cage, "cause")
+            && let Some((index, attributes)) = object.find(cage, cause.as_string())
+            && !attributes.is_enumerable()
+            && !attributes.is_accessor()
+        {
+            names.push((cause.as_string(), index, attributes));
+        }
+        names
+    }
+
+    /// A property as printing sees it, which is a chain walk that cannot throw and cannot call.
+    ///
+    /// `None` for a name nothing on the chain has and for one an accessor holds. A name that has
+    /// never been interned cannot be a property of anything in this heap, so a miss there is a
+    /// definite `None` rather than a reason to allocate.
+    fn printed_property(&self, object: ObjectRef, name: &str) -> Option<Value> {
+        let cage = self.isolate.cage();
+        let wanted = self.isolate.atoms().lookup(cage, name)?.as_string();
+        let mut step = Some(object);
+        while let Some(current) = step {
+            if let Some((index, attributes)) = current.find(cage, wanted) {
+                if attributes.is_accessor() {
+                    return None;
+                }
+                return current.value_at(cage, index).map(Value::from_bits);
+            }
+            step = current.prototype(cage);
+        }
+        None
+    }
+
+    /// The text a value contributes to an error's first line.
+    ///
+    /// `undefined` is empty rather than the word, because the specification says an error with no
+    /// `message` has no message rather than one reading "undefined". Anything a conversion cannot
+    /// turn into text is printed the way it would print anywhere else, since this runs while
+    /// printing and has nowhere to report a failure to.
+    ///
+    /// The rules of the conversion and not the conversion itself, so printing never calls anything.
+    /// Node is the same: `util.inspect` reads `name` and `message` off the object rather than asking
+    /// it what it thinks it says, which is why an error with a `toString` that throws still prints.
+    fn printed_text(&self, value: Value) -> String {
+        if value.is_undefined() {
+            return String::new();
+        }
+        self.text_of(value).unwrap_or_else(|_| self.display(value))
     }
 
     /// The name Node prints in front of an object that something other than `Object` built.
@@ -3166,6 +3559,14 @@ impl Interpreter {
                     .value_at(cage, *index)
                     .expect("a name at this index means there is a value at it");
                 let key = inspect::key(&name.to_utf8_lossy(cage));
+                // Everything here is enumerable except the `cause` an error prints anyway. Node
+                // brackets a hidden name it decided to show, which is what tells that one apart from
+                // a `cause` the program defined itself.
+                let key = if attributes.is_enumerable() {
+                    key
+                } else {
+                    format!("[{key}]")
+                };
                 // An accessor prints as what it is rather than as what it would say, because
                 // printing an object is not supposed to run any of the program's code. Node makes
                 // the same choice and prints `[Getter]`, and it is the right one: a getter can throw,
@@ -3416,10 +3817,72 @@ impl Interpreter {
         if let Some(string) = self.as_string(value) {
             return Ok(string);
         }
-        let text = self.text_of(value)?;
+        let text = self.converted_text(value)?;
         self.isolate
             .allocate_string(&text)
             .ok_or(RuntimeError::OutOfMemory)
+    }
+
+    /// How deep one text conversion may nest inside another before it is called a cycle.
+    ///
+    /// `ToString` of an object calls the object's `toString`, which is allowed to convert something
+    /// else, and an object whose `name` is itself is a cycle that recurses in Rust rather than in
+    /// JavaScript. Nothing on the interpreter's own stack grows while that happens, so the frame
+    /// limit that catches ordinary runaway recursion never fires and the process would die on the
+    /// real stack instead.
+    const CONVERSION_LIMIT: u8 = 64;
+
+    /// `ToString`, including the part of it that calls the object's own `toString`.
+    ///
+    /// This is the half of the conversion that can run code, and it is separate from [`text_of`] so
+    /// that the printing path can have the rules without the calls.
+    ///
+    /// Only a `toString` written in Rust is called. Calling a function written in JavaScript from
+    /// here needs the interpreter to be able to run a frame to completion from the middle of an
+    /// opcode, which it cannot do yet, so `String({ toString() { return 'a' } })` is still `[object
+    /// Object]` and that is the same known gap it was before. What changed is that every `toString`
+    /// the standard library installs is a native, so `String(new TypeError('x'))` is now "TypeError:
+    /// x" rather than `[object Object]`, which is how most code prints an error it caught.
+    ///
+    /// `valueOf` is not tried first, which `ToPrimitive` with no hint is supposed to do. It cannot
+    /// make a difference yet: the only `valueOf` in the realm is `Object.prototype.valueOf`, which
+    /// hands back the object it was called on, and `ToPrimitive` moves on to `toString` when it
+    /// does. The first builtin with a `valueOf` that answers with a primitive is the one that has to
+    /// add the other half.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Range`] when conversions nest far enough to be a cycle, whatever the object's
+    /// `toString` throws, and a `TypeError` when it answers with an object, which is what the
+    /// specification says to do once there is nothing else left to try.
+    fn converted_text(&mut self, value: Value) -> Result<String, RuntimeError> {
+        let Some(object) = self.as_object(value) else {
+            return self.text_of(value);
+        };
+        let Some(found) = self.printed_property(object, "toString") else {
+            return self.text_of(value);
+        };
+        let Some(native) = self.as_native(found) else {
+            return self.text_of(value);
+        };
+        // The limit is small because this nests in Rust rather than on the interpreter's stack, and
+        // one conversion inside another is already unusual. Node reports the same error for the same
+        // program, from its own stack limit rather than from a counter.
+        if self.converting >= Self::CONVERSION_LIMIT {
+            return Err(RuntimeError::Range(
+                "Maximum call stack size exceeded".to_owned(),
+            ));
+        }
+        self.converting += 1;
+        let answer = self.dispatch_native(native, Some(value), &[], false);
+        self.converting -= 1;
+        let answer = answer?;
+        if self.as_object(answer).is_some() {
+            return Err(RuntimeError::Type(
+                "Cannot convert object to primitive value".to_owned(),
+            ));
+        }
+        self.text_of(answer)
     }
 
     /// The rules of `ToString`, as Rust text and without touching the heap.

@@ -25,7 +25,7 @@ use katsu_ir::FunctionBlueprint;
 pub use cache::{Caches, PropertyCache, Site};
 pub use clock::{now_ms, origin_ms, start as start_clock};
 pub use global::Globals;
-pub use interpret::{Interpreter, Interrupt, RuntimeError};
+pub use interpret::{ErrorKind, Interpreter, Interrupt, RuntimeError};
 /// What a property is allowed to do, re exported so that a builtin can say it without depending on
 /// the heap crate. See [`katsu_gc::Attributes`].
 pub use katsu_gc::Attributes;
@@ -101,6 +101,7 @@ pub struct Isolate {
     atoms: AtomTable,
     object_prototype: Option<ObjectRef>,
     function_prototype: Option<ObjectRef>,
+    error_prototypes: [Option<ObjectRef>; ErrorKind::COUNT],
     roots: HashMap<u32, ShapeRef>,
     globals: Globals,
     natives: Natives,
@@ -114,6 +115,10 @@ impl fmt::Debug for Isolate {
             .field("atoms", &self.atoms.len())
             .field("has_object_prototype", &self.object_prototype.is_some())
             .field("has_function_prototype", &self.function_prototype.is_some())
+            .field(
+                "error_prototypes",
+                &self.error_prototypes.iter().flatten().count(),
+            )
             .field("root_shapes", &self.roots.len())
             .field("globals", &self.globals.len())
             .field("natives", &self.natives)
@@ -135,6 +140,7 @@ impl Isolate {
             atoms: AtomTable::new(),
             object_prototype: None,
             function_prototype: None,
+            error_prototypes: [None; ErrorKind::COUNT],
             roots: HashMap::new(),
             globals: Globals::new(),
             natives: Natives::new(),
@@ -297,6 +303,25 @@ impl Isolate {
     #[must_use]
     pub const fn object_prototype_if_built(&self) -> Option<ObjectRef> {
         self.object_prototype
+    }
+
+    /// The prototype an error of this kind is built with, or `None` on a realm that has no error
+    /// constructors in it.
+    ///
+    /// A bare interpreter with no standard library installed is that realm, and the interpreter's
+    /// own tests run in one, so the absence is an ordinary answer rather than a broken state.
+    #[must_use]
+    pub const fn error_prototype(&self, kind: ErrorKind) -> Option<ObjectRef> {
+        self.error_prototypes[kind.slot()]
+    }
+
+    /// Remember the prototype for a kind of error, which is what building the realm does.
+    ///
+    /// Held here rather than read out of the global of the same name every time, because the global
+    /// is a binding a program can rewrite and this is the intrinsic. `TypeError = 5` changes what
+    /// the program's own `new TypeError` means and leaves what the engine throws alone.
+    pub const fn set_error_prototype(&mut self, kind: ErrorKind, prototype: ObjectRef) {
+        self.error_prototypes[kind.slot()] = Some(prototype);
     }
 
     /// Intern a string, so that every mention of the same text reaches one object.

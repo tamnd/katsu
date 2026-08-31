@@ -160,7 +160,7 @@ fn indent_from(interpreter: &Interpreter, space: Value) -> String {
 /// is a list and not a set because it is only ever a few deep and a scan of a few machine words beats
 /// hashing every object on the way in.
 fn write(
-    interpreter: &Interpreter,
+    interpreter: &mut Interpreter,
     value: Value,
     indent: &str,
     depth: usize,
@@ -201,7 +201,7 @@ fn write(
 
 /// Write an object's braces and the properties between them.
 fn object(
-    interpreter: &Interpreter,
+    interpreter: &mut Interpreter,
     value: Value,
     properties: Vec<(String, Value, Attributes)>,
     indent: &str,

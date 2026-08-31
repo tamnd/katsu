@@ -83,10 +83,17 @@ pub fn arg(args: &[Value], index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::UNDEFINED)
 }
 
-/// One entry: the code, and the name that code answers to.
+/// One entry: the code, the name that code answers to, and whether `new` is allowed to reach it.
+///
+/// The flag is here rather than on the object in the cage because it is a fact about the function
+/// rather than about the value pointing at it, and because the eight byte native object has nowhere
+/// to put it. Node draws the same line the specification does and it is visible: `new Error()` is an
+/// error and `new console.log()` is a `TypeError`, so something has to say which of the two a given
+/// native is, and guessing is wrong about half of them.
 struct Native {
     name: Box<str>,
     call: NativeFn,
+    builds: bool,
 }
 
 /// Every function written in Rust that this isolate can call.
@@ -127,10 +134,26 @@ impl Natives {
     /// program reaches and is checked because the alternative is an ordinal that truncates and calls
     /// the wrong function.
     pub fn add(&mut self, name: &str, call: NativeFn) -> Option<u32> {
+        self.push(name, call, false)
+    }
+
+    /// Add a function that `new` is allowed to reach, and hand back the ordinal.
+    ///
+    /// The body is called with the fresh object as its receiver, exactly as a constructor written in
+    /// JavaScript is, so a native constructor fills in an object rather than building one. What it
+    /// returns follows the same rule every other constructor follows: an object wins and anything
+    /// else is dropped in favour of the object it was given.
+    pub fn add_constructor(&mut self, name: &str, call: NativeFn) -> Option<u32> {
+        self.push(name, call, true)
+    }
+
+    /// The half of the two that does the work.
+    fn push(&mut self, name: &str, call: NativeFn, builds: bool) -> Option<u32> {
         let ordinal = u32::try_from(self.entries.len()).ok()?;
         self.entries.push(Native {
             name: name.into(),
             call,
+            builds,
         });
         Some(ordinal)
     }
@@ -142,6 +165,18 @@ impl Natives {
     #[must_use]
     pub fn get(&self, ordinal: u32) -> Option<NativeFn> {
         self.entries.get(ordinal as usize).map(|entry| entry.call)
+    }
+
+    /// Whether `new` is allowed to reach the function at `ordinal`.
+    ///
+    /// False for an ordinal that is not in the table, which cannot happen from a value in the cage
+    /// and is answered rather than panicked over, because the caller is about to say that this is
+    /// not a constructor and that is the right thing to say about a function that is not there.
+    #[must_use]
+    pub fn builds(&self, ordinal: u32) -> bool {
+        self.entries
+            .get(ordinal as usize)
+            .is_some_and(|entry| entry.builds)
     }
 
     /// The name at `ordinal`, which is what printing a native shows.

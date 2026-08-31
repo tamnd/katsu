@@ -97,6 +97,10 @@ impl Runtime {
         // After `Object`, because `Function.prototype.constructor` has to be found before the
         // `constructor` that `Object.prototype` gives to everything in the realm.
         katsu_builtins::install_function(&mut interpreter)?;
+        // After both, because every error prototype inherits from `Object.prototype` and every error
+        // constructor is a function. From here on the interpreter's own errors are real instances of
+        // these, so anything installed later throws something a program can catch by kind.
+        katsu_builtins::install_error(&mut interpreter)?;
         katsu_builtins::install_string(&mut interpreter)?;
         katsu_builtins::install_json(&mut interpreter)?;
         Ok(Runtime { interpreter })

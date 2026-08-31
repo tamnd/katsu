@@ -2,10 +2,10 @@
 // runs while writing the code. Every case here is a place two engines can disagree about where a
 // throw lands rather than about what it computes.
 //
-// A caught engine error is asked for its `name` and `message` and never printed whole. Node prints
-// one as `TypeError: ...` because it is an `Error` with a prototype behind it, and katsu's is an
-// object with those two properties until prototypes arrive, so printing it would be comparing a
-// difference that is already known and written down rather than looking for a new one.
+// A caught engine error is asked for its `name` and `message` and never printed whole. Both engines
+// throw a real `TypeError` now, and what still differs is the stack node puts on it and katsu has
+// no frames to build yet, so printing one would be comparing a difference that is already known and
+// written down rather than looking for a new one. `errors.js` is where the rest of it is compared.
 function thrower(value) {
   throw value;
 }
