@@ -1923,6 +1923,7 @@ impl<'a> Lowerer<'a> {
                 Ok(register)
             }
             ExprKind::Call { callee, arguments } => self.call(at, callee, arguments, dst),
+            ExprKind::New { callee, arguments } => self.construct(at, callee, arguments, dst),
             ExprKind::Object { properties } => {
                 // An object literal is the one expression that writes its destination before its
                 // operands run, because the stores that fill it need somewhere to store into. That
@@ -2356,6 +2357,70 @@ impl<'a> Lowerer<'a> {
         self.emit(at, op);
         Ok(register)
     }
+
+    /// Lower `new callee(arguments)`.
+    ///
+    /// The callee is always copied into a temporary, which a call only does when an argument could
+    /// overwrite it. `Op::Construct` leaves the object it built in that register, so the register
+    /// has to be one that belongs to this expression: writing the object over `Foo` itself would
+    /// mean the second `new Foo()` in a program constructed an object.
+    ///
+    /// The copy is one move for the shapes that need it and nothing at all for the rest, because
+    /// `pin` only copies when the register is a variable's own slot. `new (f())()` and
+    /// `new o.Foo()` both produce their callee in a temporary already.
+    ///
+    /// The arguments are freed before the result register is taken, exactly as a call frees them,
+    /// but the callee's temporary is held past that point because the two instructions after it
+    /// both read it. Nothing here releases as far back as the callee: the enclosing expression
+    /// releases to its own mark when it is done with the value, and that mark is at or below this
+    /// one, so holding the register costs a slot in the frame and does not leak.
+    fn construct(
+        &mut self,
+        at: u32,
+        callee: &Expr,
+        arguments: &[Expr],
+        dst: Option<Register>,
+    ) -> Result<Register, LowerError> {
+        let count = u16::try_from(arguments.len()).expect("a call has fewer than 65535 arguments");
+        let evaluated = self.expr(callee)?;
+        let function = self.pin(at, evaluated, true);
+        let held = self.next_temp;
+
+        // As in a call, the arguments have to land in consecutive registers, and a construction
+        // with no arguments still names the register they would have started at.
+        let args = self.alloc();
+        for _ in 1..count {
+            self.alloc();
+        }
+        for (index, argument) in arguments.iter().enumerate() {
+            let slot = args.0 + u16::try_from(index).expect("counted above");
+            self.expr_into(argument, Register(slot))?;
+        }
+
+        self.release(held);
+        let register = self.destination(dst);
+        let key = self.constant("prototype");
+        let cache = self.cache();
+        self.emit(
+            at,
+            Op::Construct {
+                dst: register,
+                callee: function,
+                key,
+                args,
+                argc: count,
+                cache,
+            },
+        );
+        self.emit(
+            at,
+            Op::ConstructResult {
+                dst: register,
+                this: function,
+            },
+        );
+        Ok(register)
+    }
 }
 
 /// Whether evaluating this expression can write to a variable's own register.
@@ -2388,7 +2453,7 @@ fn writes_a_variable(expr: &Expr) -> bool {
         }
         ExprKind::Field { object, .. } => writes_a_variable(object),
         ExprKind::Index { object, index } => writes_a_variable(object) || writes_a_variable(index),
-        ExprKind::Call { callee, arguments } => {
+        ExprKind::Call { callee, arguments } | ExprKind::New { callee, arguments } => {
             writes_a_variable(callee) || arguments.iter().any(writes_a_variable)
         }
         ExprKind::Object { properties } => properties
@@ -2439,7 +2504,7 @@ fn touches_a_variable(expr: &Expr) -> bool {
         ExprKind::Index { object, index } => {
             touches_a_variable(object) || touches_a_variable(index)
         }
-        ExprKind::Call { callee, arguments } => {
+        ExprKind::Call { callee, arguments } | ExprKind::New { callee, arguments } => {
             touches_a_variable(callee) || arguments.iter().any(touches_a_variable)
         }
         ExprKind::Object { properties } => properties
@@ -2932,6 +2997,45 @@ mod tests {
             "
             load_global r0, k0, ic0
             call r0, r0, r1, 0, ic1
+            load_undefined r0
+            return r0
+            ",
+        );
+    }
+
+    #[test]
+    fn a_construct_copies_the_callee_because_the_object_it_builds_lands_on_it() {
+        // The move is the whole point. `Foo` stays a function, the copy in r1 becomes the fresh
+        // object, and `construct_result` reads that copy to decide what the expression is worth.
+        // `prototype` is in the constant pool because the construct reads it through a cache.
+        let blueprint = lowered("function Foo(a) {} new Foo(1);");
+        assert_code(
+            &code(&blueprint),
+            "
+            new_closure r0, fn0
+            move r1, r0
+            load_int r2, 1
+            construct r2, r1, k0, r2, 1, ic0
+            construct_result r2, r1
+            load_undefined r1
+            return r1
+            ",
+        );
+        assert_eq!(blueprint.constants.len(), 1);
+    }
+
+    #[test]
+    fn a_construct_of_something_that_is_already_a_temporary_does_not_copy_it() {
+        // `pin` copies a variable's own register and leaves anything else alone, so reaching the
+        // constructor through a property costs no move. The result takes a register of its own
+        // rather than the callee's, because the callee's is where the fresh object is waiting.
+        assert_code(
+            &code(&lowered("new lib.Thing();")),
+            "
+            load_global r0, k0, ic0
+            get_prop r0, r0, k1, ic1
+            construct r1, r0, k2, r1, 0, ic2
+            construct_result r1, r0
             load_undefined r0
             return r0
             ",

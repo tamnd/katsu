@@ -393,6 +393,7 @@ fn cache_of(op: Op) -> Option<CacheIndex> {
         | Op::SetIndex { cache, .. }
         | Op::Call { cache, .. }
         | Op::CallMethod { cache, .. }
+        | Op::Construct { cache, .. }
         | Op::LoopBackEdge { profile: cache, .. } => Some(cache),
         _ => None,
     }
@@ -469,7 +470,17 @@ fn highest_register(op: Op) -> Option<Register> {
         Op::SetIndex {
             obj, index, value, ..
         } => smallvec![obj, index, value],
+        // A construct names the same three registers a call names, and for the same reasons: the
+        // callee is read and then written over with the fresh object, and the arguments run from
+        // `args` to the last one the count reaches.
         Op::Call {
+            dst,
+            callee,
+            args,
+            argc,
+            ..
+        }
+        | Op::Construct {
             dst,
             callee,
             args,
@@ -483,6 +494,7 @@ fn highest_register(op: Op) -> Option<Register> {
             argc,
             ..
         } => smallvec![dst, obj, last_argument(args, argc)],
+        Op::ConstructResult { dst, this } => smallvec![dst, this],
         Op::ThrowConstAssignment
         | Op::NewContext { .. }
         | Op::Jump { .. }

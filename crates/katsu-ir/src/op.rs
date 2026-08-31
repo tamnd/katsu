@@ -498,6 +498,43 @@ pub enum Op {
         argc: u16,
         cache: CacheIndex,
     },
+    /// `dst = new callee(args...)`, with the arguments in consecutive registers from `args`.
+    ///
+    /// A property read and a call kept in one opcode, the way [`Op::CallMethod`] is, and for a
+    /// closely related reason. Constructing reads `callee.prototype` to decide what the new object
+    /// inherits from, so `key` names that property and `cache` is the site the read caches at, which
+    /// means `new Foo()` in a loop pays for the walk once rather than every turn.
+    ///
+    /// The fresh object goes into the `callee` register, on top of the function that is being
+    /// constructed. That register belongs to this call and nothing reads it afterwards, which is why
+    /// lowering copies a variable into a temporary before it gets here. Somewhere is needed because
+    /// the object outlives the call: a constructor that returns a primitive returns the object
+    /// instead, and `dst` is where the return value lands, so the two cannot share a register. The
+    /// alternative was a word on the call frame saying that this frame is a construct, and that word
+    /// would be read by every return in the program to serve the calls that are constructs. The
+    /// frame header is thirty two bytes and `Register::NOWHERE` exists because the last eight cost
+    /// fourteen percent on `call/call_return`, so the choice was made the same way it was made
+    /// there.
+    Construct {
+        dst: Register,
+        callee: Register,
+        key: ConstIndex,
+        args: Register,
+        argc: u16,
+        cache: CacheIndex,
+    },
+    /// Keep the object a constructor was given if what it returned is not one.
+    ///
+    /// The second half of `new`, emitted straight after [`Op::Construct`] and reading the register
+    /// the fresh object was left in. `return 5` and a bare `return` and falling off the end all mean
+    /// the same thing to `new`, which is that the object the constructor was building is the value
+    /// of the expression, and `return {}` means the opposite.
+    ///
+    /// Separate from the call rather than folded into the return, because a return has no idea it is
+    /// returning into a construct and finding out would cost it a load. This runs once per `new`
+    /// instead, next to an allocation that costs far more than a dispatch.
+    ConstructResult { dst: Register, this: Register },
+
     /// Return `src` to the caller.
     Return { src: Register },
 
@@ -741,6 +778,19 @@ impl fmt::Display for Op {
                 "call_method {dst}, {obj}, k{}, {args}, {argc}, {cache}",
                 key.0
             ),
+            Self::Construct {
+                dst,
+                callee,
+                key,
+                args,
+                argc,
+                cache,
+            } => write!(
+                f,
+                "construct {dst}, {callee}, k{}, {args}, {argc}, {cache}",
+                key.0
+            ),
+            Self::ConstructResult { dst, this } => write!(f, "construct_result {dst}, {this}"),
             Self::Return { src } => write!(f, "return {src}"),
             Self::Throw { src } => write!(f, "throw {src}"),
             Self::NewClosure { dst, blueprint } => write!(f, "new_closure {dst}, {blueprint}"),

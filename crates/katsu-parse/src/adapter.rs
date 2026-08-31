@@ -706,6 +706,8 @@ impl Adapter<'_> {
 
             oxc::Expression::CallExpression(node) => self.call(node, strict)?,
 
+            oxc::Expression::NewExpression(node) => self.construct(node, strict)?,
+
             oxc::Expression::ObjectExpression(node) => self.object(node, strict)?,
 
             oxc::Expression::FunctionExpression(node) => {
@@ -833,26 +835,53 @@ impl Adapter<'_> {
             return self.refuse("an optional call", node.span);
         }
 
-        let mut arguments = Vec::with_capacity(node.arguments.len());
-        for argument in &node.arguments {
+        Ok(Expr::new(
+            span(node.span),
+            ExprKind::Call {
+                callee: Box::new(self.expression(&node.callee, strict)?),
+                arguments: self.arguments(&node.arguments, node.span, strict)?,
+            },
+        ))
+    }
+
+    /// Adapt a construction.
+    ///
+    /// The callee is adapted as an ordinary expression, which is what it is. `new o.Foo()` reads
+    /// `Foo` off `o` and then constructs the function it found, so unlike a call there is nothing
+    /// about a `Field` callee that has to survive to lowering.
+    fn construct(&self, node: &oxc::NewExpression<'_>, strict: bool) -> Result<Expr, ParseError> {
+        Ok(Expr::new(
+            span(node.span),
+            ExprKind::New {
+                callee: Box::new(self.expression(&node.callee, strict)?),
+                arguments: self.arguments(&node.arguments, node.span, strict)?,
+            },
+        ))
+    }
+
+    /// Adapt the arguments of a call or a construction, which are the same grammar.
+    ///
+    /// The span is the whole expression's, because it is only used for a form of argument that has
+    /// no expression of its own to point at.
+    fn arguments(
+        &self,
+        arguments: &[oxc::Argument<'_>],
+        at: oxc_span::Span,
+        strict: bool,
+    ) -> Result<Vec<Expr>, ParseError> {
+        let mut adapted = Vec::with_capacity(arguments.len());
+        for argument in arguments {
             // A spread argument makes the argument count a run time value, which changes how the
             // call frame is set up rather than adding one more expression to evaluate.
             if let oxc::Argument::SpreadElement(spread) = argument {
                 return self.refuse("a spread argument", spread.span);
             }
             let Some(expression) = argument.as_expression() else {
-                return self.refuse("this argument form", node.span);
+                return self.refuse("this argument form", at);
             };
-            arguments.push(self.expression(expression, strict)?);
+            adapted.push(self.expression(expression, strict)?);
         }
-
-        Ok(Expr::new(
-            span(node.span),
-            ExprKind::Call {
-                callee: Box::new(self.expression(&node.callee, strict)?),
-                arguments,
-            },
-        ))
+        Ok(adapted)
     }
 
     /// Adapt the left side of an assignment.
@@ -1082,7 +1111,6 @@ fn expression_name(expression: &oxc::Expression<'_>) -> &'static str {
         oxc::Expression::ArrowFunctionExpression(_) => "an arrow function",
         oxc::Expression::AwaitExpression(_) => "await",
         oxc::Expression::YieldExpression(_) => "yield",
-        oxc::Expression::NewExpression(_) => "new",
         oxc::Expression::ClassExpression(_) => "a class expression",
         oxc::Expression::TemplateLiteral(_) => "a template literal",
         oxc::Expression::TaggedTemplateExpression(_) => "a tagged template",

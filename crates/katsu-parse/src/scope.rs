@@ -1050,7 +1050,7 @@ impl Analyser {
                 self.expression(object)?;
                 self.expression(index)?;
             }
-            ExprKind::Call { callee, arguments } => {
+            ExprKind::Call { callee, arguments } | ExprKind::New { callee, arguments } => {
                 self.expression(callee)?;
                 for argument in arguments {
                     self.expression(argument)?;
@@ -1489,7 +1489,7 @@ mod tests {
                 expression_idents(object, out);
                 expression_idents(index, out);
             }
-            ExprKind::Call { callee, arguments } => {
+            ExprKind::Call { callee, arguments } | ExprKind::New { callee, arguments } => {
                 expression_idents(callee, out);
                 for argument in arguments {
                     expression_idents(argument, out);

@@ -113,20 +113,37 @@ pub(crate) const NULL_PROTOTYPE: &str = "[Object: null prototype]";
 /// breaks earlier than its printed width suggests. The arithmetic is reproduced rather than
 /// approximated, because an approximation is a diff against Node on some object nobody thought of.
 ///
-/// `base` is the `<ref *1>` an object in a cycle carries, and empty for everything else. It is not
-/// only pasted on the front: its length counts towards the width, so an object with a back reference
-/// to it breaks eight characters earlier than the same object without one, and that was measured
-/// rather than assumed.
-pub(crate) fn braces(entries: &[String], indent: usize, base: &str) -> String {
-    let prefix = if base.is_empty() {
-        String::new()
-    } else {
-        format!("{base} ")
-    };
+/// `base` is the `<ref *1>` an object in a cycle carries and the `[Function: f]` a function with
+/// properties carries, and empty for everything else. `tag` is the `Foo` in front of an instance and
+/// the `[Object: null prototype]` in front of a bare object. Both are pasted on the front and both
+/// count towards the width, so an object carrying one breaks earlier than the same object without
+/// one, and that was measured rather than assumed.
+///
+/// They are separate arguments because Node charges them differently by one character. Node keeps
+/// the reference in a variable of its own and builds the tag into the opening brace, space and all,
+/// so `Foo {` is five characters against the one that a bare `{` costs while `<ref *1>` is charged
+/// its own eight. Joining the two here and charging the result once is off by one on exactly one
+/// object width, which is a diff against Node rather than a rounding difference.
+pub(crate) fn braces(entries: &[String], indent: usize, base: &str, tag: &str) -> String {
+    let mut prefix = String::new();
+    for part in [base, tag] {
+        if !part.is_empty() {
+            prefix.push_str(part);
+            prefix.push(' ');
+        }
+    }
     if entries.is_empty() {
         return format!("{prefix}{{}}");
     }
-    if fits(entries, indent, base.len()) && !entries.iter().any(|entry| entry.contains('\n')) {
+    // The opening brace on its own, or the tag and the space and the brace together.
+    let open = if tag.is_empty() {
+        "{".len()
+    } else {
+        width(tag) + "{ ".len()
+    };
+    if fits(entries, indent, width(base) + open)
+        && !entries.iter().any(|entry| entry.contains('\n'))
+    {
         return format!("{prefix}{{ {} }}", entries.join(", "));
     }
     let pad = " ".repeat(indent + INDENT);
@@ -145,21 +162,28 @@ pub(crate) const fn nested(indent: usize) -> usize {
 
 /// Whether these entries go on one line, by Node's arithmetic.
 ///
-/// The lengths are counted in UTF-16 code units and not in characters or bytes, because Node is
-/// counting the length of a JavaScript string, and an emoji is two of those.
-fn fits(entries: &[String], indent: usize, base: usize) -> bool {
-    let start = entries.len() + indent + "{".len() + base + 10;
+/// `prefix` is everything in front of the first entry, counted the way Node counts it.
+fn fits(entries: &[String], indent: usize, prefix: usize) -> bool {
+    let start = entries.len() + indent + prefix + 10;
     let mut total = entries.len() + start;
     if total + entries.len() > BREAK_LENGTH {
         return false;
     }
     for entry in entries {
-        total += entry.chars().map(char::len_utf16).sum::<usize>();
+        total += width(entry);
         if total > BREAK_LENGTH {
             return false;
         }
     }
     true
+}
+
+/// How long Node thinks this text is.
+///
+/// UTF-16 code units and not characters or bytes, because Node is counting the length of a
+/// JavaScript string, and an emoji is two of those.
+fn width(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
 }
 
 #[cfg(test)]
@@ -207,14 +231,19 @@ mod tests {
 
     #[test]
     fn an_object_with_nothing_in_it_has_no_space_between_its_braces() {
-        assert_eq!(braces(&[], 0, ""), "{}");
+        assert_eq!(braces(&[], 0, "", ""), "{}");
+        assert_eq!(braces(&[], 0, "", "Foo"), "Foo {}");
     }
 
     #[test]
     fn a_short_object_goes_on_one_line() {
         assert_eq!(
-            braces(&["a: 1".to_owned(), "b: 2".to_owned()], 0, ""),
+            braces(&["a: 1".to_owned(), "b: 2".to_owned()], 0, "", ""),
             "{ a: 1, b: 2 }"
+        );
+        assert_eq!(
+            braces(&["a: 1".to_owned()], 0, "<ref *1>", "Foo"),
+            "<ref *1> Foo { a: 1 }"
         );
     }
 
@@ -224,15 +253,31 @@ mod tests {
         // of these counts flips, and one character narrower still fits.
         for (count, width) in [(1, 63), (2, 28), (3, 17), (4, 11), (5, 7), (6, 5), (7, 3)] {
             assert!(
-                braces(&entries(count, width), 0, "").contains('\n'),
+                braces(&entries(count, width), 0, "", "").contains('\n'),
                 "{count} entries {width} wide should have broken"
             );
             assert!(
-                !braces(&entries(count, width - 1), 0, "").contains('\n'),
+                !braces(&entries(count, width - 1), 0, "", "").contains('\n'),
                 "{count} entries {} wide should have fitted",
                 width - 1
             );
         }
+    }
+
+    #[test]
+    fn a_constructor_name_costs_one_more_than_its_own_length() {
+        // Measured against Node with `new Foo()` carrying a single long property: the name and the
+        // space and the brace are counted together, so a three character name moves the boundary by
+        // four characters and not by three. Off by one here is a diff on real output rather than a
+        // rounding difference, which is why the two boundaries either side of it are pinned.
+        let entry = |width: usize| vec![format!("{}: 1", "k".repeat(width))];
+        assert!(braces(&entry(65), 0, "", "").contains('\n'));
+        assert!(!braces(&entry(64), 0, "", "").contains('\n'));
+        assert!(braces(&entry(61), 0, "", "Foo").contains('\n'));
+        assert!(!braces(&entry(60), 0, "", "Foo").contains('\n'));
+        // The same boundary for the longest tag Node writes, which is the bare object one.
+        assert!(braces(&entry(40), 0, "", super::NULL_PROTOTYPE).contains('\n'));
+        assert!(!braces(&entry(39), 0, "", super::NULL_PROTOTYPE).contains('\n'));
     }
 
     #[test]
@@ -244,21 +289,21 @@ mod tests {
             ]
         };
         assert_eq!(
-            braces(&["s: [Circular *1]".to_owned()], 0, "<ref *1>"),
+            braces(&["s: [Circular *1]".to_owned()], 0, "<ref *1>", ""),
             "<ref *1> { s: [Circular *1] }"
         );
         // Measured against Node: the same object breaks at a name of thirty nine characters with the
         // reference on it and would fit to forty seven without, so the eight characters of
         // `<ref *1>` are being charged even though they are not inside the braces.
-        assert!(braces(&entry(39), 0, "<ref *1>").contains('\n'));
-        assert!(!braces(&entry(38), 0, "<ref *1>").contains('\n'));
-        assert!(braces(&entry(47), 0, "").contains('\n'));
-        assert!(!braces(&entry(46), 0, "").contains('\n'));
+        assert!(braces(&entry(39), 0, "<ref *1>", "").contains('\n'));
+        assert!(!braces(&entry(38), 0, "<ref *1>", "").contains('\n'));
+        assert!(braces(&entry(47), 0, "", "").contains('\n'));
+        assert!(!braces(&entry(46), 0, "", "").contains('\n'));
     }
 
     #[test]
     fn a_broken_object_indents_by_two_and_puts_the_closing_brace_back_at_the_start() {
-        let text = braces(&entries(7, 3), 0, "");
+        let text = braces(&entries(7, 3), 0, "", "");
         assert_eq!(
             text,
             "{\n  k0xxx: 1,\n  k1xxx: 1,\n  k2xxx: 1,\n  k3xxx: 1,\n  k4xxx: 1,\n  k5xxx: 1,\n  k6xxx: 1\n}"
@@ -269,7 +314,7 @@ mod tests {
     fn an_entry_that_is_already_broken_breaks_the_object_around_it() {
         // One long property is enough to put every other property on its own line, which is why the
         // newline test is separate from the width test rather than folded into it.
-        let inner = braces(&entries(7, 3), nested(0), "");
-        assert!(braces(&[format!("a: {inner}")], 0, "").starts_with("{\n  a: {\n    k0xxx"));
+        let inner = braces(&entries(7, 3), nested(0), "", "");
+        assert!(braces(&[format!("a: {inner}")], 0, "", "").starts_with("{\n  a: {\n    k0xxx"));
     }
 }
