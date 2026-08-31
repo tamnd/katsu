@@ -1,0 +1,48 @@
+name: Publish crates
+
+# The release workflow publishes the crates on its own and this is not a second way to do that. It
+# exists for the one case that one cannot handle: an upload the registry stopped partway through.
+# crates.io lets an account create five crate names and then one every ten minutes, so a first
+# release of a workspace this size is hours of mostly waiting, and anything that interrupts it
+# leaves some names taken and some free. Re-running the job on the tag runs the code as it was at
+# the tag, which is the code that stopped, so finishing a release that needed a fix to the publish
+# itself has to start from the branch that has the fix. The version is the same either way, because
+# the check below refuses to upload a tree whose version is not the tag being finished.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag being finished, which has to name the version in the tree
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# One publish at a time, shared with the release workflow. Two runs uploading at once would take
+# turns spending the same rate limit allowance on each other's refusals, and the rate limit is the
+# one thing a release of this workspace cannot afford to waste.
+concurrency:
+  group: crates-io
+
+jobs:
+  crates:
+    name: crates.io
+    runs-on: ubuntu-latest
+    # The same environment the release uses, so the token is reachable from a tag matching v* and
+    # from the default branch and from nowhere else. Adding the branch is not a weaker rule than
+    # tags alone: pushing a tag and pushing to main are the same permission, and a pull request can
+    # do neither.
+    environment: crates-io
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: Publish
+        run: cargo run -p xtask -- publish --tag "$TAG"
+        env:
+          TAG: ${{ inputs.tag }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
