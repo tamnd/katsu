@@ -94,6 +94,9 @@ impl Runtime {
         katsu_builtins::install_console(&mut interpreter)?;
         katsu_builtins::install_performance(&mut interpreter)?;
         katsu_builtins::install_object(&mut interpreter)?;
+        // After `Object`, because `Function.prototype.constructor` has to be found before the
+        // `constructor` that `Object.prototype` gives to everything in the realm.
+        katsu_builtins::install_function(&mut interpreter)?;
         katsu_builtins::install_string(&mut interpreter)?;
         katsu_builtins::install_json(&mut interpreter)?;
         Ok(Runtime { interpreter })

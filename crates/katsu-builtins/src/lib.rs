@@ -6,6 +6,7 @@
 //! `regress` rather than a hand written engine.
 
 mod console;
+mod function;
 mod globals;
 mod json;
 mod object;
@@ -13,6 +14,7 @@ mod performance;
 mod string;
 
 pub use console::install as install_console;
+pub use function::install as install_function;
 pub use globals::install as install_globals;
 pub use json::install as install_json;
 pub use object::install as install_object;
