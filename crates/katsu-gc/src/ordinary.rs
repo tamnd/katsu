@@ -8,7 +8,7 @@
 //! # The layout
 //!
 //! ```text
-//! [shape][properties][inline capacity][padding][inline slot 0][inline slot 1]...
+//! [shape][properties][inline capacity][elements][inline slot 0][inline slot 1]...
 //! ```
 //!
 //! The shape is a pointer, and it is in the first word every object in the cage has, which is what
@@ -21,10 +21,13 @@
 //! built with puts the rest in a properties array off to the side and keeps the ones that already
 //! fit where they are, so `o.x = 1` on an object that had room stays one store.
 //!
-//! `spec/07-object-model.md` writes the layout with an elements pointer between the shape and the
-//! properties, for indexed properties. There are no arrays yet, so that word is not here yet: an
-//! object carrying a word nothing reads is four bytes per object against a memory budget that is the
-//! point of the project. It arrives with elements, and it moves the two offsets after it.
+//! The elements word is the indexed properties, the ones a program reaches with `a[0]`, and
+//! `elements.rs` is what it points at. It is in the fourth header word rather than the second the
+//! spec drew it in, and that is not an accident: the header was already sixteen bytes because a
+//! value has to start eight byte aligned, so the fourth word was padding that every object was
+//! already paying for. Putting elements there costs nothing at all and moves no offset. An object
+//! with no indexed properties has a zero there, which is what the heap already handed out, so it
+//! costs nothing to write either.
 //!
 //! # Why the inline capacity is in the object and not in the shape
 //!
@@ -56,11 +59,12 @@
 //! holding one function each, so nothing that steps through properties has to ask how wide one is.
 //! The flag that says the slot means a pair is in the shape with the other three, and the pair
 //! itself is in `function.rs`. No delete, which is the one operation a transition tree genuinely does
-//! not want and which needs the dictionary mode that every engine falls back to. No indexed
-//! properties. Each of those is its own piece of work and each of them is in M1.
+//! not want and which needs the dictionary mode that every engine falls back to. That is its own
+//! piece of work and it is in M1.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
+use crate::elements::{ElementsRef, HOLE, Stored};
 use crate::object::{
     HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u32_at, write_u64,
 };
@@ -73,8 +77,13 @@ const SHAPE_OFFSET: usize = 0;
 const PROPERTIES_OFFSET: usize = 4;
 /// How many values fit inside the object.
 const INLINE_OFFSET: usize = 8;
-/// Bytes before the first inline value. Twelve of header rounded up, because a value is eight bytes
-/// and an unaligned one costs more on every read than the four bytes of padding cost once.
+/// The indexed properties, or a small integer zero when this object has none.
+///
+/// The fourth word rather than the second, because the first three plus alignment already made the
+/// header sixteen bytes, so this one was padding an object was paying for whether it used it or not.
+const ELEMENTS_OFFSET: usize = 12;
+/// Bytes before the first inline value. Four header words, which is also the alignment a value
+/// needs, so nothing is padding any more.
 const HEADER_SIZE: usize = 16;
 /// Bytes per value, which is a whole boxed value rather than a compressed slot.
 ///
@@ -425,6 +434,81 @@ impl ObjectRef {
         Properties::from_slot(Slot::from_bits(self.field(cage, PROPERTIES_OFFSET)))
     }
 
+    /// This object's indexed properties, if it has any.
+    ///
+    /// `None` for every object that has only named properties on it, which is most of them, and the
+    /// check for it is a tag test on a word that is in the same cache line as the shape.
+    #[must_use]
+    pub fn elements(self, cage: &Cage) -> Option<ElementsRef> {
+        ElementsRef::from_slot(Slot::from_bits(self.field(cage, ELEMENTS_OFFSET)))
+    }
+
+    /// The value at `index`, or [`HOLE`] if there is nothing there.
+    ///
+    /// This is the whole of reading `a[i]` once the index is known to be an integer: a load of the
+    /// elements word, a bounds check, and a load. No string, no hash, no shape.
+    #[must_use]
+    pub fn element(self, cage: &Cage, index: u32) -> u64 {
+        self.elements(cage)
+            .map_or(HOLE, |array| array.value_at(cage, index))
+    }
+
+    /// Give this object room for `capacity` indexed properties, replacing whatever it had.
+    ///
+    /// For a caller that knows the count before it writes anything, which is what an array literal
+    /// is: `[1, 2, 3]` allocates once for three values rather than growing three times. Any elements
+    /// the object already had are dropped, so this is for a fresh object and not for a resize.
+    pub fn reserve_elements(self, heap: &mut BumpHeap, capacity: u32) -> Option<ElementsRef> {
+        let array = ElementsRef::new(heap, capacity)?;
+        self.point_at(heap, array);
+        Some(array)
+    }
+
+    /// Write the value of the indexed property at `index`, growing the elements array if it has to.
+    ///
+    /// The answer is not always yes. An index far enough past the end is refused rather than stored,
+    /// because the array that would hold it is almost entirely holes, and the caller is expected to
+    /// put the value under the text of the number instead. `elements.rs` has the reasoning and the
+    /// number.
+    pub fn set_element(self, heap: &mut BumpHeap, index: u32, value: u64) -> Stored {
+        let existing = self.elements(heap.cage());
+        let capacity = existing.map_or(0, |array| array.capacity(heap.cage()));
+        if let Some(array) = existing
+            && index < capacity
+        {
+            array.set(heap, index, value);
+            return Stored::Yes;
+        }
+        let Some(grown) = ElementsRef::grown_for(capacity, index) else {
+            return Stored::TooSparse;
+        };
+        let Some(array) = ElementsRef::new(heap, grown) else {
+            return Stored::NoRoom;
+        };
+        for slot in 0..capacity {
+            let old = existing
+                .expect("a capacity above zero means there is an array to read it from")
+                .value_at(heap.cage(), slot);
+            array.set(heap, slot, old);
+        }
+        self.point_at(heap, array);
+        array.set(heap, index, value);
+        Stored::Yes
+    }
+
+    /// Point the elements word at `array`.
+    fn point_at(self, heap: &mut BumpHeap, array: ElementsRef) {
+        // SAFETY: the object is in the cage and its elements word is inside its header.
+        unsafe {
+            write_u32_at(
+                heap.cage(),
+                self.offset(),
+                ELEMENTS_OFFSET,
+                array.slot().to_bits(),
+            );
+        }
+    }
+
     /// Make sure there is somewhere to put the value of the property at `index`.
     ///
     /// Nothing to do while the object still has inline room. Past that it needs an overflow array
@@ -572,10 +656,12 @@ impl Properties {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attributes, FIRST_OVERFLOW, HEADER_SIZE, ObjectRef, PROPERTIES_HEADER, VALUE_SIZE,
+        Attributes, FIRST_OVERFLOW, HEADER_SIZE, HOLE, ObjectRef, PROPERTIES_HEADER, Stored,
+        VALUE_SIZE,
     };
     use crate::bump::{BumpHeap, ObjectKind};
     use crate::cage::Slot;
+    use crate::elements::FIRST_ELEMENTS;
     use crate::object::HeapKind;
     use crate::shape::ShapeRef;
     use crate::string::StringRef;
@@ -869,5 +955,96 @@ mod tests {
             ObjectRef::from_slot(Slot::from_smi(3).expect("in range")),
             None
         );
+    }
+
+    #[test]
+    fn an_object_starts_with_no_indexed_properties_and_nobody_wrote_that() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 2);
+        assert_eq!(object.elements(heap.cage()), None);
+        assert_eq!(object.element(heap.cage(), 0), HOLE);
+    }
+
+    #[test]
+    fn an_indexed_property_that_was_put_in_comes_back_out() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        assert_eq!(object.set_element(&mut heap, 0, 11), Stored::Yes);
+        assert_eq!(object.set_element(&mut heap, 2, 33), Stored::Yes);
+        assert_eq!(object.element(heap.cage(), 0), 11);
+        assert_eq!(object.element(heap.cage(), 1), HOLE);
+        assert_eq!(object.element(heap.cage(), 2), 33);
+    }
+
+    #[test]
+    fn an_index_and_a_name_are_two_different_places() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 1);
+        let zero = name(&mut heap, "0");
+        object
+            .define(&mut heap, zero, 11, Attributes::NONE)
+            .expect("should have room");
+        object.set_element(&mut heap, 0, 22);
+        assert_eq!(object.get(heap.cage(), zero), Some(11));
+        assert_eq!(object.element(heap.cage(), 0), 22);
+        assert_eq!(texts(&heap, object), vec!["0"]);
+    }
+
+    #[test]
+    fn growing_the_elements_keeps_the_values_that_were_already_there() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        for index in 0..64 {
+            assert_eq!(
+                object.set_element(&mut heap, index, u64::from(index) + 1),
+                Stored::Yes
+            );
+        }
+        for index in 0..64 {
+            assert_eq!(object.element(heap.cage(), index), u64::from(index) + 1);
+        }
+    }
+
+    #[test]
+    fn growing_the_elements_leaves_the_new_room_as_holes() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        object.set_element(&mut heap, 0, 11);
+        let array = object.elements(heap.cage()).expect("should have elements");
+        assert_eq!(array.capacity(heap.cage()), FIRST_ELEMENTS);
+        assert_eq!(array.used(heap.cage()), Some(1));
+        assert_eq!(object.element(heap.cage(), 3), HOLE);
+    }
+
+    #[test]
+    fn an_index_far_past_the_end_is_refused_rather_than_stored() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        assert_eq!(object.set_element(&mut heap, 100_000, 1), Stored::TooSparse);
+        assert_eq!(object.elements(heap.cage()), None);
+    }
+
+    #[test]
+    fn a_literal_gets_the_room_it_asked_for_in_one_allocation() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        let before = heap.census().totals(ObjectKind::Elements).count;
+        object
+            .reserve_elements(&mut heap, 3)
+            .expect("should have room");
+        object.set_element(&mut heap, 0, 11);
+        object.set_element(&mut heap, 1, 22);
+        object.set_element(&mut heap, 2, 33);
+        assert_eq!(heap.census().totals(ObjectKind::Elements).count - before, 1);
+        assert_eq!(object.element(heap.cage(), 2), 33);
+    }
+
+    #[test]
+    fn the_elements_word_costs_an_object_nothing() {
+        let mut heap = heap();
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let before = heap.cursor();
+        ObjectRef::new(&mut heap, root, 2).expect("should have room");
+        assert_eq!(heap.cursor() - before, HEADER_SIZE + 2 * VALUE_SIZE);
     }
 }

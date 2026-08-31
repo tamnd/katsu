@@ -2,7 +2,7 @@
 //!
 //! Until the interpreter could call a function, every pointer in the cage was a string, and one
 //! place said so out loud so that the day it stopped being true there was one thing to change
-//! rather than twenty. There are seven kinds now and there will be more, so the word they share and
+//! rather than twenty. There are nine kinds now and there will be more, so the word they share and
 //! the raw reads and writes that reach it live here rather than in the file that happened to add
 //! the second kind.
 //!
@@ -55,6 +55,8 @@ pub enum HeapKind {
     Properties,
     /// A getter and a setter, sitting in the slot where an ordinary property keeps its value.
     AccessorPair,
+    /// The indexed properties of an object, addressed by the integer rather than by a name.
+    Elements,
 }
 
 impl HeapKind {
@@ -72,6 +74,7 @@ impl HeapKind {
             HeapKind::Shape => 4,
             HeapKind::Properties => 5,
             HeapKind::AccessorPair => 6,
+            HeapKind::Elements => 7,
             HeapKind::Object => return None,
         };
         // `from_smi` cannot fail for a number this small, and `expect` is not const, so the shift is
@@ -105,6 +108,7 @@ impl HeapKind {
             8 => Some(HeapKind::Shape),
             10 => Some(HeapKind::Properties),
             12 => Some(HeapKind::AccessorPair),
+            14 => Some(HeapKind::Elements),
             _ => None,
         }
     }
