@@ -4,8 +4,9 @@
 //! violated within a year, so the ones that matter get a test. This is where those tests
 //! live. See `spec/16-package-layout.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, ExitCode};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -29,6 +30,8 @@ enum Task {
     Machines,
     /// Check that the workspace is in a state crates.io will accept.
     Release(ReleaseArgs),
+    /// Upload every crate that is not on crates.io yet, in dependency order.
+    Publish(PublishArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -37,6 +40,17 @@ struct ReleaseArgs {
     /// than a release of the wrong version. Omitted outside the release workflow.
     #[arg(long)]
     tag: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct PublishArgs {
+    /// The tag being released, checked the way `cargo xtask release` checks it before anything
+    /// is uploaded.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Say what would be uploaded and in what order, and upload nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -125,6 +139,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Task::Release(args) => check_release(args.tag.as_deref()),
+        Task::Publish(args) => publish(&args),
     }
 }
 
@@ -541,7 +556,7 @@ fn check_release(tag: Option<&str>) -> Result<()> {
     // that would break the publish of everything else.
     let (published, held): (Vec<&&Package>, Vec<&&Package>) = members
         .iter()
-        .partition(|package| package.publish.as_ref().is_none_or(|to| !to.is_empty()));
+        .partition(|package| goes_to_a_registry(package));
     if published.is_empty() {
         bail!("no crate in this workspace is publishable, which cannot be right");
     }
@@ -632,9 +647,281 @@ fn check_release(tag: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether cargo will send this crate to a registry at all.
+///
+/// An empty registry list is how `publish = false` arrives in the metadata, and that is how the
+/// tools and the repository automation say they stay in this repository.
+fn goes_to_a_registry(package: &Package) -> bool {
+    package.publish.as_ref().is_none_or(|to| !to.is_empty())
+}
+
+/// The months of an HTTP date, in the order the format names them.
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The longest a rate limit is allowed to hold the release up before it is treated as something
+/// other than a rate limit. crates.io refills one new crate slot every ten minutes, so a sane wait
+/// is never more than that plus a little, and a much longer one means the message was misread.
+const LONGEST_WAIT: Duration = Duration::from_mins(45);
+
+/// Upload every crate that is not on crates.io yet, in dependency order, one at a time.
+///
+/// `cargo publish --workspace` is the better command and it is what CI dry runs, because it works
+/// the order out from the dependency graph and verifies the whole set builds as if it were already
+/// published before it uploads any of it. What it cannot do is survive crates.io's rate limit: a
+/// user account may publish a burst of five crate names and then one every ten minutes, so a first
+/// release of fifteen crates stops partway through with a 429 and no way to resume, which is
+/// exactly what happened to `v0.1.7`. Cargo has no flag for skipping what is already uploaded, so
+/// the question is asked per crate here instead, and a re-run finishes what a stopped run started.
+///
+/// This is slow on a first release and free afterwards. Once every name exists the limit is the
+/// one for new versions of existing crates, which is a burst of thirty, and fifteen crates never
+/// reach it.
+fn publish(args: &PublishArgs) -> Result<()> {
+    // Every rule this checks is one that cannot be undone once an upload has happened, so it runs
+    // before the first one rather than being trusted from an earlier job.
+    check_release(args.tag.as_deref())?;
+
+    let metadata = metadata()?;
+    let members: Vec<&Package> = metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .collect();
+    let order = publish_order(&members)?;
+    println!(
+        "publish: {} crates, in this order: {}",
+        order.len(),
+        order
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut uploaded = 0usize;
+    let mut skipped = 0usize;
+    for package in order {
+        if on_crates_io(&package.name, &package.version)? {
+            println!(
+                "publish: {} {} is already on crates.io",
+                package.name, package.version
+            );
+            skipped += 1;
+            continue;
+        }
+        if args.dry_run {
+            println!(
+                "publish: {} {} would be uploaded",
+                package.name, package.version
+            );
+            uploaded += 1;
+            continue;
+        }
+        upload(&package.name)?;
+        uploaded += 1;
+    }
+
+    let verb = if args.dry_run {
+        "to upload"
+    } else {
+        "uploaded"
+    };
+    println!("publish: {uploaded} {verb}, {skipped} already there");
+    Ok(())
+}
+
+/// The publishable crates, in an order where every crate comes after everything it depends on.
+///
+/// Taken from the dependency graph rather than from the layer table above it. The layer table is a
+/// rule about what may depend on what and this is a fact about what does, and uploading in an order
+/// derived from the rule would put an upload at the mercy of the rule being right.
+fn publish_order<'a>(members: &[&'a Package]) -> Result<Vec<&'a Package>> {
+    let publishable: Vec<&&Package> = members
+        .iter()
+        .filter(|package| goes_to_a_registry(package))
+        .collect();
+    let names: BTreeSet<&str> = publishable
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect();
+
+    // What each crate is waiting for. A build dependency counts and a dev dependency does not,
+    // because a dev dependency is not part of what somebody downloading the crate resolves.
+    let mut waiting: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for package in &publishable {
+        let blockers = package
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind.as_deref() != Some("dev"))
+            .map(|dependency| dependency.name.as_str())
+            .filter(|name| names.contains(name))
+            .collect();
+        waiting.insert(package.name.as_str(), blockers);
+    }
+
+    let mut order = Vec::with_capacity(publishable.len());
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    while done.len() < publishable.len() {
+        // Alphabetical among everything that is ready, so two runs of the same workspace upload in
+        // the same order and a stopped run resumes where the log says it stopped.
+        let ready: Option<&str> = waiting
+            .iter()
+            .filter(|(name, blockers)| !done.contains(*name) && blockers.is_subset(&done))
+            .map(|(name, _)| *name)
+            .next();
+        let Some(name) = ready else {
+            let stuck: Vec<&str> = waiting
+                .keys()
+                .filter(|name| !done.contains(*name))
+                .copied()
+                .collect();
+            bail!(
+                "these crates depend on each other in a cycle, so there is no order to upload \
+                 them in: {}",
+                stuck.join(", ")
+            );
+        };
+        done.insert(name);
+        order.push(
+            **publishable
+                .iter()
+                .find(|package| package.name == name)
+                .expect("the name came from this list"),
+        );
+    }
+    Ok(order)
+}
+
+/// Ask crates.io whether a version is already there.
+///
+/// Through curl rather than an HTTP client, because the only alternative is a dependency tree in
+/// the repository automation for one request, and curl is on every machine this runs on. A status
+/// that is neither 200 nor 404 stops the release, since a registry that cannot answer the question
+/// is not a registry to start uploading to.
+fn on_crates_io(name: &str, version: &str) -> Result<bool> {
+    // crates.io asks for one request a second and for a user agent that says who is calling.
+    std::thread::sleep(Duration::from_secs(1));
+    let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-A",
+            "katsu release automation (https://github.com/tamnd/katsu)",
+            &url,
+        ])
+        .output()
+        .context("running curl")?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "200" => Ok(true),
+        "404" => Ok(false),
+        other => bail!("crates.io answered {other} for {name} {version}, which is not an answer"),
+    }
+}
+
+/// Upload one crate, waiting out a rate limit rather than failing the release on one.
+fn upload(name: &str) -> Result<()> {
+    for attempt in 1..=3 {
+        println!("publish: uploading {name}");
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["publish", "-p", name, "--locked"])
+            .output()
+            .with_context(|| format!("running cargo publish -p {name}"))?;
+        // Cargo says everything worth reading on stderr, including the progress of the upload and
+        // the wait for the index, so it goes through whether this worked or not.
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(until) = rate_limited_until(&stderr) else {
+            bail!("publishing {name} failed");
+        };
+        let wait = until
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO)
+            + Duration::from_secs(15);
+        if wait > LONGEST_WAIT {
+            bail!(
+                "crates.io asked us to wait {} minutes before uploading {name}, which is longer \
+                 than a rate limit should ever be",
+                wait.as_secs() / 60
+            );
+        }
+        println!(
+            "publish: crates.io is rate limiting new crates, waiting {} seconds before attempt {} \
+             at {name}",
+            wait.as_secs(),
+            attempt + 1
+        );
+        std::thread::sleep(wait);
+    }
+    bail!("publishing {name} kept hitting the crates.io rate limit")
+}
+
+/// The time crates.io said to try again, out of the message it says it in.
+///
+/// The message is `You have published too many new crates in a short period of time. Please try
+/// again after Mon, 31 Aug 2026 12:56:01 GMT and see https://crates.io/docs/rate-limits for more
+/// details.` Reading the time out of it beats sleeping a guessed interval, because the same limit
+/// refills every ten minutes for a new crate and every minute for a new version of one that exists.
+fn rate_limited_until(stderr: &str) -> Option<SystemTime> {
+    let (_, after) = stderr.split_once("Please try again after ")?;
+    let (date, _) = after.split_once(" GMT")?;
+    Some(UNIX_EPOCH + Duration::from_secs(http_date(date)?))
+}
+
+/// Seconds since the epoch, from the `Mon, 31 Aug 2026 12:56:01` half of an HTTP date.
+///
+/// Hand written for the same reason base64 above is: it is twenty lines against a date library
+/// that would be in the tree forever for one call, and the answer is checked against known
+/// timestamps in the tests.
+fn http_date(text: &str) -> Option<u64> {
+    let (_, rest) = text.trim().split_once(", ")?;
+    let mut fields = rest.split_whitespace();
+    let day: i64 = fields.next()?.parse().ok()?;
+    let name = fields.next()?;
+    let month = i64::try_from(MONTHS.iter().position(|month| *month == name)?).ok()? + 1;
+    let year: i64 = fields.next()?.parse().ok()?;
+    let mut clock = fields.next()?.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let seconds = days_since_epoch(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(seconds).ok()
+}
+
+/// Days from 1970-01-01 to a civil date, by Howard Hinnant's algorithm.
+///
+/// It works by counting from March, which puts the leap day at the end of a year rather than in
+/// the middle of one, and by counting in 400 year eras, which is the period the whole calendar
+/// repeats on.
+fn days_since_epoch(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted = (month + 9) % 12;
+    let day_of_year = (153 * shifted + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MACHINES, base64, machine, unix_script, windows_script};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{
+        MACHINES, base64, days_since_epoch, http_date, machine, rate_limited_until, unix_script,
+        windows_script,
+    };
 
     #[test]
     fn base64_matches_the_reference_vectors() {
@@ -730,6 +1017,95 @@ mod tests {
 
         let windows = windows_script(machine("gamingpc-win").unwrap(), "abc123", "katsu-vm", "");
         assert!(windows.contains("-Value 'cargo bench -p katsu-vm'"));
+    }
+
+    #[test]
+    fn the_epoch_and_a_few_dates_around_it_line_up() {
+        // Two of these are the whole point: 2000 is a leap year because it is divisible by 400 and
+        // 1900 is not because it is divisible by 100, which is the pair every hand written date
+        // routine gets wrong first.
+        assert_eq!(days_since_epoch(1970, 1, 1), 0);
+        assert_eq!(days_since_epoch(1969, 12, 31), -1);
+        assert_eq!(days_since_epoch(2000, 3, 1), 11017);
+        assert_eq!(days_since_epoch(2000, 2, 29), 11016);
+        assert_eq!(days_since_epoch(1900, 3, 1), -25508);
+    }
+
+    #[test]
+    fn an_http_date_reads_as_the_timestamp_it_names() {
+        // Checked against `date -u -d ... +%s` rather than against arithmetic done here twice.
+        assert_eq!(http_date("Thu, 01 Jan 1970 00:00:00"), Some(0));
+        assert_eq!(http_date("Mon, 31 Aug 2026 12:56:01"), Some(1_788_180_961));
+        assert_eq!(http_date("Sun, 06 Nov 1994 08:49:37"), Some(784_111_777));
+        // Anything else is a message that changed shape, and guessing at a wait from a message we
+        // no longer understand is worse than failing the release.
+        assert_eq!(http_date("whenever you like"), None);
+        assert_eq!(http_date("Mon, 31 Foo 2026 12:56:01"), None);
+        assert_eq!(http_date("Mon, 31 Aug 2026 25:56:01"), None);
+    }
+
+    #[test]
+    fn the_rate_limit_message_gives_up_its_time() {
+        // The real message, from the run that stopped v0.1.7 one crate in.
+        let stderr = "error: failed to publish katsu-macros v0.1.7 to registry at \
+                      https://crates.io\n\nCaused by:\n  the remote server responded with an \
+                      error (status 429 Too Many Requests): You have published too many new \
+                      crates in a short period of time. Please try again after Mon, 31 Aug 2026 \
+                      12:56:01 GMT and see https://crates.io/docs/rate-limits for more details.\n";
+        assert_eq!(
+            rate_limited_until(stderr),
+            Some(UNIX_EPOCH + Duration::from_secs(1_788_180_961))
+        );
+        // A failure that is not a rate limit has no time in it and must not be waited out.
+        assert_eq!(
+            rate_limited_until("error: failed to verify package tarball"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_crate_is_uploaded_after_everything_it_depends_on() {
+        let json = serde_json::json!([
+            {"id": "a", "name": "katsu", "version": "0.1.7", "description": "d",
+             "license": "MIT", "readme": "r", "publish": null, "dependencies": [
+                {"name": "katsu-runtime", "kind": null, "req": "^0.1.7", "path": "/w/r"},
+                {"name": "anyhow", "kind": null, "req": "^1", "path": null}]},
+            {"id": "b", "name": "katsu-runtime", "version": "0.1.7", "description": "d",
+             "license": "MIT", "readme": "r", "publish": null, "dependencies": [
+                {"name": "katsu-ir", "kind": null, "req": "^0.1.7", "path": "/w/i"}]},
+            {"id": "c", "name": "katsu-ir", "version": "0.1.7", "description": "d",
+             "license": "MIT", "readme": "r", "publish": null, "dependencies": [
+                {"name": "katsu", "kind": "dev", "req": "^0.1.7", "path": "/w/a"}]},
+            {"id": "d", "name": "xtask", "version": "0.1.7", "description": null,
+             "license": null, "readme": null, "publish": [], "dependencies": []},
+        ]);
+        let packages: Vec<super::Package> = serde_json::from_value(json).unwrap();
+        let members: Vec<&super::Package> = packages.iter().collect();
+        let order = super::publish_order(&members).unwrap();
+        let names: Vec<&str> = order.iter().map(|package| package.name.as_str()).collect();
+        // katsu-ir goes first even though katsu dev depends on it, because a dev dependency is not
+        // part of what somebody downloading the crate resolves and counting it would be a cycle.
+        // xtask is not there at all, because it is `publish = false`.
+        assert_eq!(names, ["katsu-ir", "katsu-runtime", "katsu"]);
+    }
+
+    #[test]
+    fn a_cycle_is_named_rather_than_looped_on() {
+        let json = serde_json::json!([
+            {"id": "a", "name": "one", "version": "0.1.7", "description": "d", "license": "MIT",
+             "readme": "r", "publish": null, "dependencies": [
+                {"name": "two", "kind": null, "req": "^0.1.7", "path": "/w/two"}]},
+            {"id": "b", "name": "two", "version": "0.1.7", "description": "d", "license": "MIT",
+             "readme": "r", "publish": null, "dependencies": [
+                {"name": "one", "kind": null, "req": "^0.1.7", "path": "/w/one"}]},
+        ]);
+        let packages: Vec<super::Package> = serde_json::from_value(json).unwrap();
+        let members: Vec<&super::Package> = packages.iter().collect();
+        let error = match super::publish_order(&members) {
+            Ok(order) => panic!("a cycle produced an order of {} crates", order.len()),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("one, two"), "{error}");
     }
 
     #[test]

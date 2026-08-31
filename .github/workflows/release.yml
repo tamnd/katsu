@@ -111,39 +111,25 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
+    # A first release of a workspace this size is mostly waiting. crates.io lets an account create
+    # a burst of five crate names and then one every ten minutes, so fifteen new names take a little
+    # over two hours of sitting still. Once the names exist the limit is the one for new versions,
+    # which is a burst of thirty, and this job takes minutes again.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: Swatinem/rust-cache@v2.9.2
-      # Every rule this checks is one that cannot be undone once the upload has happened. The tag
-      # goes in as well, so a tag that does not match the version in the tree stops here rather
-      # than publishing the previous version under the new name.
+      # One command for fifteen crates. It runs the release check first, so a tag that does not
+      # match the version in the tree stops here rather than publishing the previous version under
+      # the new name, then uploads in dependency order, skips anything already on crates.io and
+      # waits out the rate limit rather than failing on it. Skipping is what makes a stopped run
+      # resumable by re-running the job, which cargo cannot do on its own.
       # The tag arrives through the environment rather than pasted into the command, because a
       # ref name is text somebody chose and text somebody chose does not belong in a shell line.
-      - run: cargo run -p xtask -- release --tag "$TAG"
+      - name: Publish
+        run: cargo run -p xtask -- publish --tag "$TAG"
         env:
           TAG: ${{ github.ref_name }}
-      # A release job can be re-run, and a re-run of one that already succeeded would otherwise
-      # fail on the first crate saying the version is already uploaded. Cargo has no flag for
-      # skipping what is already there, so the question is asked before the upload instead.
-      - name: Ask crates.io whether this version is already published
-        id: published
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 |
-            jq -r '.packages[] | select(.name == "katsu") | .version')
-          if curl -sfo /dev/null -A "katsu release workflow" \
-            "https://crates.io/api/v1/crates/katsu/$version"; then
-            echo "katsu $version is already on crates.io, so nothing is uploaded" >> "$GITHUB_STEP_SUMMARY"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-      # One command for fifteen crates. Cargo works out the order from the dependency graph and
-      # verifies the whole set builds as if it were already published before it uploads anything,
-      # which is the check that a hand written ordered list of publishes never had.
-      - name: Publish
-        if: steps.published.outputs.exists != 'true'
-        run: cargo publish --workspace --locked
-        env:
           # Replaced by trusted publishing once these crates exist on crates.io. That is the
           # better mechanism, because it swaps a long lived secret for a token minted for one
           # run, and it cannot be set up for a crate that has never been published. See issue

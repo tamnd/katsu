@@ -31,7 +31,9 @@ CI runs all four and a few more. The layer check is the one people hit first: de
 
 Bump `workspace.package.version` in the root `Cargo.toml` and the internal dependency versions under `[workspace.dependencies]` in the same edit, because they are the same number and CI fails if they drift. Run `cargo run -p xtask -- release` to check the workspace against what crates.io will accept, write the changelog entry, merge, then tag `vX.Y.Z` and push the tag.
 
-The tag is the whole trigger. The release workflow builds a binary for every tier 1 platform, attaches them to a GitHub release with checksums and a provenance attestation, and publishes all fifteen crates to crates.io in one `cargo publish --workspace`. The publish runs the same check again with the tag name in it, so a tag that does not match the version in the tree fails before anything is uploaded.
+The tag is the whole trigger. The release workflow builds a binary for every tier 1 platform, attaches them to a GitHub release with checksums and a provenance attestation, and publishes all fifteen crates to crates.io with `cargo run -p xtask -- publish`. That runs the same check again with the tag name in it, so a tag that does not match the version in the tree fails before anything is uploaded, then uploads in dependency order and skips whatever is already on the registry.
+
+Expect a first release of a new crate name to be slow, and expect to re-run the job. crates.io lets an account create a burst of five crate names and then one every ten minutes, which is what stopped 0.1.7 after one crate, so fifteen new names is a little over two hours of a job sitting still. The publish waits the limit out on its own and a re-run picks up where a stopped one left off. Once the names exist the limit is the one for new versions of existing crates, which is a burst of thirty, and the whole upload takes minutes.
 
 Nothing here is undoable. A version on crates.io can be yanked but never replaced, so the checks run on every commit rather than at tag time, and the answer to a bad release is another release.
 
