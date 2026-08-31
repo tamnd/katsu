@@ -33,6 +33,13 @@ use katsu_gc::{AtomTable, Attributes, BumpHeap, ObjectRef, ShapeRef, StringRef};
 /// linear walk should start to look bad next to a hash lookup.
 const COUNTS: [u32; 4] = [1, 2, 4, 16];
 
+/// How many elements the element benchmarks put on an object.
+///
+/// One number rather than the four above, because an element read does not walk anything and its
+/// cost is the same at every size. Sixteen so that the append benchmark crosses the doubling
+/// threshold twice and the amortisation is actually being measured.
+const COUNT: u32 = 16;
+
 /// Objects made per iteration, so the timer has something to measure.
 const BATCH: u32 = 1024;
 
@@ -316,5 +323,82 @@ fn transitions(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, creation, lookup, store, transitions);
+fn elements(c: &mut Criterion) {
+    let mut group = c.benchmark_group("object/element");
+
+    // Reading an index out of an object that has elements on it. The number to compare against is
+    // `object/get/last`, which is the same read through a name, and the gap between them is the
+    // entire argument for element storage: this one is a bounds check and a load, and that one is a
+    // walk up a parent chain. Neither of them includes the number formatting a computed key pays in
+    // the interpreter today, which is the larger half of 7.6.1's 156 nanoseconds.
+    group.bench_with_input(BenchmarkId::new("get", COUNT), &COUNT, |b, &count| {
+        let mut heap = heap(1 << 20);
+        let root = ShapeRef::root(&mut heap, None).unwrap();
+        let object = ObjectRef::new(&mut heap, root, 0).unwrap();
+        for index in 0..count {
+            object.set_element(&mut heap, index, u64::from(index));
+        }
+        let last = count - 1;
+        b.iter(|| black_box(object.element(heap.cage(), black_box(last))));
+    });
+
+    // Writing over an index that is already there, which has to touch nothing but the value.
+    group.bench_with_input(BenchmarkId::new("set", COUNT), &COUNT, |b, &count| {
+        let mut heap = heap(1 << 20);
+        let root = ShapeRef::root(&mut heap, None).unwrap();
+        let object = ObjectRef::new(&mut heap, root, 0).unwrap();
+        for index in 0..count {
+            object.set_element(&mut heap, index, u64::from(index));
+        }
+        let last = count - 1;
+        b.iter(|| black_box(object.set_element(&mut heap, black_box(last), 7)));
+    });
+
+    // Appending one at a time from nothing, which is the loop that builds an array and the one the
+    // doubling exists for. Divided by the count this should be close to the `set` above, because a
+    // geometric number of copies amortises to a constant, and the day it stops being close is the
+    // day the growth policy stopped doubling.
+    group.bench_with_input(BenchmarkId::new("append", COUNT), &COUNT, |b, &count| {
+        b.iter_batched(
+            || {
+                let mut heap = heap(BATCH as usize * 512);
+                let root = ShapeRef::root(&mut heap, None).unwrap();
+                (heap, root)
+            },
+            |(mut heap, root)| {
+                let object = ObjectRef::new(&mut heap, root, 0).unwrap();
+                for index in 0..count {
+                    black_box(object.set_element(&mut heap, index, u64::from(index)));
+                }
+                heap
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    // Asking for the room up front, which is what an array literal knows and a growing loop does
+    // not. One allocation against the four the append above pays for the same sixteen values.
+    group.bench_with_input(BenchmarkId::new("reserved", COUNT), &COUNT, |b, &count| {
+        b.iter_batched(
+            || {
+                let mut heap = heap(BATCH as usize * 512);
+                let root = ShapeRef::root(&mut heap, None).unwrap();
+                (heap, root)
+            },
+            |(mut heap, root)| {
+                let object = ObjectRef::new(&mut heap, root, 0).unwrap();
+                object.reserve_elements(&mut heap, count).unwrap();
+                for index in 0..count {
+                    black_box(object.set_element(&mut heap, index, u64::from(index)));
+                }
+                heap
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, creation, lookup, store, transitions, elements);
 criterion_main!(benches);

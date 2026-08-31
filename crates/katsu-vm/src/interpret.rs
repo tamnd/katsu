@@ -2277,7 +2277,8 @@ impl Interpreter {
             | HeapKind::Object
             | HeapKind::Shape
             | HeapKind::Properties
-            | HeapKind::AccessorPair => None,
+            | HeapKind::AccessorPair
+            | HeapKind::Elements => None,
         }
     }
 
@@ -2296,7 +2297,8 @@ impl Interpreter {
             | HeapKind::Object
             | HeapKind::Shape
             | HeapKind::Properties
-            | HeapKind::AccessorPair => None,
+            | HeapKind::AccessorPair
+            | HeapKind::Elements => None,
         }
     }
 
@@ -2318,7 +2320,8 @@ impl Interpreter {
             | HeapKind::Native
             | HeapKind::Shape
             | HeapKind::Properties
-            | HeapKind::AccessorPair => None,
+            | HeapKind::AccessorPair
+            | HeapKind::Elements => None,
         }
     }
 
@@ -3896,7 +3899,8 @@ impl Interpreter {
             | HeapKind::Object
             | HeapKind::Shape
             | HeapKind::Properties
-            | HeapKind::AccessorPair => None,
+            | HeapKind::AccessorPair
+            | HeapKind::Elements => None,
         }
     }
 
@@ -4057,7 +4061,8 @@ impl Interpreter {
                 | HeapKind::Context
                 | HeapKind::Shape
                 | HeapKind::Properties
-                | HeapKind::AccessorPair,
+                | HeapKind::AccessorPair
+                | HeapKind::Elements,
             )
             | None => "object",
         }
