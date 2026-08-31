@@ -64,6 +64,7 @@ use katsu_gc::{
 use katsu_ir::{AccessorHalf, Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
 
+use crate::cache::Site;
 use crate::inspect;
 use crate::number::{exponentiate, from_string, shift_count, to_int32, to_string, to_uint32};
 use crate::stack::{Invocation, Stack, StackError};
@@ -1433,10 +1434,21 @@ impl Interpreter {
                 // next piece of work rather than this one. What it costs until then is that every
                 // read walks the shape chain, which is the cost the module documentation in
                 // `shape.rs` is explicit about.
-                Op::GetProp { dst, obj, key, .. } => {
+                Op::GetProp {
+                    dst,
+                    obj,
+                    key,
+                    cache,
+                } => {
                     let object = self.stack.get(obj);
+                    let site = Site::new(&unit.function(function).caches, cache);
+                    let probe = self.probe(object);
+                    if let Some(value) = self.cached(probe, site) {
+                        self.stack.set(dst, value);
+                        continue;
+                    }
                     let name = self.name_at(constants, key);
-                    match guard!(self.property(object, name, blueprint, key)) {
+                    match guard!(self.property(object, probe, name, site, blueprint, key)) {
                         Found::Value(value) => self.stack.set(dst, value),
                         // A read that is a call, kept to two instructions here and done in a cold
                         // function. Everything this needs to say lives in registers the loop holds
@@ -1566,24 +1578,30 @@ impl Interpreter {
                     key,
                     args,
                     argc,
-                    ..
+                    cache,
                 } => {
                     let object = self.stack.get(obj);
-                    let name = self.name_at(constants, key);
-                    let target = match guard!(self.property(object, name, blueprint, key)) {
-                        Found::Value(value) => value,
-                        // `o.x()` where `x` is a getter is two calls, and the second one cannot be
-                        // set up until the first has returned. The loop has no way to hold a call
-                        // that is waiting on another call, because the only thing it resumes into
-                        // is the instruction after the one it left, so this refuses by name rather
-                        // than calling the getter and then losing its answer.
-                        Found::Getter(_) => {
-                            let key = Self::constant_name(blueprint, key);
-                            raise!(RuntimeError::Unsupported(format!(
-                                "calling '{key}', which is a getter, needs the result of the \
-                                 getter to become the callee and the interpreter has nowhere to \
-                                 keep a call that is waiting on another call"
-                            )));
+                    let site = Site::new(&unit.function(function).caches, cache);
+                    let probe = self.probe(object);
+                    let target = if let Some(value) = self.cached(probe, site) {
+                        value
+                    } else {
+                        let name = self.name_at(constants, key);
+                        match guard!(self.property(object, probe, name, site, blueprint, key)) {
+                            Found::Value(value) => value,
+                            // `o.x()` where `x` is a getter is two calls, and the second one cannot
+                            // be set up until the first has returned. The loop has no way to hold a
+                            // call that is waiting on another call, because the only thing it
+                            // resumes into is the instruction after the one it left, so this refuses
+                            // by name rather than calling the getter and then losing its answer.
+                            Found::Getter(_) => {
+                                let key = Self::constant_name(blueprint, key);
+                                raise!(RuntimeError::Unsupported(format!(
+                                    "calling '{key}', which is a getter, needs the result of the \
+                                     getter to become the callee and the interpreter has nowhere \
+                                     to keep a call that is waiting on another call"
+                                )));
+                            }
                         }
                     };
                     let Some(closure) = self.as_closure(target) else {
@@ -2123,18 +2141,25 @@ impl Interpreter {
     /// one back completely rather than partly. A cache that has matched a shape has established in
     /// that comparison that the slot is a plain value, because the flags are part of what the shape
     /// says, so the fast path does not read them and does not test them.
+    ///
+    /// The site is filled here rather than by the caller, because everything a fill needs is already
+    /// in hand at the moment the property is found and asking for it again means a second walk up the
+    /// same parent chain. That was measured: filling from the caller made the case where every site
+    /// is cold about half again as slow, which is the whole search paid twice.
     #[inline]
     fn property(
         &self,
         object: Value,
+        probe: Option<(ObjectRef, u32)>,
         name: StringRef,
+        site: Site,
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> Result<Found, RuntimeError> {
         if object.is_undefined() || object.is_null() {
             return Err(Self::nothing_to_read(object, blueprint, key));
         }
-        let Some(record) = self.as_object(object) else {
+        let Some((record, guard)) = probe else {
             return Ok(Found::Value(Value::UNDEFINED));
         };
         let cage = self.isolate.cage();
@@ -2142,6 +2167,9 @@ impl Interpreter {
             let bits = record
                 .value_at(cage, index)
                 .expect("a property the shape has is a property the object has room for");
+            if !attributes.is_accessor() {
+                site.fill(guard, index);
+            }
             return Ok(self.found(bits, attributes));
         }
         Ok(self.inherited(record, name))
@@ -2160,6 +2188,42 @@ impl Interpreter {
             return Found::Value(Value::from_bits(bits));
         }
         self.getter_of(Value::from_bits(bits))
+    }
+
+    /// The object a property read is about to run against, together with its shape.
+    ///
+    /// Both halves of a read need this and neither should pay for it twice. A hit needs the shape to
+    /// compare and the object to read the value out of, and a miss needs the same object to search
+    /// and the same shape to write into the site. Asking for the object again after the comparison
+    /// failed was the first shape of this and it cost about what the search itself costs, because
+    /// deciding that a value is an object is a tag test and a load of the heap kind and those are not
+    /// free at the rate a property read runs.
+    ///
+    /// `None` for anything that is not an object, which is every primitive. Those have properties in
+    /// the language and not here yet, so there is nothing to guard and nothing to cache.
+    #[inline]
+    fn probe(&self, object: Value) -> Option<(ObjectRef, u32)> {
+        let record = self.as_object(object)?;
+        Some((record, record.guard(self.isolate.cage())))
+    }
+
+    /// Read a property from what this site learned last time, or `None` if it has to be looked up.
+    ///
+    /// One comparison and one read on a hit, on top of the probe both halves pay. What is not there
+    /// is the whole point. No walk up the shape's parent chain comparing names, no read of the
+    /// property's flags to find out whether the slot holds a value or a pair of functions, and no
+    /// second walk up the prototype chain when the object itself does not have the name. The shape
+    /// already settled all three, because the prototype and the flags are both in it.
+    ///
+    /// A miss is one comparison wasted, which is what the fill has to earn back. See `cache.rs` for
+    /// what an entry holds and what it deliberately does not cover yet.
+    #[inline]
+    fn cached(&self, probe: Option<(ObjectRef, u32)>, site: Site) -> Option<Value> {
+        let (record, guard) = probe?;
+        let index = site.hit(guard)?;
+        Some(Value::from_bits(
+            record.value_of(self.isolate.cage(), index),
+        ))
     }
 
     /// The getter half of a pair, or `undefined` when the property has no getter.
@@ -5741,6 +5805,69 @@ mod tests {
                 "function id(v) { return v; } id({ x: 5, y: 2, get x() { return 1; } })"
             ),
             "{ x: [Getter], y: 2 }"
+        );
+    }
+
+    #[test]
+    fn one_site_reading_two_objects_that_share_a_shape_and_not_a_size_reads_both_right() {
+        // `{a: 1}` is built with room for one property and `x = {}; x.a = 1` is built with room for
+        // none, so the first keeps its property inside the object and the second keeps it in the
+        // overflow array. They reach the same shape, which is exactly the point: one entry answers
+        // for both of them, and it has to, because a cache that remembered a byte offset instead of
+        // a position would read sixteen bytes into an object that has no inline values at all.
+        assert_eq!(
+            evaluate_number(
+                "function read(o) { return o.a; } var packed = { a: 1 }; var grown = {}; grown.a = 2; read(packed) * 10 + read(grown)"
+            ),
+            12.0
+        );
+        // And in the other order, so that the entry being overwritten is the one that cannot be
+        // used rather than the one that can.
+        assert_eq!(
+            evaluate_number(
+                "function read(o) { return o.a; } var packed = { a: 1 }; var grown = {}; grown.a = 2; read(grown) * 10 + read(packed)"
+            ),
+            21.0
+        );
+    }
+
+    #[test]
+    fn a_site_reads_the_right_property_after_the_object_it_learned_from_has_grown() {
+        // Adding a property takes a transition, so the object's shape changes and the entry stops
+        // matching. The site has to notice, because the property it cached could have moved.
+        assert_eq!(
+            evaluate_number(
+                "function read(o) { return o.a; } var o = { a: 1 }; var before = read(o); o.b = 2; before * 10 + read(o)"
+            ),
+            11.0
+        );
+    }
+
+    #[test]
+    fn a_property_out_in_the_overflow_array_reads_the_same_every_time() {
+        // Five properties on an object built with room for none, so the last of them is well past
+        // the inline area and behind the overflow pointer. A cached position means the same thing
+        // there as inside the object, so this is a case the cache does remember, and what it reads
+        // on the second visit has to be the property rather than whatever is at that position inside
+        // an object that has no inline room.
+        assert_eq!(
+            evaluate_number(
+                "function read(o) { return o.e; } var o = {}; o.a = 1; o.b = 2; o.c = 3; o.d = 4; o.e = 5; read(o) * 10 + read(o)"
+            ),
+            55.0
+        );
+    }
+
+    #[test]
+    fn a_site_that_sees_two_kinds_of_object_answers_for_each_of_them() {
+        // Two different shapes with the property at two different positions, alternating through one
+        // site, which is the polymorphic case. There is one entry, so this is a miss every time
+        // after the first, and a miss has to be a full lookup rather than the last answer.
+        assert_eq!(
+            evaluate_number(
+                "function read(o) { return o.a; } var one = { a: 1, b: 0 }; var two = { b: 0, a: 2 }; read(one) + read(two) * 10 + read(one) * 100 + read(two) * 1000"
+            ),
+            2121.0
         );
     }
 

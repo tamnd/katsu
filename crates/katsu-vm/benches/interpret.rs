@@ -47,12 +47,15 @@
 //! language that is not free. It is measured per instruction like the dispatch group, and the number
 //! to read it against is `move_chain`, which is the same instruction shape with no lookup in it.
 //!
-//! The `property` group is the operation spec 4 says the whole architecture is judged on, measured
-//! in the form it has before there are shapes to cache against. A record's lookup is a linear scan
-//! over interned addresses, so `prop_load` is what eight four byte compares in one cache line cost,
-//! and it is the number M1's inline caches have to beat rather than a placeholder to be replaced
-//! without checking. `method_call` is the same lookup with a call on the end of it, which is the
-//! most common call shape in real code and is why it is one opcode rather than two.
+//! The `property` group is the operation spec 4 says the whole architecture is judged on, and it is
+//! two questions rather than one now that there are inline caches. `prop_load_hot` is the question
+//! real code asks, which is what a site costs once it has seen the kind of object it is going to
+//! keep seeing, and `prop_load` is the opposite corner: a thousand sites each run exactly once, so
+//! every one of them fills an entry nothing will ever read. Neither is the whole answer and the
+//! honest description of a cache needs both, because what a cache costs when it cannot help is as
+//! much a fact about it as what it saves when it can. `method_call` is a lookup with a call on the
+//! end of it, which is the most common call shape in real code and is why it is one opcode rather
+//! than two, and its sites are all cold for the same reason `prop_load`'s are.
 //!
 //! The `object` group is what building an object costs, reported per object rather than per
 //! instruction, since a literal is a `new_object` and one store per property rather than one
@@ -485,10 +488,11 @@ fn properties(c: &mut Criterion) {
     let mut group = c.benchmark_group("property");
     group.throughput(Throughput::Elements(CHAIN as u64));
 
-    // The operation the whole architecture is judged on, in the form it has before there are shapes.
-    // The number to read it against is `global_load`, because both of them are a name lookup and the
-    // question M1 has to answer is whether a shape and an inline cache beat a scan of eight
-    // addresses in one cache line.
+    // A thousand sites, each one run exactly once, which is the worst case a cache can be put in:
+    // every read pays the search it always paid, plus a comparison against an empty entry and a
+    // write into a cache line nothing has touched, and nothing ever comes back to collect. The
+    // number to read it against is `global_load`, because both of them are a name lookup, and the
+    // number to read it next to is `prop_load_hot`.
     let mut source = String::new();
     for _ in 0..CHAIN {
         source.push_str("host.p7;\n");
@@ -497,6 +501,31 @@ fn properties(c: &mut Criterion) {
     group.bench_function("prop_load", |b| {
         let mut interpreter = realm();
         b.iter(|| black_box(interpreter.run(black_box(&loads))));
+    });
+
+    // The same thousand reads through ten sites instead of a thousand, which is the case an inline
+    // cache exists for and the case real code is made of. Every site is cold once and hot ninety
+    // nine times.
+    //
+    // Half of what this measures is the global lookup that `host` costs on every line, so the line
+    // moves less than the property read inside it does. Subtracting `globals/global_load` and four
+    // tenths of `dispatch/move_chain` for the loop leaves the read on its own, which is the number
+    // worth quoting about a property read and is why those two are worth measuring in the same
+    // session as this one.
+    //
+    // Ten reads inside the loop rather than one, so that the compare, the add and the back edge are a
+    // tenth of the measurement instead of most of it.
+    let mut body = String::new();
+    for _ in 0..10 {
+        body.push_str("  host.p7;\n");
+    }
+    let hot = program(&format!(
+        "var i = 0;\nwhile (i < {}) {{\n{body}  i = i + 1;\n}}\n",
+        CHAIN / 10
+    ));
+    group.bench_function("prop_load_hot", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&hot))));
     });
 
     // Two instructions per line, the constant and the store, which is the same shape `global_store`

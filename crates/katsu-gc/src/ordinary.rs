@@ -309,6 +309,62 @@ impl ObjectRef {
             .collect()
     }
 
+    /// The word an inline cache compares, which is this object's shape.
+    ///
+    /// Two objects with the same word have the same properties in the same order, with the same
+    /// flags, inheriting from the same prototype. That is everything a site needs to be sure that the
+    /// position it found a name at last time is the position it would find it at now, which is why a
+    /// cache can key on this one word and read nothing else about the layout.
+    ///
+    /// The raw slot bits rather than a [`ShapeRef`], because a cache stores what it compares and
+    /// building a reference to a shape nothing is going to read is work with no answer in it.
+    #[must_use]
+    pub fn guard(self, cage: &Cage) -> u32 {
+        self.field(cage, SHAPE_OFFSET)
+    }
+
+    /// The value of the property at a position that a matched guard word has already established.
+    ///
+    /// The same read [`ObjectRef::value_at`] does without the two bounds tests, because a site whose
+    /// guard word matched knows the shape, and the shape is what says how many properties there are.
+    /// Both tests are loads of their own, and the second one goes through the shape, so skipping them
+    /// is most of what makes a hit cheaper than a search.
+    ///
+    /// The inline capacity is still read, because it is the one thing about the layout the shape does
+    /// not fix: `{a: 1}` is built with room for one and `x = {}; x.a = 1` is built with room for
+    /// none, and both reach the same shape. That is a load and a compare off a header word that is
+    /// already in cache, and paying it here is what lets an overflow property be cached at all.
+    ///
+    /// # Panics
+    ///
+    /// Never, for an index that came from [`ObjectRef::find`] on a matching shape. An index from
+    /// anywhere else is a bug, and the expectation below says so rather than reading a wrong word.
+    #[must_use]
+    pub fn value_of(self, cage: &Cage, index: u32) -> u64 {
+        let inline = self.inline(cage);
+        if index < inline {
+            // SAFETY: the index is below the inline capacity the header records, so the value is
+            // inside the allocation, and the shape it came from says it has been written.
+            return unsafe {
+                read_u64(
+                    cage.address_of(self.offset()),
+                    HEADER_SIZE + (index as usize) * VALUE_SIZE,
+                )
+            };
+        }
+        let properties = self
+            .properties(cage)
+            .expect("a property past the inline room is a property in the overflow array");
+        // SAFETY: the shape says the object has this property, and everything the shape counts that
+        // does not fit inside the object has room in the array.
+        unsafe {
+            read_u64(
+                cage.address_of(properties.offset()),
+                PROPERTIES_HEADER + ((index - inline) as usize) * VALUE_SIZE,
+            )
+        }
+    }
+
     /// The value of the property at `index`, or `None` if the index is past the end.
     #[must_use]
     pub fn value_at(self, cage: &Cage, index: u32) -> Option<u64> {
