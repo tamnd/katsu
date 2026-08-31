@@ -27,6 +27,14 @@ If you touched anything on a hot path, also run the benchmarks on a reference ma
 
 CI runs all four and a few more. The layer check is the one people hit first: dependencies point strictly downward through the stack in [`spec/03-architecture.md`](spec/03-architecture.md), and adding an upward edge fails the build with the edge named.
 
+## Releasing
+
+Bump `workspace.package.version` in the root `Cargo.toml` and the internal dependency versions under `[workspace.dependencies]` in the same edit, because they are the same number and CI fails if they drift. Run `cargo run -p xtask -- release` to check the workspace against what crates.io will accept, write the changelog entry, merge, then tag `vX.Y.Z` and push the tag.
+
+The tag is the whole trigger. The release workflow builds a binary for every tier 1 platform, attaches them to a GitHub release with checksums and a provenance attestation, and publishes all fifteen crates to crates.io in one `cargo publish --workspace`. The publish runs the same check again with the tag name in it, so a tag that does not match the version in the tree fails before anything is uploaded.
+
+Nothing here is undoable. A version on crates.io can be yanked but never replaced, so the checks run on every commit rather than at tag time, and the answer to a bad release is another release.
+
 ## House rules for code
 
 No unsafe code above the platform, object model and JIT layers. `spec/14-quality-bar.md` is specific about where unsafe is allowed and what it costs to add a block, and the short version is that every one needs a comment saying what invariant makes it sound.

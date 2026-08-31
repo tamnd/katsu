@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+keywords = ["javascript", "typescript", "runtime", "embedding", "jit"]
+categories = ["compilers", "development-tools"]
 
 [lints]
 workspace = true

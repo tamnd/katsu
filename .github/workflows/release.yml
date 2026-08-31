@@ -94,3 +94,58 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # The crates are a release artifact like the binaries are, listed as one in
+  # spec/16-package-layout.md, because `cargo add katsu-runtime` is how anybody embeds this in a
+  # Rust program. They go up after the binaries have built on every tier 1 platform, since a
+  # version on crates.io can be yanked but never replaced and a build failure is a much better
+  # place to find out than a yank is.
+  crates:
+    name: crates.io
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # The token is a secret on this environment rather than on the repository, and the
+    # environment takes deployments only from a tag matching v*, so nothing running on a branch
+    # or on a pull request can reach it even by asking for it by name.
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      # Every rule this checks is one that cannot be undone once the upload has happened. The tag
+      # goes in as well, so a tag that does not match the version in the tree stops here rather
+      # than publishing the previous version under the new name.
+      # The tag arrives through the environment rather than pasted into the command, because a
+      # ref name is text somebody chose and text somebody chose does not belong in a shell line.
+      - run: cargo run -p xtask -- release --tag "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+      # A release job can be re-run, and a re-run of one that already succeeded would otherwise
+      # fail on the first crate saying the version is already uploaded. Cargo has no flag for
+      # skipping what is already there, so the question is asked before the upload instead.
+      - name: Ask crates.io whether this version is already published
+        id: published
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "katsu") | .version')
+          if curl -sfo /dev/null -A "katsu release workflow" \
+            "https://crates.io/api/v1/crates/katsu/$version"; then
+            echo "katsu $version is already on crates.io, so nothing is uploaded" >> "$GITHUB_STEP_SUMMARY"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      # One command for fifteen crates. Cargo works out the order from the dependency graph and
+      # verifies the whole set builds as if it were already published before it uploads anything,
+      # which is the check that a hand written ordered list of publishes never had.
+      - name: Publish
+        if: steps.published.outputs.exists != 'true'
+        run: cargo publish --workspace --locked
+        env:
+          # Replaced by trusted publishing once these crates exist on crates.io. That is the
+          # better mechanism, because it swaps a long lived secret for a token minted for one
+          # run, and it cannot be set up for a crate that has never been published. See issue
+          # #78.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
