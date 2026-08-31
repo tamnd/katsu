@@ -2,6 +2,18 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.8
+
+0.1.7 did not finish, so this is 0.1.7 again with the part that failed fixed. Nothing in the engine changed between the two and every number in the entry below still stands.
+
+What failed is worth writing down rather than quietly correcting. The first release to publish the crates uploaded `katsu-ir` and then stopped with a 429, because crates.io lets one account create a burst of five new crate names and then one every ten minutes. Fifteen new names in one `cargo publish --workspace` was never going to work, and there is no flag anywhere in cargo for skipping a version that is already uploaded, so a re-run of that job would have failed immediately on the crate that did go up. The rate limit was researched before the workflow was written and this specific limit was not found, which is the honest version of what went wrong.
+
+`cargo xtask publish` replaces the workspace publish in the release workflow. It works the order out from the dependency graph the same way, asks crates.io per crate whether the version is there and skips it if it is, and when it does hit the limit it reads the time out of the message and waits until then. A stopped release now finishes on a re-run and a first release finishes on its own, at the cost of a job that sits still for a little over two hours the one time fifteen names are new. Every release after this one is fast, because the limit for a new version of a crate that already exists is a burst of thirty. CI runs the same command with `--dry-run` on every commit, and `cargo publish --workspace --dry-run` stays where it was, because verifying that the whole set builds as if it were already published is the one thing only that command does.
+
+`katsu-ir 0.1.7` stays on crates.io as the only piece of that tag. Yanking it would say the version is broken and it is not, it is simply alone, and the answer to a partial release is another release.
+
+The workload baseline for this release is measured against the 0.1.8 tarball rather than a local build, so it lands after the tag and is quoted in the pull request that follows this one, the same way 0.1.6 was done.
+
 ## 0.1.7
 
 The seventh patch release of M1, four pull requests on from 0.1.6, and the one sentence that matters is that the wall came down. `throw new Test262Error(message)` is the first line of most of test262, `new` did not exist for six releases, and the conformance number sat at 6.66 percent for five of them because of it. It is 12.31 percent now, 9,995 cases against 5,410, and nothing regressed on the way.
@@ -46,7 +58,7 @@ Nothing in this release could be measured on either reference machine, and that 
 
 The tell is that last benchmark. An engine error now allocates a real object with a properties object and a prototype where it used to build a bare value, so it cannot have got faster, and the branch measured ten percent quicker than main on it. That is a measurement of the laptop and not of the change. The cost of allocating an error per throw is still owed a number on a machine that can produce one, and issue #1 in the bench repository is where that stops being an excuse.
 
-The workload baseline for this release is measured against the released tarball rather than a local build, so it lands after the tag and is quoted in the pull request that follows this one, the same way 0.1.6 was done.
+The workload baseline for this release is measured against a released tarball rather than a local build, and the tarball it is taken from is 0.1.8, because the 0.1.7 tag published one crate out of fifteen and the entry above it says why.
 
 ### Where the conformance number stands
 
