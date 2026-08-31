@@ -40,8 +40,10 @@
 //! `new Array(1000)` both cost exactly what their values cost.
 //!
 //! This crate does not know what a `Value` is, and does not need to. It moves eight byte words
-//! around and the one thing it knows about their contents is that zero means nothing is there, which
-//! is the same thing `ordinary.rs` already relies on for its properties word.
+//! around and the one thing it knows about their contents is that the two smallest numbers are not
+//! values: zero means nothing was ever written here, and one means the property is on this object
+//! under the text of the number instead. Zero meaning nothing is the same thing `ordinary.rs`
+//! already relies on for its properties word.
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
@@ -60,6 +62,26 @@ const VALUE_SIZE: usize = 8;
 /// each use, because the three places that compare against it are making a claim about the value
 /// encoding and not about arithmetic.
 pub const HOLE: u64 = 0;
+
+/// What an index reads back as when the property is here but its value is not.
+///
+/// One, which is not a value any encoding produces, so it cannot be confused with one. It means the
+/// index is a property of this object under the text of the number instead, and the reader has to go
+/// and look for it there. Two things put it in: an index too sparse for an array, once the array has
+/// grown out past it, and a property defined at an index with flags the storage here cannot hold.
+/// Both are rare, and what they have in common is that the alternative is the same property in two
+/// places at once, which answers differently depending on which one the reader happened to look at.
+pub const NAMED: u64 = 1;
+
+/// Whether these bits are a value rather than one of the two words that stand in for the absence of
+/// one.
+///
+/// One comparison rather than two, which is why [`HOLE`] and [`NAMED`] are the two smallest numbers
+/// there are. This is on the read path of every `a[i]` in every program, so the shape of it matters.
+#[must_use]
+pub const fn is_value(bits: u64) -> bool {
+    bits > NAMED
+}
 
 /// How many values the first elements array holds.
 ///
@@ -89,6 +111,11 @@ pub enum Stored {
     /// The index is too far past the end for element storage to pay, and the caller should put the
     /// value under the text of the number instead.
     TooSparse,
+    /// The index is already a property of this object under the text of the number, so the write
+    /// belongs there and not here. Same answer as [`Stored::TooSparse`] for the caller and a
+    /// different reason, and they are told apart because only one of them says anything about how
+    /// much room an array would take.
+    Named,
     /// The heap is full, or the array the write asked for would be larger than the cage.
     NoRoom,
 }
@@ -177,7 +204,7 @@ impl ElementsRef {
     pub fn used(self, cage: &Cage) -> Option<u32> {
         (0..self.capacity(cage))
             .rev()
-            .find(|&index| self.value_at(cage, index) != HOLE)
+            .find(|&index| is_value(self.value_at(cage, index)))
             .map(|index| index + 1)
     }
 
@@ -219,7 +246,7 @@ impl ElementsRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{ELEMENTS_HEADER, ElementsRef, HOLE, MAX_GAP};
+    use super::{ELEMENTS_HEADER, ElementsRef, HOLE, MAX_GAP, NAMED, is_value};
     use crate::bump::BumpHeap;
     use crate::cage::Slot;
     use crate::object::HeapKind;
@@ -276,6 +303,17 @@ mod tests {
         elements.set(&mut heap, 0, 11);
         elements.set(&mut heap, 4, 55);
         assert_eq!(elements.used(heap.cage()), Some(5));
+    }
+
+    #[test]
+    fn the_two_words_that_are_not_values_are_the_two_smallest_numbers() {
+        // The whole point of the pair, because it makes the test on the read path one comparison.
+        // If either of these ever moves, `is_value` has to stop being a single `>`.
+        assert_eq!(HOLE, 0);
+        assert_eq!(NAMED, 1);
+        assert!(!is_value(HOLE));
+        assert!(!is_value(NAMED));
+        assert!(is_value(2));
     }
 
     #[test]

@@ -59,7 +59,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use katsu_gc::{
-    AccessorPairRef, Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, StringRef,
+    AccessorPairRef, Attributes, ClosureRef, ContextRef, HeapKind, NativeRef, ObjectRef, Stored,
+    StringRef, is_value,
 };
 use katsu_ir::{AccessorHalf, Constant, FunctionBlueprint, Op, Register};
 use smallvec::SmallVec;
@@ -70,6 +71,13 @@ use crate::number::{exponentiate, from_string, shift_count, to_int32, to_string,
 use crate::stack::{Invocation, Stack, StackError};
 use crate::unit::{Resolved, Unit};
 use crate::{Isolate, Value};
+
+/// The named properties of one object: the name, the slot it holds the value at, and its flags.
+///
+/// What `ObjectRef::enumerable` hands back, and what the printer passes between the two halves of
+/// deciding what an object looks like. A name and a slot rather than a name and a value, because an
+/// accessor's slot holds a pair of functions and the printer has to know that before it reads it.
+type Names = Vec<(StringRef, u32, Attributes)>;
 
 /// Why execution stopped somewhere other than a `return`.
 ///
@@ -813,12 +821,14 @@ impl Interpreter {
         self.as_closure(value).is_some() || self.as_native(value).is_some()
     }
 
-    /// The own properties of an object, in the order they were added, or `None` if it is not one.
+    /// The own properties of an object, in the order the language enumerates them, or `None` if it
+    /// is not one.
     ///
-    /// Insertion order rather than any other order, because that is the order the language
-    /// guarantees for string keys that are not array indices, and it is the order `JSON.stringify`
-    /// and `Object.keys` both have to produce. It falls out of shapes for free: a shape is a
-    /// transition chain and the chain is in the order the properties arrived.
+    /// The indices come first in ascending order and the rest follow in the order they were added,
+    /// which is the order the language guarantees and the order `JSON.stringify` and `Object.keys`
+    /// both have to produce. Neither half needs sorting to get there. The names fall out of shapes:
+    /// a shape is a transition chain and the chain is in the order the properties arrived. The
+    /// indices fall out of the element storage, which is a flat array and so is already ascending.
     ///
     /// `None` and not an empty vector for a non object, because a caller usually has something
     /// different to do with a number than with an object that happens to have no properties.
@@ -835,22 +845,40 @@ impl Interpreter {
             return self.is_callable(value).then(Vec::new);
         };
         let cage = self.isolate.cage();
-        Some(
-            object
-                .enumerable(cage)
-                .into_iter()
-                .map(|(name, index, attributes)| {
-                    let slot = object
-                        .value_at(cage, index)
-                        .expect("a name at this index means there is a value at it");
-                    (
-                        name.to_utf8_lossy(cage).into_owned(),
-                        Value::from_bits(slot),
-                        attributes,
-                    )
-                })
-                .collect(),
-        )
+        let mut indexed: Vec<(u32, Value, Attributes)> = self
+            .element_indices(object)
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    Value::from_bits(object.element(cage, index)),
+                    Attributes::DEFAULT,
+                )
+            })
+            .collect();
+        let mut named = Vec::new();
+        for (name, at, attributes) in object.enumerable(cage) {
+            let value = Value::from_bits(
+                object
+                    .value_at(cage, at)
+                    .expect("a name at this index means there is a value at it"),
+            );
+            // An index the element storage could not hold is still an index, and it enumerates with
+            // the others rather than where it happens to sit in the shape.
+            match self.name_as_index(name) {
+                Some(index) => indexed.push((index, value, attributes)),
+                None => named.push((name.to_utf8_lossy(cage).into_owned(), value, attributes)),
+            }
+        }
+        // The elements are already ascending and a name that spells an index is rare, so this is a
+        // sort of an almost sorted list and usually compares nothing at all.
+        indexed.sort_by_key(|&(index, ..)| index);
+        let mut properties: Vec<(String, Value, Attributes)> = indexed
+            .into_iter()
+            .map(|(index, value, attributes)| (index.to_string(), value, attributes))
+            .collect();
+        properties.extend(named);
+        Some(properties)
     }
 
     /// Whether this value is an ordinary object, meaning something a property can be defined on.
@@ -986,10 +1014,21 @@ impl Interpreter {
     ///
     /// Own and not inherited, which is the question `Object.getOwnPropertyDescriptor` asks and the
     /// one [`Interpreter::lookup`] does not.
+    ///
+    /// The element storage is asked first, and what it answers with is always the default flags,
+    /// because nothing can put a property with any other flags in there. `Object.defineProperty`
+    /// refuses an index for exactly that reason, so a hidden or a read only index is a property by
+    /// name and is found by the search below.
     pub fn own_descriptor(&mut self, object: Value, name: &str) -> Option<(Value, Attributes)> {
         let name = self.isolate.intern(name)?.as_string();
         let object = self.reachable(object)?;
         let cage = self.isolate.cage();
+        if let Some(index) = self.name_as_index(name) {
+            let bits = object.element(cage, index);
+            if is_value(bits) {
+                return Some((Value::from_bits(bits), Attributes::DEFAULT));
+            }
+        }
         let (index, attributes) = object.find(cage, name)?;
         let bits = object.value_at(cage, index)?;
         Some((Value::from_bits(bits), attributes))
@@ -1009,6 +1048,11 @@ impl Interpreter {
     /// already checked that and thrown a message naming itself, so this is the answer for a caller
     /// that did not, and it is deliberately not one of the messages Node prints. Returns
     /// [`RuntimeError::OutOfMemory`] if the heap has no room for the name or the new shape.
+    ///
+    /// An array index with the default flags goes into the element storage, so that
+    /// `Object.defineProperty(o, '0', d)` and `o[0] = 1` reach the same property. With any other
+    /// flags it goes under the name, because the element storage holds values and not flags, and the
+    /// slot it would have used is marked so that the two cannot both exist.
     pub fn define_property(
         &mut self,
         object: Value,
@@ -1031,6 +1075,21 @@ impl Interpreter {
             .intern(name)
             .ok_or(RuntimeError::OutOfMemory)?
             .as_string();
+        if let Some(index) = self.name_as_index(name) {
+            if attributes == Attributes::DEFAULT {
+                match target.set_element(self.isolate.heap_mut(), index, value.to_bits()) {
+                    Stored::Yes => return Ok(()),
+                    Stored::NoRoom => return Err(RuntimeError::OutOfMemory),
+                    // Too sparse to be worth an array, or already living under this name. Either way
+                    // it belongs under the name and the define below is where it goes.
+                    Stored::Named | Stored::TooSparse => {}
+                }
+            }
+            // Anything the element storage cannot describe goes under the name, and the slot it
+            // would have used is marked so that a later `o[i] = v` finds the name rather than making
+            // a second copy of the property beside it.
+            target.mark_named(self.isolate.heap_mut(), index);
+        }
         target
             .define(self.isolate.heap_mut(), name, value.to_bits(), attributes)
             .ok_or(RuntimeError::OutOfMemory)
@@ -1743,6 +1802,13 @@ impl Interpreter {
                 // hand back the wrong property rather than miss. Caching this needs a site that
                 // guards the key as well, which is the CacheIR work on the next line of M1, and until
                 // then the operand is carried and ignored.
+                //
+                // An index that the object has an element for never reaches any of that. It is a
+                // load of the elements word, a bounds check and a load, with no text, no hash and no
+                // shape, which is the whole reason element storage exists. A miss falls through to
+                // the named search, because a hole is not an answer: the index may be a name the
+                // object holds because it was too sparse to store, or one the prototype chain holds,
+                // and both of those are the search below.
                 Op::GetIndex {
                     dst,
                     obj,
@@ -1754,9 +1820,23 @@ impl Interpreter {
                     if object.is_nullish() {
                         raise!(self.nothing_to_read_at(object, key));
                     }
+                    let index = self.array_index(key);
+                    if let Some(index) = index
+                        && let Some(target) = self.as_object(object)
+                    {
+                        let bits = target.element(self.isolate.cage(), index);
+                        if is_value(bits) {
+                            self.stack.set(dst, Value::from_bits(bits));
+                            continue;
+                        }
+                    }
                     let name = guard!(self.property_key(key));
                     let probe = guard!(self.holder(object));
-                    match self.property_named(probe, name) {
+                    let found = match index {
+                        Some(index) => self.property_indexed(probe, name, index),
+                        None => self.property_named(probe, name),
+                    };
+                    match found {
                         Found::Value(value) => self.stack.set(dst, value),
                         Found::Getter(getter) => {
                             if let Some((index, callee)) =
@@ -1788,8 +1868,16 @@ impl Interpreter {
                     if object.is_nullish() {
                         raise!(self.nothing_to_write_at(object, key));
                     }
-                    let name = guard!(self.property_key(key));
                     let new = self.stack.get(value);
+                    // The write half of the same fast path. An index on an ordinary object goes
+                    // straight into the elements array, which is where it belongs and where the read
+                    // above is going to look for it. The one answer that is not a write is a refusal
+                    // for being too sparse, which falls through and stores the value under the text
+                    // of the number, and the read finds it there after missing the hole.
+                    if guard!(self.set_element_of(object, key, new)) {
+                        continue;
+                    }
+                    let name = guard!(self.property_key(key));
                     let target = match self.as_object(object) {
                         Some(target) => target,
                         None => match guard!(self.function_object(object)) {
@@ -1835,6 +1923,11 @@ impl Interpreter {
                 // A property of an object literal. The object is the one being built a few
                 // instructions ago, so it is always an object and the nullish checks that guard a
                 // store have nothing to do here.
+                //
+                // A key that spells an array index goes to the elements array rather than into the
+                // shape, because that is where `o[0]` is going to look for it and one property in
+                // two places is two properties. `{'0': 1}` and `o[0] = 1` have to be the same thing
+                // afterwards, and this is what makes them so.
                 Op::DefineValue {
                     obj, key, value, ..
                 } => {
@@ -1842,16 +1935,43 @@ impl Interpreter {
                     let name = self.name_at(constants, key);
                     let new = self.stack.get(value);
                     if let Some(target) = self.as_object(object) {
-                        guard!(
-                            target
-                                .define(
-                                    self.isolate.heap_mut(),
-                                    name,
-                                    new.to_bits(),
-                                    Attributes::DEFAULT
-                                )
-                                .ok_or(RuntimeError::OutOfMemory)
-                        );
+                        match self.name_as_index(name) {
+                            Some(index) => match target.set_element(
+                                self.isolate.heap_mut(),
+                                index,
+                                new.to_bits(),
+                            ) {
+                                Stored::Yes => {}
+                                Stored::NoRoom => raise!(RuntimeError::OutOfMemory),
+                                // Too far past the end to be worth an array, or already a name on
+                                // this object. Either way it stays a name, and the read finds it
+                                // there after missing the hole.
+                                Stored::Named | Stored::TooSparse => {
+                                    guard!(
+                                        target
+                                            .define(
+                                                self.isolate.heap_mut(),
+                                                name,
+                                                new.to_bits(),
+                                                Attributes::DEFAULT
+                                            )
+                                            .ok_or(RuntimeError::OutOfMemory)
+                                    );
+                                }
+                            },
+                            None => {
+                                guard!(
+                                    target
+                                        .define(
+                                            self.isolate.heap_mut(),
+                                            name,
+                                            new.to_bits(),
+                                            Attributes::DEFAULT
+                                        )
+                                        .ok_or(RuntimeError::OutOfMemory)
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -2982,6 +3102,42 @@ impl Interpreter {
         self.inherited(record, name)
     }
 
+    /// The same search again for a key that spells an array index.
+    ///
+    /// The caller has already looked in the object's own elements and found a hole, so this starts
+    /// with the object's names and walks up from there. What it does not do is walk the chain twice,
+    /// once for the index and once for the name, and the reason is shadowing. An element on an object
+    /// has to hide a name of the same text on a prototype, and a name on an object has to hide an
+    /// element on a prototype, so whichever of the two walks ran first would be wrong about one of
+    /// those. Asking each level for both, in the order the level itself stores them, is the only
+    /// arrangement that gets both right.
+    fn property_indexed(
+        &self,
+        probe: Option<(ObjectRef, u32)>,
+        name: StringRef,
+        index: u32,
+    ) -> Found {
+        let Some((record, _)) = probe else {
+            return Found::Value(Value::UNDEFINED);
+        };
+        let cage = self.isolate.cage();
+        let mut holder = Some(record);
+        while let Some(current) = holder {
+            let bits = current.element(cage, index);
+            if is_value(bits) {
+                return Found::Value(Value::from_bits(bits));
+            }
+            if let Some((at, attributes)) = current.find(cage, name) {
+                let bits = current
+                    .value_at(cage, at)
+                    .expect("a property the shape has is a property the object has room for");
+                return self.found(bits, attributes);
+            }
+            holder = current.prototype(cage);
+        }
+        Found::Value(Value::UNDEFINED)
+    }
+
     /// What a lookup found, once the flags have been consulted.
     ///
     /// The flags are consulted rather than the bits, because an accessor pair is a heap pointer and
@@ -3479,7 +3635,13 @@ impl Interpreter {
         // anybody from, and `[Object]` would be six characters longer as well as less informative.
         // The differential harness found this one: `[Object]` is long enough to push the object
         // holding it over the width limit, so getting it wrong breaks a line that Node keeps whole.
-        if names.is_empty() {
+        // Indexed properties print in front of named ones and in ascending order, whatever order
+        // they were put on in. Node was measured saying that: `b.x = 1; b[0] = 2` prints
+        // `{ '0': 2, x: 1 }`, and it is not node being tidy, it is the enumeration order the
+        // language specifies. Element storage gives it for free, since the array is already in
+        // index order and the shape is already in insertion order.
+        let (indices, names) = self.split_indices(object, names);
+        if names.is_empty() && indices.is_empty() {
             return head.unwrap_or_else(|| inspect::braces(&[], indent, "", &tag));
         }
         if depth == 0 {
@@ -3496,7 +3658,8 @@ impl Interpreter {
             };
         }
         cycles.enter(slot);
-        let entries = self.entries_of(object, &names, depth, indent, cycles);
+        let mut entries = self.index_entries_of(&indices, depth, indent, cycles);
+        entries.extend(self.entries_of(object, &names, depth, indent, cycles));
         cycles.leave();
         // Read after the walk and not before it, because whether anything points back at this
         // object is only known once everything under it has been printed.
@@ -3744,6 +3907,87 @@ impl Interpreter {
     /// The walk into each value has already been guarded by the caller, which entered the object
     /// holding them into the cycle set. Doing it here instead would enter the wrong object for a
     /// function, whose properties live somewhere the program cannot name.
+    /// Which indices an object holds an element for, in ascending order.
+    ///
+    /// A scan of the elements array skipping holes, which is what printing wants and what the
+    /// absence of a length in that array costs. Nothing hot asks.
+    fn element_indices(&self, object: ObjectRef) -> Vec<u32> {
+        let cage = self.isolate.cage();
+        let Some(elements) = object.elements(cage) else {
+            return Vec::new();
+        };
+        (0..elements.capacity(cage))
+            .filter(|&index| is_value(elements.value_at(cage, index)))
+            .collect()
+    }
+
+    /// The printed form of an object's indexed properties.
+    ///
+    /// The named version below with the accessor and attribute cases taken out, because an element
+    /// has neither: every index is a plain value that can do everything, which is what the elements
+    /// array is able to hold and the whole of what it is able to hold.
+    fn index_entries_of(
+        &self,
+        indices: &[(u32, u64)],
+        depth: u32,
+        indent: usize,
+        cycles: &mut Cycles,
+    ) -> Vec<String> {
+        indices
+            .iter()
+            .map(|&(index, bits)| {
+                // Always quoted, because the text of a number is never a name that can be written
+                // without quotes, which is `inspect::key` reaching the same answer on its own.
+                let key = inspect::key(&index.to_string());
+                let value = self.inspect(
+                    Value::from_bits(bits),
+                    depth - 1,
+                    inspect::nested(indent),
+                    cycles,
+                );
+                format!("{key}: {value}")
+            })
+            .collect()
+    }
+
+    /// Split a list of names into the ones that spell an index and the ones that do not, and put the
+    /// first lot in with the elements in ascending order.
+    ///
+    /// Almost every indexed property is in the element storage and comes back from here in the order
+    /// the array already had it in. The exception is an index the storage could not hold, either
+    /// because it was too far past the end or because it carries flags the storage has no room for,
+    /// and one of those sits in the shape wherever it was added. It still enumerates as an index, so
+    /// it is pulled out of the names here and sorted into place.
+    ///
+    /// An accessor at an index is dropped rather than printed, which is a gap. Reaching it means
+    /// defining a getter under a name that spells a number, and what it costs to keep is a second
+    /// entry shape carried through the printer for a case no real program writes.
+    fn split_indices(&self, object: ObjectRef, names: Names) -> (Vec<(u32, u64)>, Names) {
+        let cage = self.isolate.cage();
+        let mut indices: Vec<(u32, u64)> = self
+            .element_indices(object)
+            .into_iter()
+            .map(|index| (index, object.element(cage, index)))
+            .collect();
+        let mut rest = Vec::with_capacity(names.len());
+        for (name, at, attributes) in names {
+            match self
+                .name_as_index(name)
+                .filter(|_| !attributes.is_accessor())
+            {
+                Some(index) => {
+                    let bits = object
+                        .value_at(cage, at)
+                        .expect("a name at this index means there is a value at it");
+                    indices.push((index, bits));
+                }
+                None => rest.push((name, at, attributes)),
+            }
+        }
+        indices.sort_by_key(|&(index, _)| index);
+        (indices, rest)
+    }
+
     fn entries_of(
         &self,
         object: ObjectRef,
@@ -3923,6 +4167,184 @@ impl Interpreter {
         Ok(self.string_value(atom.as_string()))
     }
 
+    /// Write a value at an index, answering whether the elements array took it.
+    ///
+    /// `false` means the caller has to fall back to the named path, for one of four reasons. The key
+    /// was not an index, or the receiver was not an ordinary object, or the index is far enough past
+    /// the end that an array holding it would be almost entirely holes, or the index is already a
+    /// property of this object under the text of the number and belongs where it already is.
+    ///
+    /// # Errors
+    ///
+    /// Out of memory, which is the one thing a store into element storage can fail at that the
+    /// caller cannot do anything about.
+    #[inline]
+    fn set_element_of(
+        &mut self,
+        object: Value,
+        key: Value,
+        new: Value,
+    ) -> Result<bool, RuntimeError> {
+        let Some(index) = self.array_index(key) else {
+            return Ok(false);
+        };
+        let Some(target) = self.as_object(object) else {
+            return Ok(false);
+        };
+        let capacity = target
+            .elements(self.isolate.cage())
+            .map_or(0, |array| array.capacity(self.isolate.cage()));
+        // Inside the capacity is the whole of the hot path, and it is a bounds check and a store.
+        // Everything below is the allocate and copy that happens a logarithmic number of times.
+        if index < capacity {
+            return match target.set_element(self.isolate.heap_mut(), index, new.to_bits()) {
+                Stored::Yes => Ok(true),
+                Stored::Named | Stored::TooSparse => Ok(false),
+                Stored::NoRoom => Err(RuntimeError::OutOfMemory),
+            };
+        }
+        if self.holds_index_by_name(target, index)? {
+            return Ok(false);
+        }
+        match target.set_element(self.isolate.heap_mut(), index, new.to_bits()) {
+            Stored::Yes => {
+                self.mark_named_indices(target, capacity);
+                Ok(true)
+            }
+            Stored::Named | Stored::TooSparse => Ok(false),
+            Stored::NoRoom => Err(RuntimeError::OutOfMemory),
+        }
+    }
+
+    /// Whether this object already holds this index as a property name rather than as an element.
+    ///
+    /// This is half of what keeps one property from turning into two. An index wider than the gap
+    /// the element storage will span is stored as a name instead, and the write that would make an
+    /// element for it has to find that name and leave the value where it already is.
+    ///
+    /// It is only asked on the path that would make a new element, which is the path that already
+    /// allocates and copies, so the formatting and the interning ride along with work that is far
+    /// more expensive than they are. The hot loop never gets here.
+    ///
+    /// # Errors
+    ///
+    /// Out of memory, from interning the name it has to look for.
+    fn holds_index_by_name(&mut self, target: ObjectRef, index: u32) -> Result<bool, RuntimeError> {
+        let name = self
+            .isolate
+            .intern(&index.to_string())
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(target.find(self.isolate.cage(), name.as_string()).is_some())
+    }
+
+    /// Mark every index the array has just grown out over that is a property name on this object.
+    ///
+    /// The other half. `o[3000] = 1` on an empty object is too sparse for an array, so it goes under
+    /// the name `"3000"`. Filling in the three thousand below it grows the array past 3000, and from
+    /// then on the fast path would write an element there and the object would hold the same property
+    /// twice. Marking the slot as named is what stops it, and after that both the read and the write
+    /// go and find the name.
+    ///
+    /// The sweep looks at every own name, which is why it is on the grow path and not anywhere else.
+    /// A grow allocates a new array and copies the old one into it, so walking the shape chain
+    /// alongside that is the smaller half of the work, and a grow happens a logarithmic number of
+    /// times in the length rather than once per write. Nothing is interned here: the question is
+    /// whether a name that already exists spells an index, which is a scan of at most ten characters.
+    fn mark_named_indices(&mut self, target: ObjectRef, from: u32) {
+        let cage = self.isolate.cage();
+        let capacity = target
+            .elements(cage)
+            .map_or(0, |array| array.capacity(cage));
+        // Nothing grew, so nothing new is covered and there is nothing to look for.
+        if capacity <= from {
+            return;
+        }
+        let named: Vec<u32> = target
+            .names(cage)
+            .into_iter()
+            .filter_map(|name| self.name_as_index(name))
+            .filter(|&index| index >= from && index < capacity)
+            .collect();
+        for index in named {
+            target.mark_named(self.isolate.heap_mut(), index);
+        }
+    }
+
+    /// The key as an array index, or `None` when it is an ordinary name.
+    ///
+    /// This is the question the element storage asks and it is deliberately narrower than "is this a
+    /// number". An array index is an integer from zero to `2^32 - 2`, and the top value is left out
+    /// because the language leaves it out: `a[4294967295]` is a property name and not an index, so
+    /// an array's `length` can be `2^32 - 1` and still be one past the last index.
+    ///
+    /// The three shapes it accepts are the three a key arrives in. An integer is the loop counter
+    /// and is the whole reason this exists. A double is `a[i / 2]` landing on something whole, and
+    /// negative zero counts as index zero because `ToString` spells `-0` as `"0"`, so the two are
+    /// one property and anything else here would make them two. A string is `o["0"]` and the
+    /// object literal key
+    /// `{'0': 1}`, and it goes through [`Interpreter::name_as_index`] so that the two spellings are
+    /// one property rather than two.
+    ///
+    /// Everything else is `None` and takes the named path, which is not a fallback so much as the
+    /// other half of the language.
+    fn array_index(&self, key: Value) -> Option<u32> {
+        if let Some(number) = key.as_i32() {
+            return u32::try_from(number).ok().filter(|&n| n < u32::MAX);
+        }
+        if let Some(number) = key.as_double() {
+            // `as` on a double that is out of range saturates rather than wrapping, so the round
+            // trip is what checks the range, and it also rejects a NaN and both infinities without
+            // asking about them separately. Negative zero passes and is meant to: `-0` is equal to
+            // zero, its round trip succeeds, and `ToString` spells it `"0"`, so `o[-0]` and `o[0]`
+            // are the same property and this is what makes them the same.
+            // Both of these are the point rather than an accident. The truncation and the lost sign
+            // are what the round trip below is testing for, so silencing them here is what lets the
+            // test be one comparison instead of three.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = number as u32;
+            return (f64::from(index) == number)
+                .then_some(index)
+                .filter(|&n| n < u32::MAX);
+        }
+        self.as_string(key)
+            .and_then(|string| self.name_as_index(string))
+    }
+
+    /// A name as an array index, or `None` when the text is not the canonical spelling of one.
+    ///
+    /// Canonical is the load bearing word. `"0"` is index zero and `"00"`, `"0.0"`, `" 0"` and
+    /// `"+0"` are all ordinary property names, because the rule the language actually states is that
+    /// the text has to be what `ToString` would produce for the number. So this rejects a leading
+    /// zero on anything longer than one character rather than parsing and comparing, which is the
+    /// same answer for less work.
+    ///
+    /// The first byte is checked before anything else. Almost every property name in a real program
+    /// starts with a letter or an underscore, and that one comparison is what keeps this off the
+    /// cost of every named define.
+    fn name_as_index(&self, name: StringRef) -> Option<u32> {
+        let cage = self.isolate.cage();
+        let length = name.len(cage);
+        // Ten digits is `4294967295`, which is one past the largest index, so anything longer cannot
+        // be one and anything of that length still has to be checked against the limit below.
+        if length == 0 || length > 10 {
+            return None;
+        }
+        let mut index: u32 = 0;
+        for position in 0..length {
+            let unit = name.code_unit_at(cage, position)?;
+            let digit = u32::from(unit)
+                .checked_sub(u32::from(b'0'))
+                .filter(|&d| d < 10)?;
+            // A leading zero is only canonical when it is the whole of the text, which is the string
+            // `"0"` and nothing else.
+            if position == 0 && digit == 0 {
+                return (length == 1).then_some(0);
+            }
+            index = index.checked_mul(10)?.checked_add(digit)?;
+        }
+        (index < u32::MAX).then_some(index)
+    }
+
     /// The ECMAScript `ToPropertyKey` abstract operation, as the interned name a shape is searched
     /// for.
     ///
@@ -3934,9 +4356,9 @@ impl Interpreter {
     ///
     /// A key that is already a string skips the conversion and interns what it already has. Anything
     /// else goes out through text, which for a number means formatting it, allocating it and hashing
-    /// it on every access. That is a real cost on `a[i]` in a loop and it is not the arrangement an
-    /// array deserves, but an index is a property name until there are elements to put it in, and
-    /// the honest slow version of the right answer beats a fast wrong one.
+    /// it on every access. That is why an index never gets here any more: it is answered out of the
+    /// element storage before the key is ever spelled, and this runs for the names that really are
+    /// names.
     ///
     /// # Errors
     ///

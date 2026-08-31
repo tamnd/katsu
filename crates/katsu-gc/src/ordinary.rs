@@ -64,7 +64,7 @@
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
-use crate::elements::{ElementsRef, HOLE, Stored};
+use crate::elements::{ElementsRef, HOLE, NAMED, Stored};
 use crate::object::{
     HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u32_at, write_u64,
 };
@@ -469,13 +469,20 @@ impl ObjectRef {
     /// The answer is not always yes. An index far enough past the end is refused rather than stored,
     /// because the array that would hold it is almost entirely holes, and the caller is expected to
     /// put the value under the text of the number instead. `elements.rs` has the reasoning and the
-    /// number.
+    /// number. An index that is already marked as living under a name is refused for the same
+    /// reason and to the same place, which is what keeps it from being one property in two.
+    ///
+    /// The read that the refusal needs is on the same cache line the write is about to dirty, so it
+    /// costs a comparison and not a memory access.
     pub fn set_element(self, heap: &mut BumpHeap, index: u32, value: u64) -> Stored {
         let existing = self.elements(heap.cage());
         let capacity = existing.map_or(0, |array| array.capacity(heap.cage()));
         if let Some(array) = existing
             && index < capacity
         {
+            if array.value_at(heap.cage(), index) == NAMED {
+                return Stored::Named;
+            }
             array.set(heap, index, value);
             return Stored::Yes;
         }
@@ -494,6 +501,23 @@ impl ObjectRef {
         self.point_at(heap, array);
         array.set(heap, index, value);
         Stored::Yes
+    }
+
+    /// Record that `index` is a property of this object under the text of the number.
+    ///
+    /// Answers false when there is no room in the elements array for the mark, which is the state an
+    /// index too sparse for an array is already in and needs nothing else to stay in. The mark is
+    /// only needed once the array grows out over the index, and the caller that grows it is the one
+    /// that puts it there.
+    pub fn mark_named(self, heap: &mut BumpHeap, index: u32) -> bool {
+        let Some(array) = self.elements(heap.cage()) else {
+            return false;
+        };
+        if index >= array.capacity(heap.cage()) {
+            return false;
+        }
+        array.set(heap, index, NAMED);
+        true
     }
 
     /// Point the elements word at `array`.
@@ -656,7 +680,7 @@ impl Properties {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attributes, FIRST_OVERFLOW, HEADER_SIZE, HOLE, ObjectRef, PROPERTIES_HEADER, Stored,
+        Attributes, FIRST_OVERFLOW, HEADER_SIZE, HOLE, NAMED, ObjectRef, PROPERTIES_HEADER, Stored,
         VALUE_SIZE,
     };
     use crate::bump::{BumpHeap, ObjectKind};
@@ -1022,6 +1046,38 @@ mod tests {
         let object = empty(&mut heap, 0);
         assert_eq!(object.set_element(&mut heap, 100_000, 1), Stored::TooSparse);
         assert_eq!(object.elements(heap.cage()), None);
+    }
+
+    #[test]
+    fn a_marked_index_refuses_a_write_so_the_name_keeps_it() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        object.set_element(&mut heap, 3, 11);
+        assert!(object.mark_named(&mut heap, 3));
+        assert_eq!(object.set_element(&mut heap, 3, 22), Stored::Named);
+        assert_eq!(object.element(heap.cage(), 3), NAMED);
+    }
+
+    #[test]
+    fn marking_an_index_the_array_does_not_reach_answers_false() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        // Nothing to mark and nothing that needs it: the index is already outside every array this
+        // object has, so a write there takes the slow path anyway.
+        assert!(!object.mark_named(&mut heap, 3));
+        object.set_element(&mut heap, 0, 11);
+        assert!(!object.mark_named(&mut heap, 100));
+    }
+
+    #[test]
+    fn a_mark_is_not_a_value_so_nothing_counts_it_as_one() {
+        let mut heap = heap();
+        let object = empty(&mut heap, 0);
+        object.set_element(&mut heap, 0, 11);
+        object.set_element(&mut heap, 1, 22);
+        object.mark_named(&mut heap, 1);
+        let elements = object.elements(heap.cage()).expect("should have an array");
+        assert_eq!(elements.used(heap.cage()), Some(1));
     }
 
     #[test]

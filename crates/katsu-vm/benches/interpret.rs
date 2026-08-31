@@ -557,12 +557,15 @@ fn properties(c: &mut Criterion) {
     });
 
     // The same read with a number for a key, which is `a[i]` in a loop and is the shape every array
-    // in every program is written in. Every one of these formats a number into text, allocates the
-    // text, hashes it and interns it, and then does the search the other two do.
+    // in every program is written in. This used to format the number into text, allocate the text,
+    // hash it and intern it, and then do the search the other two do, and it was the slowest read in
+    // this group by a long way because of it.
     //
-    // This is the number the next piece of work exists to destroy. Elements are storage indexed by
-    // the integer itself, and the distance between this line and `index_load` is what taking the
-    // conversion away is worth before any of the rest of it counts.
+    // It is now the fastest, and it should be. An index is answered out of the element storage,
+    // which is a bounds check and a load at a computed offset, so it never reaches the intern table
+    // and never touches a shape. Watch this against `index_load` rather than on its own: a string
+    // key still pays for the hash and the search, and the distance between the two lines is what the
+    // element storage is worth.
     let mut source = String::new();
     // Eight names spelled as strings rather than as numbers, because a numeric name in a literal is
     // its own piece of lowering and is not what this measures. They are the same eight properties.
@@ -589,6 +592,21 @@ fn properties(c: &mut Criterion) {
     group.bench_function("index_store", |b| {
         let mut interpreter = realm();
         b.iter(|| black_box(interpreter.run(black_box(&indexed_stores))));
+    });
+
+    // The store side with a number for a key. Every write here lands inside the capacity the first
+    // one made, so it is a bounds check and a store and nothing else: no shape transition, no
+    // properties block, no intern. This is the write half of what an array is going to be built on,
+    // and it belongs next to `index_store` for the same reason the two reads sit together.
+    let mut source = String::new();
+    source.push_str("var numbers = {};\nvar i = 7;\n");
+    for _ in 0..CHAIN {
+        source.push_str("numbers[i] = 1;\n");
+    }
+    let numeric_stores = program(&source);
+    group.bench_function("index_store_number", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&numeric_stores))));
     });
 
     // A property read and a call in one opcode, which is the most common call shape in real code.
