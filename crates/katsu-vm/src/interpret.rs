@@ -1729,6 +1729,109 @@ impl Interpreter {
                     }
                 }
 
+                // The same read with the name worked out at runtime. `o[k]` and `o.x` reach the same
+                // property through the same search, and the only thing between them is that this one
+                // has to turn a value into a key first.
+                //
+                // The nullish check comes before that conversion and not after, because the language
+                // puts it there and the difference is observable: a key whose `toString` throws
+                // reports the missing object rather than running. Node was measured saying exactly
+                // that.
+                //
+                // No inline cache. The site records a shape and an index, and an index is only an
+                // answer for one name, so a site whose name changes from one pass to the next would
+                // hand back the wrong property rather than miss. Caching this needs a site that
+                // guards the key as well, which is the CacheIR work on the next line of M1, and until
+                // then the operand is carried and ignored.
+                Op::GetIndex {
+                    dst,
+                    obj,
+                    index: at,
+                    ..
+                } => {
+                    let object = self.stack.get(obj);
+                    let key = self.stack.get(at);
+                    if object.is_nullish() {
+                        raise!(self.nothing_to_read_at(object, key));
+                    }
+                    let name = guard!(self.property_key(key));
+                    let probe = guard!(self.holder(object));
+                    match self.property_named(probe, name) {
+                        Found::Value(value) => self.stack.set(dst, value),
+                        Found::Getter(getter) => {
+                            if let Some((index, callee)) =
+                                guard!(self.read_through(getter, object, dst, pc, unit))
+                            {
+                                function = index;
+                                blueprint = callee;
+                                constants = unit.function(index).constants.as_slice();
+                                pc = 0;
+                            }
+                        }
+                    }
+                }
+
+                // The same store with the name worked out at runtime, and the same reasoning as the
+                // read above about the order of the nullish check and about there being no cache.
+                //
+                // Everything after the key conversion is what `set_prop` does, down to which of the
+                // four sentences a strict mode refusal gets, because from the point where there is a
+                // name there is no longer anything that says how the program spelled it.
+                Op::SetIndex {
+                    obj,
+                    index: at,
+                    value,
+                    ..
+                } => {
+                    let object = self.stack.get(obj);
+                    let key = self.stack.get(at);
+                    if object.is_nullish() {
+                        raise!(self.nothing_to_write_at(object, key));
+                    }
+                    let name = guard!(self.property_key(key));
+                    let new = self.stack.get(value);
+                    let target = match self.as_object(object) {
+                        Some(target) => target,
+                        None => match guard!(self.function_object(object)) {
+                            Some(target) => target,
+                            None if blueprint.strict => {
+                                raise!(self.nowhere_to_write_at(object, name));
+                            }
+                            None => continue,
+                        },
+                    };
+                    match guard!(self.assign(target, name, new)) {
+                        Wrote::Yes => {}
+                        Wrote::Refused if blueprint.strict => {
+                            raise!(self.read_only_at(target, name));
+                        }
+                        Wrote::NoSetter if blueprint.strict => {
+                            raise!(self.only_a_getter_at(target, name));
+                        }
+                        Wrote::Refused | Wrote::NoSetter => {}
+                        Wrote::Setter(setter) => {
+                            let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                            let call = Call {
+                                target: setter,
+                                receiver: object,
+                                first: value,
+                                passed: 1,
+                                return_to: Register::NOWHERE,
+                                return_pc,
+                            };
+                            match guard!(self.enter(call, unit)) {
+                                Entered::Frame { index, callee } => {
+                                    function = index;
+                                    blueprint = callee;
+                                    constants = unit.function(index).constants.as_slice();
+                                    pc = 0;
+                                }
+                                Entered::Answered(_) => {}
+                            }
+                        }
+                    }
+                }
+
                 // A property of an object literal. The object is the one being built a few
                 // instructions ago, so it is always an object and the nullish checks that guard a
                 // store have nothing to do here.
@@ -1936,8 +2039,8 @@ impl Interpreter {
                     raise!(RuntimeError::Thrown(value));
                 }
 
-                // Everything that still needs an object that can grow, which is object literals,
-                // indexed access and `delete`. Named rather than silently wrong.
+                // Everything still to come, which is `delete` and closures over a captured
+                // environment. Named rather than silently wrong.
                 _ => return Err(RuntimeError::NotImplemented(op)),
             }
         }
@@ -2852,6 +2955,30 @@ impl Interpreter {
         Ok(self.inherited(record, name))
     }
 
+    /// The same search for a name the program worked out rather than wrote down.
+    ///
+    /// Two things are missing against [`Interpreter::property`] and both are missing on purpose. The
+    /// nullish check is the caller's, because the language does it before the key is converted and
+    /// this is called with a key that is already converted. The site fill is gone because there is no
+    /// site: an entry says that a shape has a name at an index, and a site whose name is different on
+    /// the next pass through cannot use that. A cache that guards the key too is the CacheIR work,
+    /// and the guard for the shape has nothing to hold in the meantime, which is why the probe's
+    /// second half is dropped here rather than carried.
+    #[inline]
+    fn property_named(&self, probe: Option<(ObjectRef, u32)>, name: StringRef) -> Found {
+        let Some((record, _)) = probe else {
+            return Found::Value(Value::UNDEFINED);
+        };
+        let cage = self.isolate.cage();
+        if let Some((index, attributes)) = record.find(cage, name) {
+            let bits = record
+                .value_at(cage, index)
+                .expect("a property the shape has is a property the object has room for");
+            return self.found(bits, attributes);
+        }
+        self.inherited(record, name)
+    }
+
     /// What a lookup found, once the flags have been consulted.
     ///
     /// The flags are consulted rather than the bits, because an accessor pair is a heap pointer and
@@ -3131,7 +3258,20 @@ impl Interpreter {
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> RuntimeError {
-        let key = Self::constant_name(blueprint, key);
+        self.read_only_named(target, &Self::constant_name(blueprint, key))
+    }
+
+    /// The same sentence for a key the program computed.
+    ///
+    /// The name is already interned by the time a computed store can fail, so this takes the string
+    /// rather than converting the value a second time.
+    #[cold]
+    #[inline(never)]
+    fn read_only_at(&self, target: ObjectRef, name: StringRef) -> RuntimeError {
+        self.read_only_named(target, &name.to_utf8_lossy(self.isolate.cage()))
+    }
+
+    fn read_only_named(&self, target: ObjectRef, key: &str) -> RuntimeError {
         let what = if self.inherits_object_prototype(target) {
             "#<Object>"
         } else {
@@ -3158,7 +3298,17 @@ impl Interpreter {
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> RuntimeError {
-        let key = Self::constant_name(blueprint, key);
+        self.only_a_getter_named(target, &Self::constant_name(blueprint, key))
+    }
+
+    /// The same sentence for a key the program computed, taking the interned name.
+    #[cold]
+    #[inline(never)]
+    fn only_a_getter_at(&self, target: ObjectRef, name: StringRef) -> RuntimeError {
+        self.only_a_getter_named(target, &name.to_utf8_lossy(self.isolate.cage()))
+    }
+
+    fn only_a_getter_named(&self, target: ObjectRef, key: &str) -> RuntimeError {
         let what = if self.inherits_object_prototype(target) {
             "#<Object>"
         } else {
@@ -3180,11 +3330,32 @@ impl Interpreter {
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> RuntimeError {
+        Self::no_property_read(object, Some(&Self::constant_name(blueprint, key)))
+    }
+
+    /// The same sentence for a key the program computed rather than wrote down.
+    ///
+    /// Separate from the constant version rather than sharing a caller, because both of them are
+    /// cold and out of line and the whole point of that is that the work of naming the key happens
+    /// on the far side of the call rather than in the opcode that almost always succeeds.
+    #[cold]
+    #[inline(never)]
+    fn nothing_to_read_at(&self, object: Value, key: Value) -> RuntimeError {
+        Self::no_property_read(object, self.key_text(key).as_deref())
+    }
+
+    /// What reading a property of nothing says, with or without a name for the property.
+    ///
+    /// Node drops the parenthetical rather than inventing a name for a key it will not describe, so
+    /// this does too.
+    fn no_property_read(object: Value, key: Option<&str>) -> RuntimeError {
         let what = Self::primitive_text(object);
-        let key = Self::constant_name(blueprint, key);
-        RuntimeError::Type(format!(
-            "Cannot read properties of {what} (reading '{key}')"
-        ))
+        match key {
+            Some(key) => RuntimeError::Type(format!(
+                "Cannot read properties of {what} (reading '{key}')"
+            )),
+            None => RuntimeError::Type(format!("Cannot read properties of {what}")),
+        }
     }
 
     /// What writing a property of `undefined` or `null` says, word for word as Node says it.
@@ -3195,9 +3366,26 @@ impl Interpreter {
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> RuntimeError {
+        Self::no_property_write(object, Some(&Self::constant_name(blueprint, key)))
+    }
+
+    /// The same sentence for a key the program computed, for the reason
+    /// [`Interpreter::nothing_to_read_at`] is its own function.
+    #[cold]
+    #[inline(never)]
+    fn nothing_to_write_at(&self, object: Value, key: Value) -> RuntimeError {
+        Self::no_property_write(object, self.key_text(key).as_deref())
+    }
+
+    /// What writing a property of nothing says, with or without a name for the property.
+    fn no_property_write(object: Value, key: Option<&str>) -> RuntimeError {
         let what = Self::primitive_text(object);
-        let key = Self::constant_name(blueprint, key);
-        RuntimeError::Type(format!("Cannot set properties of {what} (setting '{key}')"))
+        match key {
+            Some(key) => {
+                RuntimeError::Type(format!("Cannot set properties of {what} (setting '{key}')"))
+            }
+            None => RuntimeError::Type(format!("Cannot set properties of {what}")),
+        }
     }
 
     /// What writing a property of a primitive says in strict mode, word for word as Node says it.
@@ -3213,9 +3401,19 @@ impl Interpreter {
         blueprint: &FunctionBlueprint,
         key: katsu_ir::ConstIndex,
     ) -> RuntimeError {
+        self.nowhere_to_write_named(object, &Self::constant_name(blueprint, key))
+    }
+
+    /// The same sentence for a key the program computed, taking the interned name.
+    #[cold]
+    #[inline(never)]
+    fn nowhere_to_write_at(&self, object: Value, name: StringRef) -> RuntimeError {
+        self.nowhere_to_write_named(object, &name.to_utf8_lossy(self.isolate.cage()))
+    }
+
+    fn nowhere_to_write_named(&self, object: Value, key: &str) -> RuntimeError {
         let kind = self.type_of(object);
         let what = self.display(object);
-        let key = Self::constant_name(blueprint, key);
         RuntimeError::Type(format!("Cannot create property '{key}' on {kind} '{what}'"))
     }
 
@@ -3719,6 +3917,84 @@ impl Interpreter {
     fn intern(&mut self, text: &str) -> Result<Value, RuntimeError> {
         let atom = self.isolate.intern(text).ok_or(RuntimeError::OutOfMemory)?;
         Ok(self.string_value(atom.as_string()))
+    }
+
+    /// The ECMAScript `ToPropertyKey` abstract operation, as the interned name a shape is searched
+    /// for.
+    ///
+    /// Every property key in the language is a string or a symbol, there are no symbols yet, so this
+    /// is `ToString` and then interning. Interning is the whole point of it: a name on a shape is
+    /// compared by identity, so a key computed at run time has to become the same object as the key
+    /// the shape was built with, and that is also the reason `o[0]` and `o["0"]` are one property
+    /// rather than two.
+    ///
+    /// A key that is already a string skips the conversion and interns what it already has. Anything
+    /// else goes out through text, which for a number means formatting it, allocating it and hashing
+    /// it on every access. That is a real cost on `a[i]` in a loop and it is not the arrangement an
+    /// array deserves, but an index is a property name until there are elements to put it in, and
+    /// the honest slow version of the right answer beats a fast wrong one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Interpreter::converted_text`] refuses, which is an object with no `toString` it can
+    /// reach and one whose `toString` answers with another object.
+    fn property_key(&mut self, key: Value) -> Result<StringRef, RuntimeError> {
+        if let Some(string) = self.as_string(key) {
+            return Ok(self.isolate.intern_string(string).as_string());
+        }
+        let text = self.converted_text(key)?;
+        Ok(self
+            .isolate
+            .intern(&text)
+            .ok_or(RuntimeError::OutOfMemory)?
+            .as_string())
+    }
+
+    /// How a key names itself in the message about the property that could not be reached.
+    ///
+    /// Node describes the key only when describing it cannot run any of the program's code, and
+    /// leaves it out of the sentence entirely when it would. The program has already gone wrong by
+    /// the time this runs, so calling into it to build the words that say so is a way of turning one
+    /// error into a different one.
+    ///
+    /// The rule for an object is narrower than it looks and it was measured rather than assumed. It
+    /// is not whether the object inherits from `Object.prototype`, which is the guess: it is whether
+    /// the `toString` reached by walking the chain for a data property is the very same function as
+    /// `Object.prototype.toString`. An array fails that, so `undefined[[1, 2]]` says nothing about
+    /// the key. So does a `Date` and so does anything with its own `toString`, including one that
+    /// would have thrown. An object with no prototype at all passes it if somebody put the builtin
+    /// on it, which node was checked doing.
+    ///
+    /// The name itself is the `constructor`, again as a data property off the chain and again with
+    /// no call: `#<Weird>` for `new Weird()`, and `#<Object>` for a plain object, which is where the
+    /// familiar one comes from. There is no `instanceof` in this, so an object that merely inherits
+    /// a `constructor` pointing at `Weird` is named `#<Weird>` too. That is different from the rule
+    /// [`Interpreter::constructor_name`] uses for printing, where node does check, and the two are
+    /// separate functions because node genuinely asks two different questions.
+    ///
+    /// `None` covers a function, which node names with its source text, and that is the same piece
+    /// of work `Function.prototype.toString` is waiting on.
+    fn key_text(&self, key: Value) -> Option<String> {
+        if let Some(string) = self.as_string(key) {
+            return Some(string.to_utf8_lossy(self.isolate.cage()).into_owned());
+        }
+        if !key.is_pointer() {
+            return Some(Self::primitive_text(key));
+        }
+        let object = self.as_object(key)?;
+        if self.printed_property(object, "toString")? != self.object_to_string()? {
+            return None;
+        }
+        let name = self.callable_name(self.printed_property(object, "constructor")?)?;
+        (!name.is_empty()).then(|| format!("#<{name}>"))
+    }
+
+    /// This realm's `Object.prototype.toString`, or `None` in a build that has no builtins.
+    ///
+    /// Held nowhere and looked up each time, because the only caller is a message about a program
+    /// that is already throwing.
+    fn object_to_string(&self) -> Option<Value> {
+        self.printed_property(self.isolate.object_prototype_if_built()?, "toString")
     }
 
     /// The ECMAScript `ToBoolean` abstract operation.
@@ -5080,17 +5356,16 @@ mod tests {
                 dst: Register(0),
                 value: 1,
             },
-            Op::GetIndex {
+            Op::DeleteIndex {
                 dst: Register(1),
                 obj: Register(0),
                 index: Register(0),
-                cache: IC,
             },
             Op::Return { src: Register(1) },
         ])
         .expect_err("should refuse");
         assert!(
-            error.to_string().starts_with("get_index"),
+            error.to_string().starts_with("delete_index"),
             "the error should name the opcode, and it said {error}"
         );
     }
@@ -5278,11 +5553,10 @@ mod tests {
         // draws the same line: a program cannot catch running out of memory either.
         let blueprint = assemble_handled(
             vec![
-                Op::GetIndex {
+                Op::DeleteIndex {
                     dst: Register(0),
                     obj: Register(1),
                     index: Register(2),
-                    cache: IC,
                 },
                 Op::Return { src: Register(0) },
             ],
@@ -6761,6 +7035,164 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn a_computed_key_reaches_the_same_property_a_dotted_one_does() {
+        assert_eq!(evaluate_display("var o = { a: 1 }; var k = 'a'; o[k]"), "1");
+        assert_eq!(evaluate_display("var o = { a: 1 }; o['a']"), "1");
+        assert_eq!(
+            evaluate_display("var o = {}; var k = 'a'; o[k] = 7; o.a"),
+            "7"
+        );
+        assert_eq!(
+            evaluate_display("var o = { a: 1 }; o['nothing']"),
+            "undefined"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_a_string_is_made_into_one() {
+        // Every property key is a string, so the number and the text of the number are one property
+        // rather than two. This is why an array cannot be an object with numeric keys and be fast,
+        // and it is the reason elements are their own storage.
+        assert_eq!(
+            evaluate_display("var o = {}; o[0] = 'zero'; o['0'] + ',' + o[0]"),
+            "zero,zero"
+        );
+        assert_eq!(evaluate_display("var o = {}; o[1.5] = 'x'; o['1.5']"), "x");
+        assert_eq!(evaluate_display("var o = {}; o[-0] = 'x'; o['0']"), "x");
+        assert_eq!(
+            evaluate_display("var o = {}; o[1e21] = 'x'; o['1e+21']"),
+            "x"
+        );
+        assert_eq!(
+            evaluate_display("var o = {}; o[0 / 0] = 'x'; o['NaN']"),
+            "x"
+        );
+        assert_eq!(
+            evaluate_display("var o = {}; o[true] = 'x'; o['true']"),
+            "x"
+        );
+        assert_eq!(
+            evaluate_display("var o = {}; o[null] = 'x'; o['null']"),
+            "x"
+        );
+        assert_eq!(
+            evaluate_display("var o = {}; var u; o[u] = 'x'; o['undefined']"),
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_computed_key_runs_an_accessor_the_same_way_a_dotted_one_does() {
+        assert_eq!(
+            evaluate_display("var o = { get x() { return 'got'; } }; var k = 'x'; o[k]"),
+            "got"
+        );
+        assert_eq!(
+            evaluate_display(
+                "var seen; var o = { set x(v) { seen = v; } }; var k = 'x'; o[k] = 'sent'; seen"
+            ),
+            "sent"
+        );
+    }
+
+    #[test]
+    fn reading_and_writing_through_a_computed_key_on_nothing_names_the_key() {
+        // The same sentences as the dotted forms, which is what node says, because by the time there
+        // is a key there is nothing left that says how the program spelled it.
+        for (source, message) in [
+            (
+                "var u; var k = 'x'; u[k]",
+                "Cannot read properties of undefined (reading 'x')",
+            ),
+            (
+                "var n = null; n[0]",
+                "Cannot read properties of null (reading '0')",
+            ),
+            (
+                "var u; var k = 'x'; u[k] = 1",
+                "Cannot set properties of undefined (setting 'x')",
+            ),
+            (
+                "var n = null; n[2] = 1",
+                "Cannot set properties of null (setting '2')",
+            ),
+        ] {
+            assert_eq!(
+                evaluate(source),
+                Err(RuntimeError::Type(message.to_owned())),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_named_without_running_code_is_not_named() {
+        // Naming an object key needs `Object.prototype.toString` to compare against, so what a realm
+        // with builtins says is tested where the builtins are. This is the half that holds anywhere:
+        // a build with no realm has nothing to compare against and says nothing rather than guessing.
+        assert_eq!(
+            evaluate("var u; u[{}]"),
+            Err(RuntimeError::Type(
+                "Cannot read properties of undefined".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_nullish_check_happens_before_the_key_is_converted() {
+        // The order the language puts them in, and it is observable: converting first would run the
+        // key's `toString` and report whatever that threw instead of the missing object.
+        let error = evaluate(
+            "var ran = false;\n\
+             var u;\n\
+             u[{ toString: function () { ran = true; return 'x'; } }];",
+        )
+        .expect_err("should throw");
+        assert!(
+            matches!(&error, RuntimeError::Type(message) if message.starts_with("Cannot read")),
+            "the missing object should be what is reported, and it said {error}"
+        );
+    }
+
+    #[test]
+    fn a_computed_store_that_is_refused_says_what_a_dotted_one_says() {
+        // The read only property is the fourth of these sentences and it needs
+        // `Object.defineProperty` to build one, so it is tested where that lives.
+        for (source, message) in [
+            (
+                "'use strict'; var o = { get only() { return 1; } }; o['only'] = 2;",
+                "Cannot set property only of #<Object> which has only a getter",
+            ),
+            (
+                "'use strict'; var n = 5; n['x'] = 1;",
+                "Cannot create property 'x' on number '5'",
+            ),
+        ] {
+            let blueprint = crate::compile("t.js", source).expect("should compile");
+            assert!(blueprint.strict, "{source} should have been strict");
+            assert_eq!(
+                Interpreter::new()
+                    .expect("should reserve a stack")
+                    .run(&blueprint),
+                Err(RuntimeError::Type(message.to_owned())),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_computed_store_that_is_refused_is_silent_outside_strict_mode() {
+        assert_eq!(
+            evaluate_display("var o = { get only() { return 1; } }; o['only'] = 2; o['only']"),
+            "1"
+        );
+        assert_eq!(
+            evaluate_display("var n = 5; n['x'] = 1; n['x']"),
+            "undefined"
+        );
     }
 
     #[test]

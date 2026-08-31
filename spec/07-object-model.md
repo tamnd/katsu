@@ -182,7 +182,7 @@ The children of a shape are a singly linked list threaded through the shapes the
 
 An ordinary object is a sixteen byte header of a shape, a properties array and an inline capacity, with one word of padding, followed by its inline slots. A value is eight bytes here for exactly the reason a context cell is eight bytes, written down above, and it goes back to four when there is a heap number and a set of realm singletons for a slot to point at.
 
-The elements word 7.4 puts in the header is deliberately not there yet. Nothing indexes an object today, since `o[k]` has no interpreter arm at all, and a word reserved for a feature that does not exist is eight bytes on every object in the heap to buy nothing. It goes in when arrays do, and the header grows by one word at that point rather than starting out with a hole in it.
+The elements word 7.4 puts in the header is deliberately not there yet. `o[k]` runs now, but it runs by turning the key into a property name and doing the search a named access does, so there is still nothing indexing an object and a word reserved for storage that does not exist is eight bytes on every object in the heap to buy nothing. It goes in when arrays do, and the header grows by one word at that point rather than starting out with a hole in it. The padding word already sitting between the inline capacity and the first slot is where it goes, so the header does not grow at all.
 
 Inline capacity is in the object and not in the shape, which is a real departure from V8, where the map holds the instance size. The reason is that the same shape is reached two ways: by a literal built with room for its properties, and by an empty object grown one property at a time. Those two objects have the same layout and different sizes, so a size in the shape has to be either wrong for one of them or accompanied by the slack tracking machinery V8 needs to make it right. Four bytes in the object buys not building that.
 
@@ -221,6 +221,16 @@ Arrays get specialized element storage, because a JavaScript array is not one da
 Transitions only go one way, from more specific to less. Writing a double into a PackedSmi array converts the whole backing store once. Writing past the end creates holes and transitions to holey, and the holey kinds are meaningfully slower because every read has to check for the hole and consult the prototype chain if it finds one.
 
 Typed arrays and `ArrayBuffer` are separate: the backing store is a raw allocation outside the cage, reached through the external pointer table, which is what makes zero copy sharing with Rust possible in document 11.
+
+### 7.6.1 An index is a property name, for now
+
+`o[k]` runs and none of the storage above exists, which is worth stating plainly because the two get conflated. What is built is `ToPropertyKey` and two opcodes: the key is converted to text, the text is interned, and the interned name goes into the same shape search a dotted access uses. Every key in the language is a string or a symbol and there are no symbols yet, so that is the whole of the conversion, and it is why `o[0]` and `o["0"]` are one property rather than two.
+
+The cost of doing it that way is measured rather than asserted, on the same machine in one session. A named read is about 10 nanoseconds. The same read through a key already held as a string is about 20, which is the intern table lookup plus the absence of a cache. The same read through a number is about 156, which is fifteen times the named read, because every access formats the number into text, allocates the text, hashes it and interns it before any of the search starts.
+
+That third number is the argument for element storage rather than a reason to be unhappy about the second. `a[i]` in a loop is the shape most real code touches an array with, and the conversion is pure waste in every one of those accesses because the integer was already the answer. Elements take it away by indexing on the integer, which is what makes the difference between 156 nanoseconds and the load a packed array should be.
+
+There is no inline cache on either opcode, and that is a correctness point rather than an omission. A cache entry says a shape has a name at an index, and a site whose key changes from one pass to the next would hand back the wrong property rather than miss. Caching a computed key needs a site that guards the key as well as the shape, which is 7.5 and is where it belongs.
 
 ## 7.7 Strings, and the UTF-16 problem
 

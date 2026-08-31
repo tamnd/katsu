@@ -332,6 +332,18 @@ impl Isolate {
         self.atoms.intern(&mut self.heap, text)
     }
 
+    /// Intern a string that is already on the heap.
+    ///
+    /// The same operation as [`Isolate::intern`] without the copy, for a key a program computed
+    /// rather than wrote down. `o[k]` where `k` holds a string has the text in the cage already,
+    /// and reading it back out into Rust text to hand it straight back would be a copy and a second
+    /// hash for nothing.
+    ///
+    /// Infallible where the other one is not, because the string it needs is the one it was given.
+    pub fn intern_string(&mut self, string: StringRef) -> Atom {
+        self.atoms.intern_string(self.heap.cage(), string)
+    }
+
     /// Bytes this isolate has allocated on its heap.
     ///
     /// The number the memory budget in `spec/02-the-10x-goal.md` counts, which is what has been

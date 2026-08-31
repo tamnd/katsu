@@ -541,6 +541,56 @@ fn properties(c: &mut Criterion) {
         b.iter(|| black_box(interpreter.run(black_box(&stores))));
     });
 
+    // The same read reached through a key held in a variable rather than written down. Against
+    // `prop_load` the difference is the whole cost of a computed key when the key is already a
+    // string, which is one hash of four bytes and a lookup in the intern table, and the absence of a
+    // cache. Neither of those is free and both are why this number is worth watching.
+    let mut source = String::new();
+    source.push_str("var k = 'p7';\n");
+    for _ in 0..CHAIN {
+        source.push_str("host[k];\n");
+    }
+    let indexed = program(&source);
+    group.bench_function("index_load", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&indexed))));
+    });
+
+    // The same read with a number for a key, which is `a[i]` in a loop and is the shape every array
+    // in every program is written in. Every one of these formats a number into text, allocates the
+    // text, hashes it and interns it, and then does the search the other two do.
+    //
+    // This is the number the next piece of work exists to destroy. Elements are storage indexed by
+    // the integer itself, and the distance between this line and `index_load` is what taking the
+    // conversion away is worth before any of the rest of it counts.
+    let mut source = String::new();
+    // Eight names spelled as strings rather than as numbers, because a numeric name in a literal is
+    // its own piece of lowering and is not what this measures. They are the same eight properties.
+    source.push_str(
+        "var numbers = { '0': 1, '1': 2, '2': 3, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8 };\n\
+         var i = 7;\n",
+    );
+    for _ in 0..CHAIN {
+        source.push_str("numbers[i];\n");
+    }
+    let numeric = program(&source);
+    group.bench_function("index_load_number", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&numeric))));
+    });
+
+    // The store side of the same pair, next to `prop_store` for the same reason.
+    let mut source = String::new();
+    source.push_str("var k = 'p7';\n");
+    for _ in 0..CHAIN {
+        source.push_str("host[k] = 1;\n");
+    }
+    let indexed_stores = program(&source);
+    group.bench_function("index_store", |b| {
+        let mut interpreter = realm();
+        b.iter(|| black_box(interpreter.run(black_box(&indexed_stores))));
+    });
+
     // A property read and a call in one opcode, which is the most common call shape in real code.
     // Against `native_call`, the difference is the lookup, and against `prop_load` it is the call.
     group.throughput(Throughput::Elements(CALLS as u64));

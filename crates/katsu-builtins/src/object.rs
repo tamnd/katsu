@@ -1163,6 +1163,73 @@ mod tests {
     }
 
     #[test]
+    fn a_computed_key_gets_the_same_refusal_a_dotted_one_does() {
+        // From the point where there is a name there is nothing left that says how the program
+        // spelled it, so `o['a']` has to say exactly what `o.a` says.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, 'a', {value: 1}); o['a'] = 2; console.log(o['a']);"
+            ),
+            "1"
+        );
+        let error = printed(
+            "'use strict'; var o = {}; Object.defineProperty(o, 'a', {value: 1}); o['a'] = 2;",
+        )
+        .expect_err("should throw");
+        assert!(
+            error.contains("Cannot assign to read only property 'a' of object '#<Object>'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_computed_key_finds_what_the_prototype_chain_holds() {
+        assert_eq!(
+            logged(
+                "var p = {a: 'above'}; var o = Object.create(p); console.log(o['a']); o['a'] = 'own'; console.log(o.a, p.a);"
+            ),
+            "above\nown above"
+        );
+    }
+
+    #[test]
+    fn a_key_is_named_in_the_message_only_when_naming_it_runs_nothing() {
+        // Node's rule, measured rather than assumed, and narrower than the obvious guess. The name
+        // comes from `constructor` and is offered only when the `toString` the object reaches is the
+        // one on `Object.prototype`, so anything that would have called the program's own code is
+        // left out of the sentence rather than run to build it.
+        for (source, message) in [
+            (
+                "var u; u[{}];",
+                "Cannot read properties of undefined (reading '#<Object>')",
+            ),
+            (
+                "function Weird() {} var u; u[new Weird()];",
+                "Cannot read properties of undefined (reading '#<Weird>')",
+            ),
+            (
+                "var u; u[Object.create({constructor: function Weird() {}})];",
+                "Cannot read properties of undefined (reading '#<Weird>')",
+            ),
+            (
+                "var u; u[Object.create(null)];",
+                "Cannot read properties of undefined",
+            ),
+            (
+                "var u; u[{toString: function () { throw new Error('should not run'); }}];",
+                "Cannot read properties of undefined",
+            ),
+            (
+                "var u; u[Object.create(Object.prototype, {constructor: {value: 1}})];",
+                "Cannot read properties of undefined",
+            ),
+        ] {
+            let error = printed(source).expect_err("should throw");
+            assert!(error.contains(message), "{source} said {error}");
+        }
+    }
+
+    #[test]
     fn a_read_only_property_on_a_prototype_stops_a_write_to_everything_below_it() {
         // The part that is easy to get wrong. The object being written to does not have the
         // property at all, and the answer still comes from the chain.

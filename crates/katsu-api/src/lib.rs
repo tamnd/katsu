@@ -229,12 +229,12 @@ mod tests {
     #[test]
     fn something_this_build_cannot_run_says_so_and_names_it() {
         let mut runtime = runtime();
-        // Named property access runs now, so the opcode this stops at has moved along again, to a
-        // key computed at run time. It is still the case being checked: something the frontend can
-        // lower and the loop cannot run is named rather than being guessed at or crashed on.
+        // Computed keys run now, so the opcode this stops at has moved along again, to `delete`. It
+        // is still the case being checked: something the frontend can lower and the loop cannot run
+        // is named rather than being guessed at or crashed on.
         let error = runtime
-            .eval("ok.js", "console['log']")
-            .expect_err("a computed key is not implemented yet");
+            .eval("ok.js", "var o = {a: 1}; delete o.a;")
+            .expect_err("delete is not implemented yet");
         assert!(matches!(error, Error::NotImplemented(_)), "got {error:?}");
     }
 
