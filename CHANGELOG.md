@@ -2,6 +2,69 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.5
+
+The fifth patch release of M1, three pull requests on from 0.1.4, and all three are one arc. A property slot can now hold a pair of functions, an object literal can write that pair, and a property read remembers where it found what it found. The first two are language features that each cost about a fifth of a property read, and the third is the thing that takes both of them back and more, because it is what the shape was being built for all along.
+
+### A property can be a pair of functions
+
+In #68. A read or a write on a property can be a call now, so a getter runs when its name is read and a setter runs when its name is written.
+
+The pair is one boxed heap object and not two slots. A property is one slot everywhere in the heap and making it sometimes two would put a width question on the plain property path, which is the path that has to be fast, and buy nothing on the path that is already a call. The fourth attribute bit saying which kind a property is went into the same shape padding the first three did, so the flags still cost nothing.
+
+The receiver is where the access started and not where the property was found. That is the whole reason to put an accessor on a prototype: one getter above answers for every object below it and each of them sees itself as `this`.
+
+A setter is the odd case in the interpreter, because its answer is thrown away and the operands of the store that called it are still live. It returns into a register that is nowhere, and `Register::NOWHERE` is a sentinel rather than an `Option` for the same reason the receiver is one.
+
+The rules were run under node case by case rather than remembered. Printing shows `[Getter]`, `[Setter]`, `[Getter/Setter]` or `undefined` when a property has neither half. A second `defineProperty` keeps the half it does not mention. An accessor turned into a data property comes out not writable with its other two flags intact. Writing to something that has only a getter is swallowed in sloppy mode and refused in strict with node's exact wording.
+
+### A literal defines, it does not assign
+
+In #69. `get x() {}` and `set x(v) {}` work in an object literal, and two halves written under the same name join into one property rather than replacing each other, in either order and with other properties in between.
+
+Writing the syntax turned up something else that was wrong and had been wrong since literals existed. Every property in a literal defines rather than assigns, which is what the language has always said and what katsu was not doing. It was measured rather than reasoned about: with a setter installed on `Object.prototype`, node does not call it for `{p: 1}` and does call it for `q.p = 2`, and a non writable property up the chain stops the assignment and not the literal.
+
+So a literal no longer asks the prototype chain for permission, and it can put a value over an accessor the way `{get x() {}, x: 5}` has to. It made literals faster rather than slower, which is the direction that follows from skipping a prototype walk: a two property literal and a four property one are both about six percent quicker over twenty alternating pairs, and building the same four property object out of four assignments is unchanged because those are still assignments.
+
+### Property reads have inline caches
+
+In #70, and this is what the last four pieces of object model work were aimed at. Each access site remembers one shape and the position the name was found at, and a site whose shape matches skips all three of the costs that had been accumulating. No walk up the shape's parent chain comparing interned names, because the shape says where the property is. No read of the attributes to find out whether the slot holds a value or an accessor pair, because the flags are part of what the shape says. No walk up the prototype chain when the object does not have the name itself, because the prototype is in the shape too. One comparison settles all three.
+
+An entry holds a property position rather than a byte offset, and that is the one part of it that was measured into shape rather than designed. An offset is a load cheaper on a hit because it says outright where the value is, and it does not work on its own: `{a: 1}` is built with room for one property and `x = {}; x.a = 1` is built with room for none and keeps its property in the overflow array, and both reach the same shape. An offset therefore has to be guarded by the inline capacity as well, which makes the key eight bytes instead of four, an entry sixteen instead of eight, and every object built the second way a permanent miss. That version was slower on every benchmark it was not faster on, including the store benchmark, which reads no cache at all and was paying only for a table twice the size it needed to be.
+
+A cached property read costs 9.5 ns against 12.1 ns before, a little under a quarter off, subtracting the global lookup and the loop out of `property/prop_load_hot` over ten alternating pairs. The benchmark line itself moves 14 percent, because half of what it does is look up `host` rather than read a property off it.
+
+What a cache costs when it cannot help is the other half of the answer and it belongs here rather than only in a benchmark file. `property/prop_load` is a thousand sites each run exactly once, so every read fills an entry nothing ever reads back, and it is 22 percent slower. `property/prop_store` is 5 percent slower for a different reason, which is that a site is given its eight bytes when the program loads whether or not anything ever fills them, and stores do not fill them yet.
+
+The cache is monomorphic, which is one shape and not the four the design calls for, so a site that alternates between two kinds of object pays the full search every time and pays to fill an entry as well. Own properties only, because caching an inherited hit needs a validity cell for the holder's own shape. Reads only, because a store that grows an object changes its shape and so wants a transition rather than a position.
+
+### Where the numbers stand
+
+`fib.js` from tamnd/katsu-bench, 25 runs of each runtime after 3 discarded, interleaved in one session on the same m4, timed by the workload's own `performance.now()` rather than by wall clock around the process.
+
+| Runtime | fib(35) compute | Peak memory | Against katsu |
+|---|---:|---:|---|
+| katsu | 993 ms | 2.70 MiB | |
+| node 26.7.0 | 61.2 ms | 46.36 MiB | 16.2x faster, 17.2x heavier |
+| bun 1.4.0 | 41.5 ms | 18.14 MiB | 23.9x faster, 6.7x heavier |
+| deno 2.9.6 | 61.8 ms | 35.91 MiB | 16.1x faster, 13.3x heavier |
+
+The ratio against node went from 16.6x to 16.2x, which is small enough to be nothing, and the absolute went up from 821 ms to 993 ms, which is definitely nothing. Node measured 49.5 ms in the 0.1.4 session and 61.2 ms in this one, 24 percent slower, and katsu moved 21 percent in the same direction, so what changed between the sessions is how busy the laptop was. This is the third release in a row where that sentence has had to be written and it is why the ratio column is the one to read.
+
+The reason the ratio barely moved is the same reason it barely moved last time. `fib` is a call benchmark wearing an arithmetic benchmark's clothes, and it does not read properties, so an inline cache for property reads has almost nothing to work on there. The microbenchmarks that do cover this release moved and are quoted above.
+
+The memory column is new here and it is the first row of the second half of the goal. katsu runs `fib` in 2.70 MiB of peak resident memory against bun's 18.14, which is 6.7 times less, and it does that with no collector at all, so it is a fact about how little the interpreter allocates rather than about how well it cleans up. It will get worse before it gets better, because `strings.js` still fills the 4 GiB cage and dies for exactly that reason.
+
+Still one of six compute workloads running, and what stops the other five is unchanged. `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` wants a collector.
+
+### Where the conformance number stands
+
+6.66%, 5,410 cases of the 81,225 attempted, unchanged for the fourth release running. 75,807 cases still stop on the `new` in `throw new Test262Error(message)`, one fewer than last time, and the accessor work in this release is part of what it takes to get past that line rather than something that could have moved it on its own.
+
+### Also
+
+The differential corpus gained `literals.js`, and a full run is 1,015 programs with 1,014 agreements, 0 differences and 1 gap, which is `set_index` and therefore element writes.
+
 ## 0.1.4
 
 The fourth patch release of M1, three pull requests on from 0.1.3, and all three are the object model. An object now has a prototype chain that is really walked, properties that know what they are allowed to do, and a `this` that is bound where the call happens. The theme underneath all three is that the shape carries the answer, so that an inline cache which has compared one shape has in that one comparison also checked everything else it needed to know.
