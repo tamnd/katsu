@@ -40,20 +40,20 @@ The cache is monomorphic, which is one shape and not the four the design calls f
 
 ### Where the numbers stand
 
-`fib.js` from tamnd/katsu-bench, 25 runs of each runtime after 3 discarded, interleaved in one session on the same m4, timed by the workload's own `performance.now()` rather than by wall clock around the process.
+`fib.js` from tamnd/katsu-bench, 25 runs of each runtime after 3 discarded, interleaved in one session on the same m4, timed by the workload's own `performance.now()` rather than by wall clock around the process. These are the figures from the published 0.1.5 baseline in that repository, measured against the released tarball rather than a local build, so they are the ones a reader can rerun.
 
 | Runtime | fib(35) compute | Peak memory | Against katsu |
 |---|---:|---:|---|
-| katsu | 993 ms | 2.70 MiB | |
-| node 26.7.0 | 61.2 ms | 46.36 MiB | 16.2x faster, 17.2x heavier |
-| bun 1.4.0 | 41.5 ms | 18.14 MiB | 23.9x faster, 6.7x heavier |
-| deno 2.9.6 | 61.8 ms | 35.91 MiB | 16.1x faster, 13.3x heavier |
+| katsu 0.1.5 | 789.33 ms | 2.72 MiB | |
+| node 26.7.0 | 49.27 ms | 46.36 MiB | 16.0x faster, 17.0x heavier |
+| bun 1.4.0 | 33.47 ms | 18.05 MiB | 23.6x faster, 6.6x heavier |
+| deno 2.9.6 | 49.99 ms | 35.62 MiB | 15.8x faster, 13.1x heavier |
 
-The ratio against node went from 16.6x to 16.2x, which is small enough to be nothing, and the absolute went up from 821 ms to 993 ms, which is definitely nothing. Node measured 49.5 ms in the 0.1.4 session and 61.2 ms in this one, 24 percent slower, and katsu moved 21 percent in the same direction, so what changed between the sessions is how busy the laptop was. This is the third release in a row where that sentence has had to be written and it is why the ratio column is the one to read.
+The ratio against node went from 16.6x to 16.0x and against bun from 24.0x to 23.6x, and neither is a result. For once the two sessions are directly comparable, because the rivals barely moved between them: node measured 49.5 ms in the 0.1.4 session and 49.27 ms here, bun 34.2 and 33.47. Against that the katsu absolute went from 821 ms to 789 ms, four percent, which is smaller than the spread between sessions and has no mechanism behind it.
 
-The reason the ratio barely moved is the same reason it barely moved last time. `fib` is a call benchmark wearing an arithmetic benchmark's clothes, and it does not read properties, so an inline cache for property reads has almost nothing to work on there. The microbenchmarks that do cover this release moved and are quoted above.
+The reason it has no mechanism behind it is the same reason nothing moved last time. `fib` is a call benchmark wearing an arithmetic benchmark's clothes, and it does not read properties, so an inline cache for property reads has nothing to work on there. The microbenchmarks that do cover this release moved and are quoted above.
 
-The memory column is new here and it is the first row of the second half of the goal. katsu runs `fib` in 2.70 MiB of peak resident memory against bun's 18.14, which is 6.7 times less, and it does that with no collector at all, so it is a fact about how little the interpreter allocates rather than about how well it cleans up. It will get worse before it gets better, because `strings.js` still fills the 4 GiB cage and dies for exactly that reason.
+The memory column is new here and it is the first row of the second half of the goal. katsu runs `fib` in 2.72 MiB of peak resident memory against bun's 18.05, which is 6.6 times less, and it does that with no collector at all, so it is a fact about how little the interpreter allocates rather than about how well it cleans up. It will get worse before it gets better, because `strings.js` still fills the 4 GiB cage and dies for exactly that reason.
 
 Still one of six compute workloads running, and what stops the other five is unchanged. `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` wants a collector.
 
