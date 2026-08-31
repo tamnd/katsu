@@ -17,21 +17,47 @@
 
 use crate::bump::{BumpHeap, ObjectKind};
 use crate::cage::{Cage, Slot};
-use crate::object::{HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u64};
+use crate::object::{
+    HeapKind, read_u32, read_u64, slot_of, write_kind, write_u32, write_u32_at, write_u64,
+};
+use crate::ordinary::ObjectRef;
 use crate::string::StringRef;
 
-/// Bytes in a closure: the kind tag, the function index, the captured context and the name.
+/// Bytes in a closure: the kind tag, the function index, the captured context, the name and the
+/// properties.
 ///
-/// Sixteen exactly, so there is no alignment padding. The name is in here rather than being looked
-/// up through the function index because printing a function has to work after the unit that
-/// compiled it is gone, which is the situation an embedder holding a value is always in.
-const CLOSURE_SIZE: usize = 16;
+/// Twenty written and twenty four reserved. It was sixteen with nothing wasted until a function
+/// became something a program can hang properties off, and the four bytes that bought are the
+/// subject of the next paragraph. The name is in here rather than being looked up through the
+/// function index because printing a function has to work after the unit that compiled it is gone,
+/// which is the situation an embedder holding a value is always in.
+const CLOSURE_SIZE: usize = 20;
 /// Which function in the loaded unit this closure runs.
 const FUNCTION_OFFSET: usize = 4;
 /// The context this closure captured, as raw slot bits, or zero for none.
 const CAPTURED_OFFSET: usize = 8;
 /// The function's name, as raw slot bits, or zero for an anonymous function.
 const NAME_OFFSET: usize = 12;
+/// The object holding this function's own properties, or zero until something asks for one.
+///
+/// A function in JavaScript is an object. `f.prototype`, `f.name`, and every static a program hangs
+/// off a constructor are ordinary properties on an ordinary object, and until this field existed a
+/// closure had nowhere to keep any of them.
+///
+/// A side object rather than a shape in the first word, which is the arrangement a mature engine
+/// ends up with and is not what this is. The first word of everything in this cage is either a shape
+/// or a kind tag, and that one test is how `object.rs` tells a closure from an object without a
+/// second dereference. Giving a closure a shape there would mean every kind question became a read
+/// through the shape, on the hottest path in the runtime, to re-derive something a tag already says.
+/// So the properties live in an object of their own that the closure points at, the prototype chain
+/// and the inline caches work on it exactly as they do on any other object, and the closure keeps
+/// its tag.
+///
+/// Zero until a property is asked for, so a function that is only ever called still costs twenty
+/// four bytes and nothing else. The first property access builds the object, and for a closure it
+/// builds `prototype` with it, because a function somebody is reading properties off is usually a
+/// constructor and the two allocations would otherwise land one after the other anyway.
+const PROPERTIES_OFFSET: usize = 16;
 
 /// A function value: one blueprint, plus the environment that was live where it was written.
 ///
@@ -62,7 +88,8 @@ impl ClosureRef {
         let pointer = heap.allocate(CLOSURE_SIZE, ObjectKind::Closure)?;
         let slot = slot_of(heap.cage(), pointer)?;
         // SAFETY: the allocation is `CLOSURE_SIZE` bytes of freshly committed memory that nothing
-        // else holds a reference to, and all three writes are inside it.
+        // else holds a reference to, and all four writes are inside it. The properties field is
+        // left at the zero the heap hands out, which is what "no properties yet" is spelled as.
         unsafe {
             write_kind(pointer, HeapKind::Closure);
             write_u32(pointer, FUNCTION_OFFSET, function);
@@ -78,6 +105,31 @@ impl ClosureRef {
             );
         }
         Some(ClosureRef(slot))
+    }
+
+    /// The object holding this function's own properties, or `None` if nothing has asked yet.
+    #[must_use]
+    pub fn properties(self, cage: &Cage) -> Option<ObjectRef> {
+        // SAFETY: the slot points at a closure, which is `CLOSURE_SIZE` bytes long.
+        let bits = unsafe { read_u32(cage, self.offset(), PROPERTIES_OFFSET) };
+        ObjectRef::from_slot(Slot::from_bits(bits))
+    }
+
+    /// Give this function the object its properties live in.
+    ///
+    /// Called once, by whoever found the field empty and built one. Writing it twice would strand
+    /// the first object and lose whatever was on it, so the caller reads before it writes, which is
+    /// the same shape of code every lazy field in this heap has.
+    pub fn set_properties(self, heap: &mut BumpHeap, properties: ObjectRef) {
+        // SAFETY: as `properties`, and `&mut BumpHeap` means nothing else is reading the cage.
+        unsafe {
+            write_u32_at(
+                heap.cage(),
+                self.offset(),
+                PROPERTIES_OFFSET,
+                properties.slot().to_bits(),
+            );
+        }
     }
 
     /// Which function in the loaded unit this closure runs.
@@ -124,14 +176,21 @@ impl ClosureRef {
     }
 }
 
-/// Bytes in a native: the kind tag and the ordinal.
+/// Bytes in a native: the kind tag, the ordinal and the properties.
 ///
-/// Eight exactly, which is the smallest an object in this heap can be, and there is nothing else to
-/// put in it. A native has no captured environment because Rust code closes over nothing, and no
-/// name here because the name is in the same table the code is in.
-const NATIVE_SIZE: usize = 8;
+/// Twelve written and sixteen reserved. It was eight, the smallest an object in this heap can be,
+/// until a function became something a program can hang properties off, and `Object` is a function
+/// with `create` and `prototype` on it. A native still has no captured environment because Rust code
+/// closes over nothing, and no name here because the name is in the same table the code is in.
+const NATIVE_SIZE: usize = 12;
 /// Which entry in the isolate's table of Rust functions this native calls.
 const ORDINAL_OFFSET: usize = 4;
+/// The object holding this function's own properties, or zero until something asks for one.
+///
+/// The same field a closure has and for the same reasons, which [`PROPERTIES_OFFSET`] gives at
+/// length. The one difference is what gets built: a native has no `prototype` put on it, because
+/// nothing written in Rust is constructible yet.
+const NATIVE_PROPERTIES_OFFSET: usize = 8;
 
 /// A function whose body is Rust: an ordinal into the table of them the isolate holds.
 ///
@@ -178,6 +237,29 @@ impl NativeRef {
     pub fn ordinal(self, cage: &Cage) -> u32 {
         // SAFETY: the slot points at a native, which is `NATIVE_SIZE` bytes long.
         unsafe { read_u32(cage, self.offset(), ORDINAL_OFFSET) }
+    }
+
+    /// The object holding this function's own properties, or `None` if nothing has asked yet.
+    #[must_use]
+    pub fn properties(self, cage: &Cage) -> Option<ObjectRef> {
+        // SAFETY: as `ordinal`.
+        let bits = unsafe { read_u32(cage, self.offset(), NATIVE_PROPERTIES_OFFSET) };
+        ObjectRef::from_slot(Slot::from_bits(bits))
+    }
+
+    /// Give this function the object its properties live in.
+    ///
+    /// As with [`ClosureRef::set_properties`], the caller reads before it writes.
+    pub fn set_properties(self, heap: &mut BumpHeap, properties: ObjectRef) {
+        // SAFETY: as `ordinal`, and `&mut BumpHeap` means nothing else is reading the cage.
+        unsafe {
+            write_u32_at(
+                heap.cage(),
+                self.offset(),
+                NATIVE_PROPERTIES_OFFSET,
+                properties.slot().to_bits(),
+            );
+        }
     }
 
     /// The slot this native lives at.
@@ -489,17 +571,18 @@ mod tests {
     }
 
     #[test]
-    fn a_native_costs_eight_bytes_and_wastes_none_of_them() {
-        // The smallest object this heap can hand out, and the reason the name and the code pointer
-        // are both in the table rather than in here. If this ever needs a third word, the tradeoff
-        // in the doc above has to be made again rather than assumed.
+    fn a_native_costs_twelve_bytes_and_is_given_sixteen() {
+        // Eight of those twelve are the reason the name and the code pointer are both in the table
+        // rather than in here, and the third word is what makes `Object.create` reachable off a
+        // function written in Rust. If this ever needs a fourth, the tradeoff in the doc above has
+        // to be made again rather than assumed.
         use crate::bump::ObjectKind;
         let mut heap = heap();
         NativeRef::new(&mut heap, 0).expect("should have room");
         let totals = heap.census().totals(ObjectKind::Native);
         assert_eq!(totals.count, 1);
-        assert_eq!(totals.requested_bytes, 8);
-        assert_eq!(totals.reserved_bytes, 8);
+        assert_eq!(totals.requested_bytes, 12);
+        assert_eq!(totals.reserved_bytes, 16);
     }
 
     #[test]
@@ -595,13 +678,43 @@ mod tests {
         assert_eq!(heap.census().totals(ObjectKind::Context).count, 1);
         assert_eq!(heap.census().totals(ObjectKind::String).count, 0);
         // Twenty four bytes for the context, which is sixteen of header and one eight byte cell,
-        // and sixteen for the closure with no alignment tax on either.
+        // and twenty asked for by the closure with four of alignment on top.
         assert_eq!(heap.census().totals(ObjectKind::Context).reserved_bytes, 24);
         assert_eq!(
             heap.census().totals(ObjectKind::Closure).requested_bytes,
-            16
+            20
         );
-        assert_eq!(heap.census().totals(ObjectKind::Closure).reserved_bytes, 16);
+        assert_eq!(heap.census().totals(ObjectKind::Closure).reserved_bytes, 24);
+    }
+
+    #[test]
+    fn a_function_keeps_no_properties_object_until_it_is_given_one() {
+        // The field is zero on a fresh closure and on a fresh native, so a function that is only
+        // ever called never pays for the object a function that is read from needs.
+        let mut heap = heap();
+        let closure = ClosureRef::new(&mut heap, 0, None, None).expect("should have room");
+        let native = NativeRef::new(&mut heap, 0).expect("should have room");
+        assert_eq!(closure.properties(heap.cage()), None);
+        assert_eq!(native.properties(heap.cage()), None);
+    }
+
+    #[test]
+    fn a_function_hands_back_the_properties_object_it_was_given() {
+        use crate::ordinary::ObjectRef;
+        use crate::shape::ShapeRef;
+        let mut heap = heap();
+        let closure = ClosureRef::new(&mut heap, 0, None, None).expect("should have room");
+        let native = NativeRef::new(&mut heap, 0).expect("should have room");
+        let root = ShapeRef::root(&mut heap, None).expect("should have room");
+        let for_closure = ObjectRef::new(&mut heap, root, 0).expect("should have room");
+        let for_native = ObjectRef::new(&mut heap, root, 0).expect("should have room");
+        closure.set_properties(&mut heap, for_closure);
+        native.set_properties(&mut heap, for_native);
+        assert_eq!(closure.properties(heap.cage()), Some(for_closure));
+        assert_eq!(native.properties(heap.cage()), Some(for_native));
+        // Two functions do not share one properties object, which is the bug that would make
+        // `f.x = 1` show up on `g` and would be invisible until two constructors existed.
+        assert_ne!(for_closure, for_native);
     }
 
     #[test]
