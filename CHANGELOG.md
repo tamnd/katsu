@@ -2,6 +2,58 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.7
+
+The seventh patch release of M1, four pull requests on from 0.1.6, and the one sentence that matters is that the wall came down. `throw new Test262Error(message)` is the first line of most of test262, `new` did not exist for six releases, and the conformance number sat at 6.66 percent for five of them because of it. It is 12.31 percent now, 9,995 cases against 5,410, and nothing regressed on the way.
+
+### `new` and `instanceof`
+
+In #77. `new Foo()` builds an object whose prototype is `Foo.prototype`, runs the constructor against it, and gives back the constructor's object if it returned one or the fresh object if it did not. `x instanceof Foo` walks the chain and answers. They are one piece of work because they are the same three steps in a different order, and both of them start with a property read on a function, which is what 0.1.6 was for.
+
+Constructing is two opcodes rather than one. The fresh object has to still be somewhere when the call comes back, so `Construct` parks it in the register the callee was read into, which is dead the moment the frame is pushed, and `ConstructResult` picks between that register and whatever came back. The alternative was a word on the call frame saying this frame is a construct, read by every return in the program to serve the calls that are constructs. The frame is thirty two bytes because the last eight cost 14 percent on `call/call_return`, so the same decision was made the same way: one dispatch per `new`, next to an allocation that costs far more, rather than a load per return.
+
+Three real bugs came out of testing rather than out of reading. `new Foo() instanceof Bar` threw about `Bar`'s prototype, because the lookup went through the path that deliberately does not build a function's properties object. At the depth limit an instance printed as `[Object]` where node prints `[Foo]`. And the three questions in `OrdinaryHasInstance` were being asked in the order that reads best rather than the order the standard gives, which makes `0 instanceof F` throw when `F.prototype` is a number and calls a getter the language says is not called.
+
+The first version of that branch cost 5 percent on `call/call_return` and 8 percent on `call/closure_call`, neither of which constructs anything at all, because the dispatch loop is one function and every arm competes for the same registers. Moving the body behind an `inline(never)` helper, which is the shape every other bulky piece of the loop already has, took it back to no signal in either direction.
+
+### The seven error constructors
+
+In #79. `Error`, `TypeError`, `RangeError`, `ReferenceError`, `SyntaxError`, `EvalError` and `URIError` exist, and the errors the engine throws are real instances of them rather than a shape that prints like one. A program can write `throw new TypeError(m)`, ask `e instanceof RangeError`, read `name` and `message` off the chain, and pass `{ cause }` through.
+
+The seven share one body and differ only by name, by the prototype they hang off and by the slot on the isolate the engine reads when it throws that kind. The prototypes live in an array on the isolate rather than being read back out of the global object, so a throw does not depend on the program leaving `TypeError` alone and a realm with no builtins still throws something rather than failing to build the error it was going to throw with.
+
+`String(err)` answered `[object Object]`, because the conversion to text never called an inherited `toString`. It is two halves now. The rules only half is what printing uses, so inspecting a value can never run the program's code, which is the property node has and one we should not give up by accident. The calling half sits behind `String(x)` and `+` and calls a `toString` written in Rust. A `toString` written in JavaScript is still not called, because that needs the dispatch loop to run a frame to completion from inside an opcode.
+
+That calling half opens a recursion nothing else could reach: `e.name = e` and then `String(e)` recurses in Rust with nothing growing on the interpreter's stack, so the frame limit never fires and the process dies on the real one. A counter raises the same `RangeError` node raises for the same program, at 64 conversions deep, and it sits for free in padding that a new `constructing` flag had already created. That flag took the interpreter from 72 bytes to 80, which is the whole cost of this release in the hot structure, and the next byte added there costs another eight.
+
+Printing an error matches node exactly, including the two rules that are only visible against a stackless error: node hides an own `name` or `message` that the first line already says, and prints a non-enumerable `cause` as `[cause]`. Both were measured with `node -e` rather than reasoned about.
+
+An error still has no `stack`, so `console.log(err)` prints node's stackless bracketed form rather than a trace, and the milestone checklist line stays unticked because of it. Alongside that, `Object.getPrototypeOf(TypeError) === Error` is false, `Object.prototype.toString.call(err)` does not say `[object Error]`, `Error.name` and `Error.length` are missing because a function has no own `name` yet, and `captureStackTrace` and `AggregateError` are absent. Each of those refuses by name rather than answering wrongly.
+
+### The crates go to crates.io
+
+In #80. This is the first release that publishes them. `spec/16-package-layout.md` has listed the crates as a release artifact since the specification was written and nothing was uploading them, so a tag built five binaries, attached them to a GitHub release and stopped.
+
+It is one `cargo publish --workspace`, which takes the order from the dependency graph and verifies the whole set builds as if it were already published before it uploads any of it. Everything about a publish that can be checked without a tag is checked on every commit instead, because a version on crates.io can be yanked but never replaced: `cargo xtask release` fails on a version that is not in lockstep, on an internal dependency asking for a version other than the one being released, and on a missing description, license or readme, and CI packages every crate the way crates.io would. The tag goes through the same check on the way in.
+
+That check found something on its first run. Every entry in `[workspace.dependencies]` asked for 0.1.5 while the workspace was at 0.1.6, which is invisible in a workspace build because cargo resolves a path dependency by path, and the first person to run `cargo add katsu-runtime` would have been the one to find it.
+
+The token that authorizes the upload is a secret on a GitHub environment that takes deployments only from a tag matching `v*`, so nothing running on a branch or on a pull request can reach it. It is a long lived token only because crates.io cannot attach a trusted publisher to a crate that has never been published, and #78 is what replaces it now that these crates exist.
+
+### Where the numbers stand
+
+Nothing in this release could be measured on either reference machine, and that is worth saying plainly rather than quoting a median that reads well. gamingpc is swinging by more than a factor of two on identical binaries at the moment: three alternating runs put main's own `call/fib` at 1,261, 1,485 and 1,475 microseconds and its own `native/native_call` at 16.0, 30.2 and 30.7. The m4 is quieter and still not quiet enough, with main's own spread at 10.52 to 17.45 microseconds on `call/call_return` and 209 to 321 on `exceptions/engine_error_caught` across four runs with nothing else on the machine.
+
+The tell is that last benchmark. An engine error now allocates a real object with a properties object and a prototype where it used to build a bare value, so it cannot have got faster, and the branch measured ten percent quicker than main on it. That is a measurement of the laptop and not of the change. The cost of allocating an error per throw is still owed a number on a machine that can produce one, and issue #1 in the bench repository is where that stops being an excuse.
+
+The workload baseline for this release is measured against the released tarball rather than a local build, so it lands after the tag and is quoted in the pull request that follows this one, the same way 0.1.6 was done.
+
+### Where the conformance number stands
+
+12.31 percent, 9,995 cases of the 81,225 attempted, up from 6.66 percent and 5,410. It moved twice. `new` took it to 8,924, and the error constructors took it to 9,995, mostly through the harness rather than through the error tests: `assert.throws` reads `name` off the constructor it was handed and `propertyHelper.js` asks `e instanceof TypeError`, and 20,360 of the 53,874 JavaScript files under test262's `test/` mention an error constructor or `assert.throws`.
+
+The differential harness against node v26.7.0 is at 2,017 programs, 2,016 agreed, 0 differed and 1 untested, and the one gap is still `set_index`, which is element writes.
+
 ## 0.1.6
 
 The sixth patch release of M1, three pull requests on from 0.1.5, and two of them are one piece of work: a function is an object now. It can carry properties, so `Foo.prototype` and the statics on a constructor are ordinary properties in an ordinary object, and `Object` is a function rather than a namespace object wearing the wrong type tag. This is the wall that `new` has been standing behind, and it is the reason 75,807 test262 cases stop where they stop.
