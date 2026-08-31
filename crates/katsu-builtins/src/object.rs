@@ -1713,4 +1713,141 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    #[test]
+    fn an_index_found_on_a_prototype_is_reached_from_below() {
+        // The read that goes through the element storage misses, and the walk that follows has to
+        // ask each level for its elements as well as for its names. A walk that only asks for names
+        // answers undefined here, which is what this build did before the chain learned about them.
+        assert_eq!(
+            logged(
+                "var p = {}; p[0] = 'proto'; var c = Object.create(p); console.log(c[0], c['0']);"
+            ),
+            "proto proto"
+        );
+    }
+
+    #[test]
+    fn an_index_written_below_shadows_the_one_above_and_leaves_it_alone() {
+        assert_eq!(
+            logged(
+                "var p = {}; p[0] = 'proto'; var c = Object.create(p); c[0] = 'own'; console.log(c[0], p[0]);"
+            ),
+            "own proto"
+        );
+    }
+
+    #[test]
+    fn an_index_is_serialised_by_json_the_way_a_name_is() {
+        assert_eq!(
+            logged("var o = {}; o[0] = 1; console.log(JSON.stringify(o));"),
+            "{\"0\":1}"
+        );
+    }
+
+    #[test]
+    fn the_indices_come_before_the_names_whatever_order_they_arrived_in() {
+        // Measured against Node. This is the language's enumeration order and not a choice, and it
+        // falls out of the storage for free: the elements are a flat array so they are already
+        // ascending, and the names are a shape chain so they are already in insertion order.
+        assert_eq!(
+            logged(
+                "var o = {}; o.x = 1; o[2] = 2; o[0] = 3; o.a = 4; console.log(JSON.stringify(o));"
+            ),
+            "{\"0\":3,\"2\":2,\"x\":1,\"a\":4}"
+        );
+    }
+
+    #[test]
+    fn an_index_has_the_descriptor_an_assignment_makes() {
+        assert_eq!(
+            logged("var o = {}; o[0] = 1; console.log(Object.getOwnPropertyDescriptor(o, '0'));"),
+            "{ value: 1, writable: true, enumerable: true, configurable: true }"
+        );
+    }
+
+    #[test]
+    fn the_methods_that_ask_about_own_properties_all_see_an_index() {
+        assert_eq!(
+            logged(
+                "var o = {}; o[0] = 1; console.log(o.hasOwnProperty('0'), o.hasOwnProperty(0), o.hasOwnProperty('00'), o.propertyIsEnumerable('0'));"
+            ),
+            "true true false true"
+        );
+    }
+
+    #[test]
+    fn an_index_too_sparse_for_an_array_is_still_one_property_once_the_array_grows_past_it() {
+        // The first write is too far past the end to be worth an array, so it is stored as a name.
+        // Filling in everything below it then grows the array out past that index, and the write
+        // that follows has to find the name and stay with it. Storing it in the array instead would
+        // leave the same property in two places, and which one answered would depend on the reader.
+        assert_eq!(
+            logged(
+                "var o = {}; o[3000] = 'named'; for (var i = 0; i < 3000; i++) o[i] = i; o[3000] = 'again'; console.log(o[3000], o['3000']);"
+            ),
+            "again again"
+        );
+    }
+
+    #[test]
+    fn defining_an_index_with_the_default_flags_puts_it_where_an_assignment_would() {
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, '0', {value: 7, writable: true, enumerable: true, configurable: true}); console.log(o[0], JSON.stringify(o));"
+            ),
+            "7 {\"0\":7}"
+        );
+    }
+
+    #[test]
+    fn defining_an_index_with_anything_else_puts_it_under_the_name_and_leaves_it_there() {
+        // The element storage holds values and not flags, so a hidden or a read only index has to be
+        // an ordinary property. What matters is that it is only one property afterwards: the slot it
+        // would have used is marked, so the assignment below finds the name rather than writing an
+        // element beside it and leaving the object answering two ways.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, '0', {value: 7}); console.log(o[0], JSON.stringify(o), Object.getOwnPropertyDescriptor(o, '0'));"
+            ),
+            "7 {} { value: 7, writable: false, enumerable: false, configurable: false }"
+        );
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, '0', {value: 7, writable: true}); o[0] = 9; console.log(o[0], o['0'], JSON.stringify(o));"
+            ),
+            "9 9 {}"
+        );
+    }
+
+    #[test]
+    fn an_index_that_started_as_a_name_stays_one_after_the_array_grows_over_it() {
+        // The element storage is asked to cover index 8 by the loop, and index 3 is already a name
+        // by then. Without the mark the write would land in the array and the object would hold `3`
+        // twice, answering `9` to one reader and `7` to another.
+        assert_eq!(
+            logged(
+                "var o = {}; Object.defineProperty(o, '3', {value: 7, writable: true}); for (var i = 0; i < 9; i++) if (i !== 3) o[i] = i; o[3] = 9; console.log(o[3], o['3'], JSON.stringify(o));"
+            ),
+            "9 9 {\"0\":0,\"1\":1,\"2\":2,\"4\":4,\"5\":5,\"6\":6,\"7\":7,\"8\":8}"
+        );
+    }
+
+    #[test]
+    fn negative_zero_is_index_zero_because_that_is_how_it_spells() {
+        assert_eq!(
+            logged("var o = {}; o[0] = 'zero'; console.log(o[-0], o[0.0], o['0']);"),
+            "zero zero zero"
+        );
+    }
+
+    #[test]
+    fn only_the_canonical_spelling_of_a_number_is_an_index() {
+        assert_eq!(
+            logged(
+                "var o = {}; o[1] = 'a'; console.log(o[1.0], o['1'], o['01'], o['+1'], o[' 1']);"
+            ),
+            "a a undefined undefined undefined"
+        );
+    }
 }
