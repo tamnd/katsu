@@ -2,6 +2,48 @@
 
 Versions are cut on a fixed rhythm rather than when something feels finished. A patch release goes out every few merged pull requests so that there is always a recent tag to bisect against and to point a bug report at, and a minor release, 0.x.0, goes out when a milestone in the roadmap is done. Everything below 1.0 is a skeleton being filled in and nothing here is a stability promise.
 
+## 0.1.6
+
+The sixth patch release of M1, three pull requests on from 0.1.5, and two of them are one piece of work: a function is an object now. It can carry properties, so `Foo.prototype` and the statics on a constructor are ordinary properties in an ordinary object, and `Object` is a function rather than a namespace object wearing the wrong type tag. This is the wall that `new` has been standing behind, and it is the reason 75,807 test262 cases stop where they stop.
+
+### A function carries its properties beside it
+
+In #73. A property written on a function is kept, read back and printed, where before the write was dropped and the read answered `undefined`.
+
+The properties go in an ordinary object that the function points at, rather than in the function itself. The first word of everything in this cage is either a shape or a kind tag, and that one test is how the heap tells a closure from an object without a second dereference. Giving a closure a shape there, which is what a mature engine does, would turn every kind question into a read through the shape to re-derive what a tag already says, on the hottest path in the runtime. A side object costs one pointer chase on the first property access instead, and after that the prototype chain and the inline caches work on it exactly as they work on anything else, so a read of `Foo.prototype` caches the way a read of `o.x` does.
+
+A closure went from sixteen bytes to twenty and a native from eight to twelve, and the field is zero until something asks for it. A function that is only ever called never allocates the object, which is most functions in most programs. The one that is read from builds it and builds `prototype` with it, because a function somebody reads a property off is usually a constructor, and puts `constructor` on that prototype pointing back at the function.
+
+The read path does not move: `property/prop_load_hot` measured 8.19 us on both sides of the change on gamingpc, which is what inlining the probe and making the function case a cold call out of it was for. The store path costs 7 percent and it is worth being exact about what that 7 percent is. It was 12 percent when the object test sat behind a helper answering for both cases, and rewriting the arm so the ordinary object is tested first got a third of it back. The rest is not work a store does: a third build, identical except that the store path never asks about functions, measures main's number, so a call the store never makes is costing it something through the register allocator. Taking that back means giving the whole cold tail its own function, and it is worth doing when there is a setter on `Function.prototype` to test it against.
+
+### `Object` is a function, and so is `Function`
+
+In #74. `typeof Object` answers `function` where it answered `object` for the last four releases, `Object` prints as `[Function: Object]`, and `Object.getPrototypeOf(Object)` finds the same `Function.prototype` that sits above any function a program writes. It carries its six statics as ordinary properties, which is only possible because of the change above. `Object(x)` works as a call, and `Object.prototype.constructor` is there, so `({}).constructor === Object` is true.
+
+That last line is what pulled `Function` into the same release. `constructor` on `Object.prototype` is inherited by everything in the realm, functions included, so the moment it existed a plain `function f() {}` answered `f.constructor === Object` where node answers `Function`. A wrong answer is worse than a missing one, so `Function`, `Function.prototype` and its own `constructor` came with it, found first because that prototype sits below `Object.prototype` on a function's chain. Calling `Function` refuses by name, because its last argument is source and that is a compiler entry point carrying every question `eval` carries about which scope the result closes over.
+
+A function answers the same questions about its own properties that an object does. `Foo.hasOwnProperty('bar')`, `Foo.propertyIsEnumerable('prototype')`, `Object.defineProperty(Foo, 'hidden', {value: 2})` and `Object.getOwnPropertyDescriptor(Foo, 'prototype')` all work, and every descriptor involved was read off node rather than remembered. Inside the engine the embedder API learned to see through a function to its properties: the three questions that only look find them without building anything, and the one that defines builds them.
+
+`Object.create(f)` refuses by name rather than answering wrongly, and the reason is the shape again. A prototype link points at an ordinary object and a function keeps its properties beside it, so the link would point at the side object and `Object.getPrototypeOf` would hand back something that is not the function. That is the kind of nearly right answer that costs a day to find later.
+
+Nothing in the dispatch loop changed and the numbers say so: `property/prop_load_hot` 8.31 us to 8.16 us and `property/prop_store` 9.10 us to 8.67 us on gamingpc, three runs a side alternating, with startup unchanged at about 2.1 ms. The first attempt at those numbers showed a 23 percent regression that did not reproduce on a second round, which is worth knowing about that machine: a single pair on it can be wrong by 40 percent, and turbo needs pinning before any number from it can carry the 10x claim.
+
+### Where the numbers stand
+
+The workload baseline for this release is measured against the released tarball in [tamnd/katsu-bench](https://github.com/tamnd/katsu-bench) rather than against a local build, so it lands after the tag rather than before it, and the table is quoted here in the pull request that follows this one. That is the same order 0.1.5 ended up in, and doing it deliberately this time avoids shipping two sets of absolutes for one release.
+
+What can be said before it is measured is what moved and what cannot have. `fib` does not read properties and does not hang anything off a function, so neither piece of work in this release has anything to do there, and the microbenchmarks that do cover it are quoted above. Still one of six compute workloads running, and what stops the other five is unchanged: `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` wants a collector.
+
+### Where the conformance number stands
+
+6.66%, 5,410 cases of the 81,225 attempted, unchanged for the fifth release running. 75,807 cases still stop on the `new` in `throw new Test262Error(message)`. This is the last release where that sentence is an explanation rather than an excuse, because everything `new` was waiting for is now here.
+
+### Also
+
+#72 replaced the fib absolutes in the 0.1.5 entry with the published baseline for the same release, because the changelog had quoted a busier session than the one katsu-bench published and one release should not carry two sets of absolutes.
+
+The differential harness is unchanged at 1,015 programs with 1,014 agreements, 0 differences and 1 gap, which is `set_index` and therefore element writes.
+
 ## 0.1.5
 
 The fifth patch release of M1, three pull requests on from 0.1.4, and all three are one arc. A property slot can now hold a pair of functions, an object literal can write that pair, and a property read remembers where it found what it found. The first two are language features that each cost about a fifth of a property read, and the third is the thing that takes both of them back and more, because it is what the shape was being built for all along.
