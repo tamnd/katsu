@@ -1487,47 +1487,55 @@ impl Interpreter {
                     if object.is_nullish() {
                         raise!(Self::nothing_to_write(object, blueprint, key));
                     }
-                    match guard!(self.written_to(object)) {
-                        Some(target) => match guard!(self.assign(target, name, new)) {
-                            Wrote::Yes => {}
-                            Wrote::Refused if blueprint.strict => {
-                                raise!(self.read_only(target, blueprint, key));
+                    // The object test is written out here rather than hidden behind a helper that
+                    // answers for both cases, because a store to an ordinary object is the common
+                    // one by a wide margin and putting anything in front of it is measurable. A
+                    // function is asked about only once the answer is already known not to be an
+                    // ordinary object.
+                    let target = match self.as_object(object) {
+                        Some(target) => target,
+                        None => match guard!(self.function_object(object)) {
+                            Some(target) => target,
+                            None if blueprint.strict => {
+                                raise!(self.nowhere_to_write(object, blueprint, key));
                             }
-                            Wrote::NoSetter if blueprint.strict => {
-                                raise!(self.only_a_getter(target, blueprint, key));
-                            }
-                            Wrote::Refused | Wrote::NoSetter => {}
-                            // A write that is a call. The one argument is the value being assigned,
-                            // which is already in a register, so it is passed where it sits. The
-                            // answer goes nowhere: a setter's return value is specified to be
-                            // discarded, and the value of the assignment expression is the value
-                            // that went in rather than anything the setter said about it.
-                            Wrote::Setter(setter) => {
-                                let return_pc =
-                                    u32::try_from(pc).map_err(|_| Self::code_too_long())?;
-                                let call = Call {
-                                    target: setter,
-                                    receiver: object,
-                                    first: value,
-                                    passed: 1,
-                                    return_to: Register::NOWHERE,
-                                    return_pc,
-                                };
-                                match guard!(self.enter(call, unit)) {
-                                    Entered::Frame { index, callee } => {
-                                        function = index;
-                                        blueprint = callee;
-                                        constants = unit.function(index).constants.as_slice();
-                                        pc = 0;
-                                    }
-                                    Entered::Answered(_) => {}
-                                }
-                            }
+                            None => continue,
                         },
-                        None if blueprint.strict => {
-                            raise!(self.nowhere_to_write(object, blueprint, key));
+                    };
+                    match guard!(self.assign(target, name, new)) {
+                        Wrote::Yes => {}
+                        Wrote::Refused if blueprint.strict => {
+                            raise!(self.read_only(target, blueprint, key));
                         }
-                        None => {}
+                        Wrote::NoSetter if blueprint.strict => {
+                            raise!(self.only_a_getter(target, blueprint, key));
+                        }
+                        Wrote::Refused | Wrote::NoSetter => {}
+                        // A write that is a call. The one argument is the value being assigned,
+                        // which is already in a register, so it is passed where it sits. The
+                        // answer goes nowhere: a setter's return value is specified to be
+                        // discarded, and the value of the assignment expression is the value
+                        // that went in rather than anything the setter said about it.
+                        Wrote::Setter(setter) => {
+                            let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                            let call = Call {
+                                target: setter,
+                                receiver: object,
+                                first: value,
+                                passed: 1,
+                                return_to: Register::NOWHERE,
+                                return_pc,
+                            };
+                            match guard!(self.enter(call, unit)) {
+                                Entered::Frame { index, callee } => {
+                                    function = index;
+                                    blueprint = callee;
+                                    constants = unit.function(index).constants.as_slice();
+                                    pc = 0;
+                                }
+                                Entered::Answered(_) => {}
+                            }
+                        }
                     }
                 }
 
@@ -1955,24 +1963,6 @@ impl Interpreter {
             return Ok(None);
         };
         Ok(Some((properties, properties.guard(self.isolate.cage()))))
-    }
-
-    /// The object a property write on `value` lands in, and nothing else.
-    ///
-    /// The same answer [`Interpreter::holder`] gives without the shape, because a store has no cache
-    /// to compare one against yet and reading a word to throw it away is a cost the hottest write in
-    /// the language should not pay. When stores get caches this collapses back into `holder`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError::OutOfMemory`] if a function is being written to for the first time
-    /// and there is no room for the object its properties go in.
-    #[inline]
-    fn written_to(&mut self, value: Value) -> Result<Option<ObjectRef>, RuntimeError> {
-        if let Some(object) = self.as_object(value) {
-            return Ok(Some(object));
-        }
-        self.function_object(value)
     }
 
     /// The object holding a function's properties, built on first use.
