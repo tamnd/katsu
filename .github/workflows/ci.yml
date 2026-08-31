@@ -166,7 +166,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: Swatinem/rust-cache@v2.9.2
-      - run: cargo run -p xtask -- release
+      # The same command the release runs, with the upload turned off. It checks the workspace
+      # against what crates.io will accept, works out the order the crates go up in and asks the
+      # registry which of them are already there, so the ordering code is exercised on every commit
+      # rather than for the first time during a release.
+      - run: cargo run -p xtask -- publish --dry-run
       - name: Ask crates.io whether this version is already published
         id: published
         run: |
