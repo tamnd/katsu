@@ -6,9 +6,10 @@
 //!
 //! # What is here
 //!
-//! `Object.prototype`, `Object.create`, `Object.getPrototypeOf`, `Object.defineProperty`,
-//! `Object.defineProperties` and `Object.getOwnPropertyDescriptor`, and on the prototype itself
-//! `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` and `valueOf`.
+//! `Object` itself as a callable function, `Object.prototype`, `Object.create`,
+//! `Object.getPrototypeOf`, `Object.defineProperty`, `Object.defineProperties` and
+//! `Object.getOwnPropertyDescriptor`, and on the prototype itself `constructor`, `hasOwnProperty`,
+//! `isPrototypeOf`, `propertyIsEnumerable`, `toString` and `valueOf`.
 //!
 //! # Why the prototype was empty until now
 //!
@@ -33,23 +34,28 @@
 //! one can only have its value changed, only if it is writable, and can only ever become less
 //! permissive.
 //!
-//! # `typeof Object` says "object" here and "function" in Node
+//! # `Object` is a function
 //!
-//! This is a known wrong answer and it is worth stating plainly rather than leaving to be
-//! discovered. `Object` is a constructor, which is to say a function with properties hanging off it,
-//! and in this build a function written in Rust is a native reference rather than an object, so it
-//! cannot carry `create` and `prototype`. The choice was between an `Object` that has the right type
-//! tag and no properties, which is useless, and one that has the properties and the wrong tag, which
-//! is what a program actually reaches for.
+//! It answers `function` to `typeof`, it prints as `[Function: Object]`, and `Object.getPrototypeOf`
+//! finds the same `Function.prototype` above it that it finds above any function a program writes.
+//! For a while it was a namespace object with the right names and the wrong type tag, because a
+//! function written in Rust had nowhere to keep `create` and `prototype`. A function carries its own
+//! properties now, so it does not have to be one thing or the other.
 //!
-//! It is fixed by functions becoming ordinary objects with a call behaviour, which is the same piece
-//! of work as `new` and as `Function.prototype`, and it is next.
+//! `Object.prototype.constructor` came with it and points back here, which is what makes
+//! `({}).constructor === Object` true.
 //!
 //! # What is not here
 //!
-//! `Object(x)` as a call, for the same reason: there is nothing to call.
+//! `new Object()`, which needs `new`. `Object(x)` as a call is here, and the two are the same
+//! operation with the same answer for every argument, so the second one arriving is mostly a matter
+//! of routing.
 //!
-//! `new Object()`, which needs `new`.
+//! `Object(1)` and the other primitives, which box into a wrapper that does not exist yet.
+//!
+//! `Object.create(f)`, meaning an object that inherits from a function. A prototype link points at an
+//! ordinary object and a function keeps its properties beside it, so the link would point at the side
+//! object and `Object.getPrototypeOf` would answer with something that is not the function.
 //!
 //! Accessors, meaning `get` and `set` in a descriptor. There is now a receiver to call a getter
 //! with, and what is left is the storage: a slot has to be able to hold a pair of functions instead
@@ -61,10 +67,6 @@
 //! `Object.prototype.toLocaleString`, which is defined as calling `this.toString()`. Calling a value
 //! from Rust is not something a native can do yet, and writing the same answer out twice would give
 //! the wrong one for any object that overrides `toString`.
-//!
-//! `Object.prototype.constructor`, which points at `Object`. It is one line and the line would be a
-//! lie: `Object` is not a function here, so `x.constructor` would answer with something that cannot
-//! be called or constructed. It lands with `new`.
 //!
 //! `__defineGetter__` and the three others like it, which are accessors under an older spelling.
 //!
@@ -104,24 +106,56 @@ pub fn install(interpreter: &mut Interpreter) -> Result<(), RuntimeError> {
     let define_property = interpreter.native_function("defineProperty", define_property)?;
     let define_properties = interpreter.native_function("defineProperties", define_properties)?;
     let describe = interpreter.native_function("getOwnPropertyDescriptor", describe)?;
-    // Non enumerable, like every namespace object in the language. `Object.keys(Object)` is empty in
-    // Node and it is empty here, and a `for in` over `Object` walks nothing.
-    let object = interpreter.host_object_with(
-        &[
-            ("create", create),
-            ("getPrototypeOf", get_prototype_of),
-            ("defineProperty", define_property),
-            ("defineProperties", define_properties),
-            ("getOwnPropertyDescriptor", describe),
-        ],
-        Attributes::BUILTIN,
-    )?;
+    // A function, which is what `Object` is, and not a namespace object that happens to hold the
+    // same names. That is what makes `typeof Object` answer "function", and it is only possible now
+    // that a function written in Rust can carry properties.
+    let object = interpreter.native_function("Object", call)?;
+    // Non enumerable, like every static in the language. `Object.keys(Object)` is empty in Node and
+    // it is empty here, and a `for in` over `Object` walks nothing.
+    for (name, value) in [
+        ("create", create),
+        ("getPrototypeOf", get_prototype_of),
+        ("defineProperty", define_property),
+        ("defineProperties", define_properties),
+        ("getOwnPropertyDescriptor", describe),
+    ] {
+        interpreter.define_property(object, name, value, Attributes::BUILTIN)?;
+    }
     // `Object.prototype` is the one property here that is none of the three things. Nothing can
     // rewrite it, hide it or remove it, because the top of every prototype chain in the realm moving
     // out from under running code is not something the language is willing to allow.
     interpreter.define_property(object, "prototype", prototype, Attributes::NONE)?;
     install_prototype(interpreter, prototype)?;
+    // The other half of that link, which had to wait for `Object` to be something worth pointing at.
+    // Every object in the realm inherits `constructor` from here, so `({}).constructor === Object`.
+    interpreter.define_property(prototype, "constructor", object, Attributes::BUILTIN)?;
     interpreter.define_global("Object", object)
+}
+
+/// `Object(value)`, which is `ToObject` with the empty case filled in.
+///
+/// `Object()` and `Object(undefined)` and `Object(null)` all make a new empty object, and anything
+/// that is already an object, function included, is handed straight back rather than copied. What is
+/// left is a primitive, which boxes into a wrapper that does not exist yet and refuses by name.
+///
+/// `new Object()` is the same operation and is not here, because `new` is not here.
+fn call(
+    interpreter: &mut Interpreter,
+    _receiver: Option<Value>,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let value = arg(args, 0);
+    if value.is_undefined() || value.is_null() {
+        let prototype = interpreter.object_prototype()?;
+        return interpreter.new_object_with_prototype(prototype);
+    }
+    if interpreter.is_ordinary_object(value) || interpreter.is_callable(value) {
+        return Ok(value);
+    }
+    let what = interpreter.display(value);
+    Err(RuntimeError::Unsupported(format!(
+        "Object({what}) is not supported yet, because boxing a primitive needs the wrapper prototypes"
+    )))
 }
 
 /// Put the methods every object inherits onto `Object.prototype`.
@@ -270,7 +304,9 @@ fn called_on(
             "Cannot convert undefined or null to object".to_owned(),
         ));
     }
-    if !interpreter.is_ordinary_object(value) {
+    // A function is an object and these methods work on one, which is how `hasOwnProperty.call(f,
+    // 'x')` answers. What is left here is a primitive, which needs a wrapper to be asked at all.
+    if !interpreter.is_ordinary_object(value) && !interpreter.is_callable(value) {
         return Err(RuntimeError::Unsupported(format!(
             "{name} is not supported yet for a value that is not an ordinary object, because it needs the wrapper prototypes"
         )));
@@ -288,11 +324,22 @@ fn called_on(
 /// in Node, because the argument is required to be an object or `null` and `undefined` is neither,
 /// so the missing argument falls into the same message rather than being defaulted. It is the other
 /// way around for the second, where absent means there is nothing to define.
+///
+/// Inheriting from a function is legal and refuses by name. A prototype link lives in the shape and
+/// points at an object, and a function keeps its properties in a side object, so the link would have
+/// to point at that side object instead. Every property lookup through it would find the right
+/// answer and `Object.getPrototypeOf` would hand back something that is not the function, which is a
+/// wrong answer rather than a missing one.
 fn create(
     interpreter: &mut Interpreter,
     _receiver: Option<Value>,
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
+    if interpreter.is_callable(arg(args, 0)) {
+        return Err(RuntimeError::Unsupported(
+            "Object.create is not supported yet for a function, because a prototype link can only point at an ordinary object".to_owned(),
+        ));
+    }
     let object = interpreter.new_object_with_prototype(arg(args, 0))?;
     let descriptors = arg(args, 1);
     if descriptors.is_undefined() {
@@ -322,14 +369,14 @@ fn get_prototype_of(
     if let Some(prototype) = interpreter.prototype_of(value) {
         return Ok(prototype);
     }
-    let what = if interpreter.is_callable(value) {
-        "a function, because it needs Function.prototype"
-    } else {
-        "a primitive, because it needs the wrapper prototypes"
-    };
-    Err(RuntimeError::Unsupported(format!(
-        "Object.getPrototypeOf is not supported yet for {what}"
-    )))
+    // A function inherits from `Function.prototype` whether or not it has been given a properties
+    // object of its own, so this is answered from the realm rather than from the function.
+    if interpreter.is_callable(value) {
+        return interpreter.function_prototype();
+    }
+    Err(RuntimeError::Unsupported(
+        "Object.getPrototypeOf is not supported yet for a primitive, because it needs the wrapper prototypes".to_owned(),
+    ))
 }
 
 /// A property descriptor as it was written, with the fields that were left out still left out.
@@ -371,7 +418,9 @@ fn define_property(
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
     let target = arg(args, 0);
-    if !interpreter.is_ordinary_object(target) {
+    // A function counts, and it is the reason this asks two questions instead of one. Defining a
+    // static on a constructor is how half of the standard library is written.
+    if !interpreter.is_ordinary_object(target) && !interpreter.is_callable(target) {
         return Err(RuntimeError::Type(
             "Object.defineProperty called on non-object".to_owned(),
         ));
@@ -397,7 +446,7 @@ fn define_properties(
     args: &[Value],
 ) -> Result<Value, RuntimeError> {
     let target = arg(args, 0);
-    if !interpreter.is_ordinary_object(target) {
+    if !interpreter.is_ordinary_object(target) && !interpreter.is_callable(target) {
         return Err(RuntimeError::Type(
             "Object.defineProperties called on non-object".to_owned(),
         ));
@@ -441,10 +490,19 @@ fn describe(
         ));
     }
     let key = interpreter.to_text(arg(args, 1))?;
-    if !interpreter.is_ordinary_object(value) {
+    let callable = interpreter.is_callable(value);
+    if !interpreter.is_ordinary_object(value) && !callable {
         return unwrappable(interpreter, value);
     }
     let Some((value, attributes)) = interpreter.own_descriptor(value, &key) else {
+        // A function has `name` and `length` in Node and does not have them here, so answering
+        // `undefined` for those two would be a wrong answer rather than a missing one. Every other
+        // name really is absent.
+        if callable && (key == "name" || key == "length") {
+            return Err(RuntimeError::Unsupported(format!(
+                "Object.getOwnPropertyDescriptor is not supported yet for '{key}' on a function, because a function does not carry that property yet"
+            )));
+        }
         return Ok(Value::UNDEFINED);
     };
     let enumerable = Value::from_bool(attributes.is_enumerable());
@@ -473,19 +531,13 @@ fn describe(
     ])
 }
 
-/// What to say about a primitive or a function that was asked to describe a property of itself.
+/// What to say about a primitive that was asked to describe a property of itself.
 ///
 /// A number, a boolean or a symbol boxes into a wrapper that never has own properties, so the honest
 /// answer is `undefined` and it happens to be the same answer Node gives. A string is different: its
 /// wrapper carries `length` and one property per character, so answering `undefined` would be a
-/// wrong answer rather than a missing one, and it refuses by name instead. So does a function, which
-/// has `name` and `length` of its own once functions are objects.
+/// wrong answer rather than a missing one, and it refuses by name instead.
 fn unwrappable(interpreter: &Interpreter, value: Value) -> Result<Value, RuntimeError> {
-    if interpreter.is_callable(value) {
-        return Err(RuntimeError::Unsupported(
-            "Object.getOwnPropertyDescriptor is not supported yet for a function, because it needs functions to be objects".to_owned(),
-        ));
-    }
     if interpreter.as_text(value).is_some() {
         return Err(RuntimeError::Unsupported(
             "Object.getOwnPropertyDescriptor is not supported yet for a string, because it needs the wrapper prototypes".to_owned(),
@@ -1039,11 +1091,16 @@ mod tests {
     }
 
     #[test]
-    fn asking_a_function_for_a_prototype_names_the_other_missing_piece() {
-        let error = printed("Object.getPrototypeOf(function () {});").expect_err("should throw");
-        assert!(
-            error.contains("it needs Function.prototype"),
-            "unexpected error: {error}"
+    fn every_function_in_the_realm_answers_with_one_function_prototype() {
+        // Node says true to both of these, and the second is the one that says `Object` is a
+        // function rather than a namespace object with the same names on it.
+        assert_eq!(
+            logged(
+                "function f() {} function g() {}\n\
+                 console.log(Object.getPrototypeOf(f) === Object.getPrototypeOf(g));\n\
+                 console.log(Object.getPrototypeOf(Object) === Object.getPrototypeOf(f));"
+            ),
+            "true\ntrue"
         );
     }
 
@@ -1449,7 +1506,14 @@ mod tests {
 
     #[test]
     fn the_statics_on_object_are_hidden_the_way_every_namespace_object_is() {
-        assert_eq!(logged("console.log(Object, JSON);"), "{} {}");
+        // `Object` is a function and prints as one now, and neither it nor `JSON` shows a single one
+        // of the names on it, because every static is non enumerable. Node writes `[Function:
+        // Object] Object [JSON] {}`, where the tag in front of the empty braces comes from
+        // `Symbol.toStringTag` and there are no symbols yet.
+        assert_eq!(
+            logged("console.log(Object, JSON);"),
+            "[Function: Object] {}"
+        );
     }
 
     #[test]
@@ -1459,6 +1523,114 @@ mod tests {
                 "console.log(Object.getOwnPropertyDescriptor(Object, 'prototype').writable, Object.getOwnPropertyDescriptor(Object, 'prototype').configurable);"
             ),
             "false false"
+        );
+    }
+
+    #[test]
+    fn object_is_a_function_and_says_so() {
+        // The whole point of the change. It used to answer "object" here and "function" in node.
+        assert_eq!(
+            logged("console.log(typeof Object, typeof Object.create, Object);"),
+            "function function [Function: Object]"
+        );
+    }
+
+    #[test]
+    fn every_object_in_the_realm_knows_the_constructor_that_would_have_made_it() {
+        assert_eq!(
+            logged(
+                "console.log(({}).constructor === Object, Object.prototype.constructor === Object, Object.create(null).constructor);"
+            ),
+            "true true undefined"
+        );
+    }
+
+    #[test]
+    fn constructor_is_hidden_the_way_node_hides_it() {
+        // Node breaks this one over five lines too, because the single line would be too long, and
+        // the four flags read the same either way.
+        assert_eq!(
+            logged(
+                "console.log(Object.getOwnPropertyDescriptor(Object.prototype, 'constructor'));"
+            ),
+            "{\n  value: [Function: Object],\n  writable: true,\n  enumerable: false,\n  configurable: true\n}"
+        );
+    }
+
+    #[test]
+    fn calling_object_makes_something_out_of_nothing_and_hands_everything_else_back() {
+        assert_eq!(
+            logged(
+                "var o = {}; var f = function () {};\n\
+                 console.log(typeof Object(), Object(undefined).a, Object(null) !== o, Object(o) === o, Object(f) === f);"
+            ),
+            "object undefined true true true"
+        );
+    }
+
+    #[test]
+    fn calling_object_on_a_primitive_refuses_rather_than_handing_the_primitive_back() {
+        // Node answers with a `Number` wrapper here. Handing back the number itself would be a wrong
+        // answer that a program could not tell from the right one until it tried to add a property.
+        let error = printed("Object(1);").expect_err("should throw");
+        assert!(
+            error.contains("boxing a primitive needs the wrapper prototypes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_function_answers_the_same_questions_about_its_own_properties_that_an_object_does() {
+        assert_eq!(
+            logged(
+                "function Foo() {} Foo.bar = 1;\n\
+                 console.log(Foo.hasOwnProperty('bar'), Foo.hasOwnProperty('prototype'), Foo.hasOwnProperty('nope'), Foo.propertyIsEnumerable('bar'), Foo.propertyIsEnumerable('prototype'));"
+            ),
+            "true true false true false"
+        );
+    }
+
+    #[test]
+    fn a_static_can_be_defined_on_a_function_the_way_the_standard_library_defines_them() {
+        assert_eq!(
+            logged(
+                "function Foo() {} Object.defineProperty(Foo, 'hidden', {value: 2});\n\
+                 console.log(Foo.hidden, Object.getOwnPropertyDescriptor(Foo, 'hidden'), Foo.propertyIsEnumerable('hidden'));"
+            ),
+            "2 { value: 2, writable: false, enumerable: false, configurable: false } false"
+        );
+    }
+
+    #[test]
+    fn describing_a_function_answers_for_what_it_carries_and_for_what_it_was_born_with() {
+        // Every one of these was measured against node. A written static is an ordinary property, and
+        // `prototype` is the one a function is born with and cannot lose.
+        assert_eq!(
+            logged(
+                "function Foo() {} Foo.bar = 1;\n\
+                 console.log(Object.getOwnPropertyDescriptor(Foo, 'bar'), Object.getOwnPropertyDescriptor(Foo, 'prototype'), Object.getOwnPropertyDescriptor(Foo, 'nope'));"
+            ),
+            "{ value: 1, writable: true, enumerable: true, configurable: true } { value: {}, writable: true, enumerable: false, configurable: false } undefined"
+        );
+    }
+
+    #[test]
+    fn one_function_prototype_sits_above_every_function_including_object() {
+        assert_eq!(
+            logged(
+                "function a() {} function b() {}\n\
+                 console.log(Object.getPrototypeOf(a) === Object.getPrototypeOf(b), Object.getPrototypeOf(Object) === Object.getPrototypeOf(a), Object.getPrototypeOf(Object.getPrototypeOf(a)) === Object.prototype);"
+            ),
+            "true true true"
+        );
+    }
+
+    #[test]
+    fn inheriting_from_a_function_refuses_rather_than_inheriting_from_its_properties() {
+        let error = printed("Object.create(function () {});").expect_err("should throw");
+        assert!(
+            error.contains("a prototype link can only point at an ordinary object"),
+            "unexpected error: {error}"
         );
     }
 

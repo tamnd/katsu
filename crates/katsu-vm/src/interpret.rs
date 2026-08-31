@@ -602,6 +602,23 @@ impl Interpreter {
         Ok(Value::from_slot(object.slot(), self.isolate.cage()))
     }
 
+    /// `Function.prototype`, which every function in this realm inherits from.
+    ///
+    /// Empty, and not callable. What lives here in a finished realm is `call`, `apply`, `bind` and
+    /// `toString`, and each of those needs a native to be able to call a JavaScript function, which
+    /// nothing in this build can do yet.
+    ///
+    /// # Errors
+    ///
+    /// As [`Interpreter::object_prototype`], which this inherits from.
+    pub fn function_prototype(&mut self) -> Result<Value, RuntimeError> {
+        let object = self
+            .isolate
+            .function_prototype()
+            .ok_or(RuntimeError::OutOfMemory)?;
+        Ok(Value::from_slot(object.slot(), self.isolate.cage()))
+    }
+
     /// An object with no properties that inherits from `prototype`, where `null` means nothing.
     ///
     /// This is `Object.create` without the second argument, and it is the only way to make an object
@@ -658,7 +675,11 @@ impl Interpreter {
     /// today has to refuse when it meets one, and handing them the flags is what lets them notice.
     #[must_use]
     pub fn own_properties(&self, value: Value) -> Option<Vec<(String, Value, Attributes)>> {
-        let object = self.as_object(value)?;
+        // A function that has never been given a property has no properties object, and the answer
+        // for it is an empty list rather than the `None` that means this was not an object at all.
+        let Some(object) = self.reachable(value) else {
+            return self.is_callable(value).then(Vec::new);
+        };
         let cage = self.isolate.cage();
         Some(
             object
@@ -737,8 +758,8 @@ impl Interpreter {
             return Ok(None);
         };
         let interned = interned.as_string();
+        let mut holder = self.reachable(object);
         let cage = self.isolate.cage();
-        let mut holder = self.as_object(object);
         while let Some(current) = holder {
             if let Some((index, attributes)) = current.find(cage, interned) {
                 if attributes.is_accessor() {
@@ -813,7 +834,7 @@ impl Interpreter {
     /// one [`Interpreter::lookup`] does not.
     pub fn own_descriptor(&mut self, object: Value, name: &str) -> Option<(Value, Attributes)> {
         let name = self.isolate.intern(name)?.as_string();
-        let object = self.as_object(object)?;
+        let object = self.reachable(object)?;
         let cage = self.isolate.cage();
         let (index, attributes) = object.find(cage, name)?;
         let bits = object.value_at(cage, index)?;
@@ -841,10 +862,15 @@ impl Interpreter {
         value: Value,
         attributes: Attributes,
     ) -> Result<(), RuntimeError> {
-        let Some(target) = self.as_object(object) else {
-            return Err(RuntimeError::Type(
-                "Cannot define a property on a value that is not an object".to_owned(),
-            ));
+        // A function is an object, so a builtin can be given properties the same way anything else
+        // is, and that is how `Object` carries `create` and `prototype`.
+        let target = match self.as_object(object) {
+            Some(target) => target,
+            None => self.function_object(object)?.ok_or_else(|| {
+                RuntimeError::Type(
+                    "Cannot define a property on a value that is not an object".to_owned(),
+                )
+            })?,
         };
         let name = self
             .isolate
@@ -2354,6 +2380,26 @@ impl Interpreter {
     fn probe(&self, object: Value) -> Option<(ObjectRef, u32)> {
         let record = self.as_object(object)?;
         Some((record, record.guard(self.isolate.cage())))
+    }
+
+    /// The object whose properties a question about `value` should be answered from, without
+    /// building one.
+    ///
+    /// [`Interpreter::holder`] is the same question asked by a program, and it builds what it does
+    /// not find because a program that reads a property off a function usually goes on to write one.
+    /// A native asking is usually only looking, so this answers `None` for a function that has never
+    /// been given a property rather than allocating on the way to saying there is nothing there.
+    /// That is the same answer either way, because a function with no properties object has no
+    /// properties, and because nothing is on `Function.prototype` for one to inherit yet.
+    fn reachable(&self, value: Value) -> Option<ObjectRef> {
+        if let Some(object) = self.as_object(value) {
+            return Some(object);
+        }
+        let cage = self.isolate.cage();
+        if let Some(closure) = self.as_closure(value) {
+            return closure.properties(cage);
+        }
+        self.as_native(value)?.properties(cage)
     }
 
     /// Read a property from what this site learned last time, or `None` if it has to be looked up.
