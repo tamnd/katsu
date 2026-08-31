@@ -326,6 +326,20 @@ pub enum ExprKind {
         /// The arguments, in source order. Spread is not in the M0 subset.
         arguments: Vec<Expr>,
     },
+    /// A construction, as in `new Foo(1)`.
+    ///
+    /// A separate node from [`ExprKind::Call`] rather than a flag on it, because the two evaluate
+    /// their callee to different ends. A call with a `Field` callee takes the object as the
+    /// receiver, and `new o.Foo()` takes nothing from `o` at all: the receiver is an object that
+    /// does not exist yet. Keeping them apart means neither has to check which one it is.
+    New {
+        /// What is being constructed, which is an expression and not a name. `new (f())()` and
+        /// `new o.Foo()` are both ordinary code.
+        callee: Box<Expr>,
+        /// The arguments, in source order. `new Foo` with no brackets arrives here as an empty
+        /// list, which is what it means.
+        arguments: Vec<Expr>,
+    },
     /// An object literal with property names known at compile time.
     Object {
         /// The properties, in source order, which is the order they are stored in and therefore

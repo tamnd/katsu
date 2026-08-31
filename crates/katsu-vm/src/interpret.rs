@@ -1228,6 +1228,16 @@ impl Interpreter {
                     self.stack.set(dst, Value::from_bool(!less.unwrap_or(true)));
                 }
 
+                // The one operator whose answer is a walk up a prototype chain rather than a
+                // comparison of two values. The cache slot the opcode carries is not used yet, and
+                // what it is waiting for is written on `Interpreter::instance_of`.
+                Op::InstanceOf { dst, lhs, rhs, .. } => {
+                    let object = self.stack.get(lhs);
+                    let target = self.stack.get(rhs);
+                    let answer = guard!(self.instance_of(object, target));
+                    self.stack.set(dst, Value::from_bool(answer));
+                }
+
                 Op::Neg { dst, src, .. } => {
                     let number = self.number_at(src);
                     self.stack.set(dst, Value::from_f64(-number));
@@ -1681,6 +1691,68 @@ impl Interpreter {
                     pc = 0;
                 }
 
+                // A property read, an allocation and a call, in that order. The read is
+                // `callee.prototype` and it goes through the same inline cache a `get_prop` would,
+                // because a constructor called in a loop reads the same property off the same
+                // function every turn and that is exactly what a cache is for.
+                Op::Construct {
+                    dst,
+                    callee,
+                    key,
+                    args,
+                    argc,
+                    cache,
+                } => {
+                    let target = self.stack.get(callee);
+                    let Some(closure) = self.as_closure(target) else {
+                        raise!(self.cannot_construct(target));
+                    };
+                    let site = Site::new(&unit.function(function).caches, cache);
+                    let this = guard!(self.instance_for(target, site, constants, key, blueprint));
+                    // On top of the function, which is the register lowering set aside for it, and
+                    // which `construct_result` reads once the call has returned.
+                    self.stack.set(callee, this);
+                    let index = closure.function(self.isolate.cage());
+                    let captured = closure.captured(self.isolate.cage());
+                    let callee = unit.function(index).blueprint;
+                    let return_pc = u32::try_from(pc).map_err(|_| Self::code_too_long())?;
+                    guard!(
+                        self.stack
+                            .push_call(
+                                callee.frame_size,
+                                Invocation {
+                                    arity: callee.arity,
+                                    first: args,
+                                    passed: argc,
+                                    function: index,
+                                    return_pc,
+                                    return_to: dst,
+                                    // The object being built, which is what `this` means inside a
+                                    // constructor and is the whole reason the object is made before
+                                    // the call rather than after it.
+                                    receiver: this,
+                                },
+                            )
+                            .map_err(RuntimeError::from)
+                    );
+                    self.set_frame_context(captured);
+                    function = index;
+                    blueprint = callee;
+                    constants = unit.function(index).constants.as_slice();
+                    pc = 0;
+                }
+
+                // What the constructor returned, unless it did not return an object, in which case
+                // the object it was given. `return 5`, `return` and falling off the end are three
+                // spellings of the same thing here, and all three are far more common in real code
+                // than the `return {}` that overrides them.
+                Op::ConstructResult { dst, this } => {
+                    let returned = self.stack.get(dst);
+                    if self.as_object(returned).is_none() && !self.is_callable(returned) {
+                        self.stack.set(dst, self.stack.get(this));
+                    }
+                }
+
                 // The instruction that hands a value to the unwinder. Where it goes is not written
                 // here and could not be: entering the `try` emitted nothing at all, so the handler
                 // table is the only thing that knows, and it is read now or never.
@@ -2092,6 +2164,189 @@ impl Interpreter {
             )
             .ok_or(RuntimeError::OutOfMemory)?;
         Ok(())
+    }
+
+    /// What `new` says when what it was given cannot build anything.
+    ///
+    /// Two situations and two different answers, because they are different kinds of missing. A
+    /// number or a plain object is a program error and Node throws a `TypeError` a program can
+    /// catch, so this does too. A function written in Rust is a gap in the runtime: the table of
+    /// them records a name and a code pointer and nothing that says which of them construct, and
+    /// `new Object()` and `new console.log()` would have to be told apart by something. Node answers
+    /// the first with an object and the second with a `TypeError`, so guessing either way is wrong
+    /// half the time, and this refuses by name instead.
+    ///
+    /// The value is named rather than the expression, which is the same divergence `Op::Call`
+    /// carries: Node says `x is not a constructor` where this says `5 is not a constructor`. Naming
+    /// the expression needs the source span of every call site, and both of them get it together.
+    #[cold]
+    #[inline(never)]
+    fn cannot_construct(&self, target: Value) -> RuntimeError {
+        if self.as_native(target).is_some() {
+            return RuntimeError::Unsupported(
+                "new is not supported yet on a function written in Rust, because nothing in the \
+                 table of them says which are constructors"
+                    .to_owned(),
+            );
+        }
+        let text = self.display(target);
+        RuntimeError::Type(format!("{text} is not a constructor"))
+    }
+
+    /// Everything a `new` does before the call: read `prototype` off the function and build the
+    /// object that the constructor will be run on.
+    ///
+    /// It is out of line and that is the point of it. The dispatch loop is one function, so
+    /// everything written inside an arm competes for registers with every other arm, and a body
+    /// this size is paid for by the opcodes around it rather than by the one it belongs to.
+    /// Measured on gamingpc, having it inline cost 5 percent on `call/call_return` and 8 percent on
+    /// `call/closure_call`, neither of which constructs anything. One call per `new`, next to an
+    /// allocation that costs far more, does not show up beside that.
+    ///
+    /// The read goes through the same inline cache a `get_prop` would, because a constructor called
+    /// in a loop reads the same property off the same function every turn, which is what a cache is
+    /// for. It builds the function's properties object rather than merely looking for it, because a
+    /// function nobody has read a property off has no `prototype` yet and this is a read a program
+    /// asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the read of `prototype` and the allocation return, and
+    /// [`RuntimeError::Unsupported`] when `prototype` turns out to be an accessor.
+    #[inline(never)]
+    fn instance_for(
+        &mut self,
+        target: Value,
+        site: Site,
+        constants: &[Value],
+        key: katsu_ir::ConstIndex,
+        blueprint: &FunctionBlueprint,
+    ) -> Result<Value, RuntimeError> {
+        let probe = self.holder(target)?;
+        let prototype = if let Some(value) = self.cached(probe, site) {
+            value
+        } else {
+            let name = self.name_at(constants, key);
+            match self.property(target, probe, name, site, blueprint, key)? {
+                Found::Value(value) => value,
+                // `Foo.prototype` as an accessor is the same wall a method call hits when the
+                // method is a getter, and it is here for the same reason: the loop has nowhere to
+                // keep a call that is waiting on another call.
+                Found::Getter(_) => {
+                    return Err(RuntimeError::Unsupported(
+                        "reading 'prototype' to construct means calling a getter, and the \
+                         interpreter has nowhere to keep a call that is waiting on another call"
+                            .to_owned(),
+                    ));
+                }
+            }
+        };
+        self.new_instance(prototype)
+    }
+
+    /// The object a constructor is handed, built out of what its `prototype` property holds.
+    ///
+    /// Anything that is not an object means `Object.prototype`, which is what the specification says
+    /// and what Node does: `Foo.prototype = 5` does not make an instance with a number above it and
+    /// does not throw, it makes an ordinary object. That is worth knowing because the same value in
+    /// the same property throws in an `instanceof` check, and the two are not the same operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Unsupported`] when `prototype` is a function, because a prototype
+    /// link in this object model can only point at an ordinary object, which is the same wall
+    /// `Object.create` hits and says so in the same words. Returns [`RuntimeError::OutOfMemory`] if
+    /// the heap has no room for the object or its shape.
+    fn new_instance(&mut self, prototype: Value) -> Result<Value, RuntimeError> {
+        if self.is_ordinary_object(prototype) {
+            return self.new_object_with_prototype(prototype);
+        }
+        if self.is_callable(prototype) {
+            return Err(RuntimeError::Unsupported(
+                "constructing from a function whose 'prototype' is itself a function is not \
+                 supported yet, because a prototype link can only point at an ordinary object"
+                    .to_owned(),
+            ));
+        }
+        let above = self.object_prototype()?;
+        self.new_object_with_prototype(above)
+    }
+
+    /// `instanceof`, which asks whether an object was built by a constructor by asking whether the
+    /// constructor's `prototype` is anywhere above it.
+    ///
+    /// It is a walk and not a comparison, and it reads the property on the way, which is why the
+    /// answer to `e instanceof E` changes when `E.prototype` is reassigned after `e` was made. That
+    /// is not a curiosity, it is the whole reason the operator is defined this way, and it is
+    /// measured against Node in the tests rather than reasoned about here.
+    ///
+    /// A function on the left is an object and answers `true` for `Function` and for `Object`, so
+    /// the walk starts from the object a function keeps its properties in, whose prototype is
+    /// `Function.prototype`. Building that object is the price of asking, and it is paid once per
+    /// function rather than once per check.
+    ///
+    /// The three questions are asked in the specification's order and not in the order that reads
+    /// best, because the order is observable. A right hand side that cannot be called is refused
+    /// before anything else, a left hand side that is a primitive answers false next, and only then
+    /// is `prototype` read. Swapping the last two turns `5 instanceof F` into an error when
+    /// `F.prototype` is a number, and calls a getter the language says is not called.
+    ///
+    /// The read of `prototype` interns the name rather than going through the opcode's cache slot.
+    /// The slot is there and stays empty, because filling it needs a constant pool index to name the
+    /// property in the message a miss can produce, and `Op::InstanceOf` has the shape every other
+    /// binary operator has instead. The day this shows up in a profile is the day it gets one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Type`] in Node's words for a right hand side that is not an object,
+    /// for one that is an object but cannot be called, and for a `prototype` that is not an object.
+    /// All three are program errors a `catch` can see. Returns [`RuntimeError::Unsupported`] if
+    /// `prototype` turns out to be an accessor, which reading means calling.
+    fn instance_of(&mut self, object: Value, target: Value) -> Result<bool, RuntimeError> {
+        if !self.is_callable(target) {
+            return Err(RuntimeError::Type(
+                if self.is_ordinary_object(target) {
+                    "Right-hand side of 'instanceof' is not callable"
+                } else {
+                    "Right-hand side of 'instanceof' is not an object"
+                }
+                .to_owned(),
+            ));
+        }
+        let record = match self.as_object(object) {
+            Some(record) => Some(record),
+            None => self.function_object(object)?,
+        };
+        // A primitive is not an instance of anything, and it says so before `prototype` is read
+        // rather than after. The order is the specification's and it is observable twice over:
+        // `5 instanceof F` is false rather than an error when `F.prototype` is a number, and a
+        // getter on `prototype` is not called at all. Both are test262 cases.
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        // Built and not merely looked for. A function that has never had a property read off it has
+        // no properties object yet and so has no `prototype` either, and answering `undefined` for
+        // one of those would make `new Foo() instanceof Bar` throw about `Bar` rather than answer
+        // false. This is a read a program asked for, so it materialises what a read materialises.
+        self.holder(target)?;
+        let prototype = self
+            .lookup(target, "prototype")?
+            .unwrap_or(Value::UNDEFINED);
+        let Some(wanted) = self.as_object(prototype) else {
+            let what = self.display(prototype);
+            return Err(RuntimeError::Type(format!(
+                "Function has non-object prototype '{what}' in instanceof check"
+            )));
+        };
+        let cage = self.isolate.cage();
+        let mut step = record.prototype(cage);
+        while let Some(current) = step {
+            if current == wanted {
+                return Ok(true);
+            }
+            step = current.prototype(cage);
+        }
+        Ok(false)
     }
 
     /// Leave the dispatch loop and run some Rust.
@@ -2746,13 +3001,18 @@ impl Interpreter {
         // is asked for them, which is what makes it possible to put a method on a prototype without
         // it turning up in the printed form of every object that inherits it.
         let names = object.enumerable(cage);
-        // An object that inherits from nothing says so, and the tag counts towards the width the
-        // same way a back reference does, so an object with it breaks onto several lines earlier
-        // than the same object without it. That was measured against node rather than assumed.
-        let tag = if object.prototype(cage).is_none() {
-            inspect::NULL_PROTOTYPE
+        let bare = object.prototype(cage).is_none();
+        // An object that inherits from nothing says so, and so does one that something other than
+        // `Object` built, which is why `new Foo()` prints as `Foo {}`. Either one counts towards the
+        // width, so an object carrying one breaks onto several lines earlier than the same object
+        // without one, and it is handed to `braces` separately from a back reference because node
+        // charges the two differently. That was measured against node rather than assumed. The two
+        // are exclusive because an object with no prototype has no chain for a constructor to be
+        // found on.
+        let tag = if bare {
+            inspect::NULL_PROTOTYPE.to_owned()
         } else {
-            ""
+            self.constructor_name(object).unwrap_or_default()
         };
         // Also before the depth check, and also measured. An object with nothing in it prints as
         // `{}` however deep it is, because there is nothing below it for the limit to be protecting
@@ -2760,15 +3020,19 @@ impl Interpreter {
         // The differential harness found this one: `[Object]` is long enough to push the object
         // holding it over the width limit, so getting it wrong breaks a line that Node keeps whole.
         if names.is_empty() {
-            return inspect::braces(&[], indent, tag);
+            return inspect::braces(&[], indent, "", &tag);
         }
         if depth == 0 {
-            // The tag on its own rather than `[Object]`, because at the depth limit the one thing
-            // still worth saying about an object is the thing its contents would not have shown.
-            return if tag.is_empty() {
+            // What is left when the contents are not printed is what built the object, so an
+            // instance of `Foo` elides to `[Foo]` and a plain object to `[Object]`. A bare object
+            // says what it always says, without a second pair of brackets around it, because the
+            // form node writes there is already bracketed.
+            return if bare {
+                inspect::NULL_PROTOTYPE.to_owned()
+            } else if tag.is_empty() {
                 "[Object]".to_owned()
             } else {
-                tag.to_owned()
+                format!("[{tag}]")
             };
         }
         cycles.enter(slot);
@@ -2776,12 +3040,105 @@ impl Interpreter {
         cycles.leave();
         // Read after the walk and not before it, because whether anything points back at this
         // object is only known once everything under it has been printed.
-        let base = match (cycles.assigned(slot), tag) {
-            (Some(number), "") => inspect::reference(number),
-            (Some(number), tag) => format!("{} {tag}", inspect::reference(number)),
-            (None, tag) => tag.to_owned(),
+        let pointed_at = match cycles.assigned(slot) {
+            Some(number) => inspect::reference(number),
+            None => String::new(),
         };
-        inspect::braces(&entries, indent, &base)
+        inspect::braces(&entries, indent, &pointed_at, &tag)
+    }
+
+    /// The name Node prints in front of an object that something other than `Object` built.
+    ///
+    /// This is Node's rule and not an approximation of it, because the approximation everybody
+    /// reaches for first is "read `constructor` off the prototype", and that prints `Weird {}` for
+    /// an object whose prototype merely has a `constructor` property pointing somewhere unrelated.
+    /// Node walks the chain looking for an own `constructor` that holds a named function which the
+    /// object is actually an instance of, and skips the ones that fail any part of that. The
+    /// `instanceof` half is what makes it a fact about the object rather than about a property
+    /// somebody wrote, and it is why `Object.create({constructor: function Weird() {}})` prints as
+    /// `{}` in Node and here.
+    ///
+    /// `Object` itself answers `None`, because Node prints a plain object as `{}` rather than
+    /// `Object {}`. That is the same comparison Node makes, against the name and not against the
+    /// function, so an object whose constructor is a different function that happens to be called
+    /// `Object` also prints without a prefix.
+    ///
+    /// Nothing is interned here. A name that has never been interned cannot be a property of
+    /// anything in this heap, so a lookup that misses is a definite `None` rather than a reason to
+    /// allocate, and printing stays a read only operation on the isolate.
+    fn constructor_name(&self, object: ObjectRef) -> Option<String> {
+        let cage = self.isolate.cage();
+        let wanted = self
+            .isolate
+            .atoms()
+            .lookup(cage, "constructor")?
+            .as_string();
+        let mut step = Some(object);
+        while let Some(current) = step {
+            if let Some((index, attributes)) = current.find(cage, wanted)
+                && !attributes.is_accessor()
+                && let Some(bits) = current.value_at(cage, index)
+            {
+                let function = Value::from_bits(bits);
+                if let Some(name) = self.callable_name(function)
+                    && self.built_by(object, function)
+                {
+                    return (name != "Object").then_some(name);
+                }
+            }
+            step = current.prototype(cage);
+        }
+        None
+    }
+
+    /// Whether `object` is an instance of `function`, asked without being able to throw.
+    ///
+    /// The same walk [`Interpreter::instance_of`] makes, and deliberately not that function: this
+    /// one is asked while printing, where every question a program could get an error for has to
+    /// answer `false` instead. A function with no `prototype`, a `prototype` that is not an object
+    /// and an accessor in its place are all reasons to keep walking rather than reasons to stop.
+    fn built_by(&self, object: ObjectRef, function: Value) -> bool {
+        let cage = self.isolate.cage();
+        let Some(properties) = self.reachable(function) else {
+            return false;
+        };
+        let Some(name) = self.isolate.atoms().lookup(cage, "prototype") else {
+            return false;
+        };
+        let Some((index, attributes)) = properties.find(cage, name.as_string()) else {
+            return false;
+        };
+        if attributes.is_accessor() {
+            return false;
+        }
+        let Some(bits) = properties.value_at(cage, index) else {
+            return false;
+        };
+        let Some(wanted) = self.as_object(Value::from_bits(bits)) else {
+            return false;
+        };
+        let mut step = object.prototype(cage);
+        while let Some(current) = step {
+            if current == wanted {
+                return true;
+            }
+            step = current.prototype(cage);
+        }
+        false
+    }
+
+    /// The bare name of a function, or `None` for anything else and for one written without a name.
+    ///
+    /// The name and not the `[Function: name]` text, because the two places that want this want it
+    /// as a word: one puts it in front of an object and the other compares it against `Object`.
+    fn callable_name(&self, value: Value) -> Option<String> {
+        if let Some(closure) = self.as_closure(value) {
+            let name = closure.name(self.isolate.cage())?;
+            return Some(name.to_utf8_lossy(self.isolate.cage()).into_owned());
+        }
+        let native = self.as_native(value)?;
+        let ordinal = native.ordinal(self.isolate.cage());
+        Some(self.isolate.natives().name(ordinal)?.to_owned())
     }
 
     /// One `name: value` for each property, which is the inside of a printed object.
@@ -2884,7 +3241,7 @@ impl Interpreter {
             Some(number) => format!("{} {base}", inspect::reference(number)),
             None => base,
         };
-        inspect::braces(&entries, indent, &base)
+        inspect::braces(&entries, indent, &base, "")
     }
 
     /// What one value looks like inside a printed object.
@@ -6371,6 +6728,279 @@ mod tests {
             .run(&as_expression("function id(v) { return v; } id(host.log)"))
             .expect("should not throw");
         assert_eq!(interpreter.display(value), "[Function: log]");
+    }
+
+    #[test]
+    fn a_construct_runs_the_function_on_a_fresh_object_and_hands_it_back() {
+        // The four things `new` does, in one program: allocate, link, run the body against it, and
+        // produce the object rather than what the body returned.
+        assert_eq!(
+            evaluate_value("function Foo(a) { this.a = a; } var f = new Foo(1);", "f"),
+            "Foo { a: 1 }"
+        );
+    }
+
+    #[test]
+    fn a_fresh_object_inherits_from_the_prototype_the_function_had_at_the_time() {
+        assert_eq!(
+            evaluate_display(
+                "function Foo() {}\n\
+                 Foo.prototype.answer = function () { return 42; };\n\
+                 new Foo().answer();"
+            ),
+            "42"
+        );
+        // Read through the chain rather than found on the object, which is the same test written so
+        // that a copy of the prototype's properties would fail it.
+        assert_eq!(
+            evaluate_display("function Foo() {} new Foo().constructor === Foo"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn a_constructor_that_returns_an_object_returns_that_object_instead() {
+        // Node's rule, measured: an object wins, a function is an object for this purpose, and
+        // everything else is dropped on the floor including an explicit `null`.
+        assert_eq!(
+            evaluate_value(
+                "function Foo() { this.a = 1; return { b: 2 }; } var f = new Foo();",
+                "f"
+            ),
+            "{ b: 2 }"
+        );
+        assert_eq!(
+            evaluate_value(
+                "function Foo() { this.a = 1; return 5; } var f = new Foo();",
+                "f"
+            ),
+            "Foo { a: 1 }"
+        );
+        assert_eq!(
+            evaluate_value(
+                "function Foo() { this.a = 1; return null; } var f = new Foo();",
+                "f"
+            ),
+            "Foo { a: 1 }"
+        );
+        assert_eq!(
+            evaluate_value(
+                "function Foo() { this.a = 1; var nothing; return nothing; } var f = new Foo();",
+                "f"
+            ),
+            "Foo { a: 1 }"
+        );
+        assert_eq!(
+            evaluate_display(
+                "function Bar() {}\n\
+                 function Foo() { return Bar; }\n\
+                 new Foo() === Bar"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn a_construct_reads_the_prototype_every_time_rather_than_once() {
+        // The read is cached at the site, so this is the test that the cache is a cache and not a
+        // memo: the same site constructs twice with a different prototype in between.
+        assert_eq!(
+            evaluate_display(
+                "function Foo() {}\n\
+                 function make() { return new Foo(); }\n\
+                 Foo.prototype = { tag: 'first' };\n\
+                 var first = make();\n\
+                 Foo.prototype = { tag: 'second' };\n\
+                 var second = make();\n\
+                 first.tag + ',' + second.tag"
+            ),
+            "first,second"
+        );
+    }
+
+    #[test]
+    fn a_function_whose_prototype_is_not_an_object_still_constructs() {
+        // Node falls back to `Object.prototype` rather than to nothing, and the printed form is
+        // where that shows in a runtime with no builtins in it: an object that inherited from
+        // nothing would say so. Both a primitive and `null` land here.
+        for prototype in ["5", "null", "'text'"] {
+            assert_eq!(
+                evaluate_value(
+                    &format!(
+                        "function Foo() {{ this.a = 1; }}\n\
+                         Foo.prototype = {prototype};\n\
+                         var f = new Foo();"
+                    ),
+                    "f"
+                ),
+                "{ a: 1 }",
+                "prototype {prototype}"
+            );
+        }
+    }
+
+    #[test]
+    fn constructing_something_that_is_not_a_function_says_so() {
+        // Node names the expression where we name the value, which is the divergence `Op::Call`
+        // already carries and for the same reason: the loop has the value and not the source.
+        assert_eq!(
+            evaluate("var x = 5; new x();"),
+            Err(RuntimeError::Type("5 is not a constructor".to_owned()))
+        );
+        assert_eq!(
+            evaluate("var o = {}; new o();"),
+            Err(RuntimeError::Type("{} is not a constructor".to_owned()))
+        );
+    }
+
+    #[test]
+    fn constructing_a_function_written_in_rust_refuses_by_name() {
+        // `new Object()` works in node and `new console.log()` does not, and nothing in the table
+        // says which is which yet. Refusing by name is the honest answer until it does.
+        let mut interpreter = hosted();
+        let error = interpreter
+            .run(&as_expression("new host.log();"))
+            .expect_err("should refuse");
+        assert!(
+            matches!(&error, RuntimeError::Unsupported(text) if text.contains("constructor")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_argument_to_a_construct_can_be_another_construct() {
+        // The nested case is worth its own test because the fresh object lives in the callee's
+        // register until the call returns, and a nested `new` allocates its registers inside that.
+        assert_eq!(
+            evaluate_value(
+                "function Foo(a) { this.a = a; } var f = new Foo(new Foo(2));",
+                "f"
+            ),
+            "Foo { a: Foo { a: 2 } }"
+        );
+    }
+
+    #[test]
+    fn instance_of_answers_for_the_whole_prototype_chain() {
+        assert_eq!(
+            evaluate_display("function Foo() {} new Foo() instanceof Foo"),
+            "true"
+        );
+        assert_eq!(
+            evaluate_display("function Foo() {} function Bar() {} new Foo() instanceof Bar"),
+            "false"
+        );
+        // One link further along, which is inheritance written the way a program without `class`
+        // writes it.
+        assert_eq!(
+            evaluate_display(
+                "function Foo() {}\n\
+                 function Bar() {}\n\
+                 Bar.prototype = new Foo();\n\
+                 var b = new Bar();\n\
+                 (b instanceof Bar) + ',' + (b instanceof Foo)"
+            ),
+            "true,true"
+        );
+    }
+
+    #[test]
+    fn instance_of_is_false_for_a_primitive_rather_than_an_error() {
+        for value in ["5", "'text'", "null", "true"] {
+            assert_eq!(
+                evaluate_display(&format!("function Foo() {{}} {value} instanceof Foo")),
+                "false",
+                "{value}"
+            );
+        }
+        assert_eq!(
+            evaluate_display("function Foo() {} var nothing; nothing instanceof Foo"),
+            "false"
+        );
+    }
+
+    #[test]
+    fn instance_of_follows_the_prototype_the_function_has_now() {
+        // The answer is a fact about the object's chain and not about which function built it, so
+        // moving the prototype makes an object stop being an instance of the thing that made it.
+        assert_eq!(
+            evaluate_display(
+                "function Foo() {}\n\
+                 var f = new Foo();\n\
+                 Foo.prototype = {};\n\
+                 f instanceof Foo"
+            ),
+            "false"
+        );
+    }
+
+    #[test]
+    fn instance_of_says_what_is_wrong_with_a_right_hand_side_it_cannot_use() {
+        // Three different messages for three different mistakes, all node's, word for word. The
+        // first two are the same mistake to a reader and a different one to the specification.
+        for (source, message) in [
+            (
+                "({}) instanceof {}",
+                "Right-hand side of 'instanceof' is not callable",
+            ),
+            (
+                "({}) instanceof 5",
+                "Right-hand side of 'instanceof' is not an object",
+            ),
+            (
+                "({}) instanceof null",
+                "Right-hand side of 'instanceof' is not an object",
+            ),
+            (
+                "({}) instanceof 'text'",
+                "Right-hand side of 'instanceof' is not an object",
+            ),
+        ] {
+            assert_eq!(
+                evaluate(source),
+                Err(RuntimeError::Type(message.to_owned())),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_primitive_answers_false_before_the_prototype_is_read_at_all() {
+        // The specification's order, and test262 checks it twice: this is the case where reading
+        // `prototype` would have thrown, and the other one is a getter that must not be called.
+        assert_eq!(
+            evaluate_display("function Foo() {} Foo.prototype = 5; 0 instanceof Foo"),
+            "false"
+        );
+        assert_eq!(
+            evaluate("function Foo() {} Foo.prototype = 5; ({}) instanceof Foo")
+                .expect_err("an object gets as far as the read"),
+            RuntimeError::Type(
+                "Function has non-object prototype '5' in instanceof check".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn instance_of_against_a_function_with_a_useless_prototype_says_which_prototype() {
+        // The value is printed the way node prints it in this message, which is bare rather than
+        // quoted for a number and quoted for a string.
+        for (prototype, shown) in [
+            ("5", "5"),
+            ("null", "null"),
+            ("'abc'", "abc"),
+            ("true", "true"),
+        ] {
+            assert_eq!(
+                evaluate(&format!(
+                    "function Foo() {{}} Foo.prototype = {prototype}; ({{}}) instanceof Foo"
+                )),
+                Err(RuntimeError::Type(format!(
+                    "Function has non-object prototype '{shown}' in instanceof check"
+                ))),
+                "{prototype}"
+            );
+        }
     }
 
     // The binary operators as functions, so that a table driven test can name one without writing
