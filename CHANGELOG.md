@@ -30,9 +30,20 @@ Nothing in the dispatch loop changed and the numbers say so: `property/prop_load
 
 ### Where the numbers stand
 
-The workload baseline for this release is measured against the released tarball in [tamnd/katsu-bench](https://github.com/tamnd/katsu-bench) rather than against a local build, so it lands after the tag rather than before it, and the table is quoted here in the pull request that follows this one. That is the same order 0.1.5 ended up in, and doing it deliberately this time avoids shipping two sets of absolutes for one release.
+`fib.js` from tamnd/katsu-bench, 25 runs of each runtime after 3 discarded, interleaved in one session on the same m4, timed by the workload's own `performance.now()` rather than by wall clock around the process. These are the figures from the published 0.1.6 baseline in that repository, measured against the released tarball rather than a local build, so they are the ones a reader can rerun.
 
-What can be said before it is measured is what moved and what cannot have. `fib` does not read properties and does not hang anything off a function, so neither piece of work in this release has anything to do there, and the microbenchmarks that do cover it are quoted above. Still one of six compute workloads running, and what stops the other five is unchanged: `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` wants a collector.
+| Runtime | fib(35) compute | Peak memory | Against katsu |
+|---|---:|---:|---|
+| katsu 0.1.6 | 875.16 ms | 2.70 MiB | |
+| node 26.7.0 | 53.38 ms | 46.34 MiB | 16.4x faster, 17.2x heavier |
+| bun 1.4.0 | 34.28 ms | 18.03 MiB | 25.5x faster, 6.7x heavier |
+| deno 2.9.6 | 56.54 ms | 36.06 MiB | 15.5x faster, 13.4x heavier |
+
+The ratio against bun went from 23.6x to 25.5x and this release is the one where that gets a straight answer rather than the usual sentence about the laptop. Two things are true at once. The session was slower for everybody, node by eight percent and deno by thirteen and bun by two, and katsu moved eleven, which is inside that band rather than outside it. And there is a mechanism this time, which is that a closure grew from sixteen bytes to twenty, so `fib` pays four bytes on each of the two functions it defines even though it hangs nothing off either of them. The gamingpc microbenchmarks put the call group inside noise across that change with one run of six showing three percent. A couple of points of the eleven are plausibly real and the rest is the machine.
+
+A head to head between the 0.1.5 and 0.1.6 release binaries was run to settle it and could not, because the laptop's load average went past 26 while it ran and `fib` under one binary varied between 2.4 and 5.9 seconds inside a single alternating sequence. That is published in the bench repository rather than left out, and it is the clearest argument yet for moving these numbers onto dedicated hardware.
+
+Memory is unchanged at 2.70 MiB against bun's 18.03, which answers the obvious worry about a release that made two heap objects bigger. `fib` allocates almost nothing either way, and the row that will actually test a bigger closure is the one that allocates in a loop, which is `alloc.js` and still does not run. Still one of six compute workloads running, and what stops the other five is unchanged: `alloc.js` and `sort.js` want `new`, `json.js` and `nbody.js` want array literals, and `strings.js` wants a collector.
 
 ### Where the conformance number stands
 
