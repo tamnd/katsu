@@ -29,7 +29,7 @@ katsu-stencils = { version = "0.1.8", path = "crates/katsu-stencils" }
 katsu-vm = { version = "0.1.8", path = "crates/katsu-vm" }
 
 # Frontend. See spec/04-frontend.md and open question Q9.
-oxc_allocator = "0.147.0"
+oxc_allocator = "0.148.0"
 oxc_ast = "0.147.0"
 oxc_parser = "0.147.0"
 oxc_resolver = "11.24.3"
