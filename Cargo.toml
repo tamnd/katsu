@@ -34,7 +34,7 @@ oxc_ast = "0.147.0"
 oxc_parser = "0.147.0"
 oxc_resolver = "11.24.3"
 oxc_semantic = "0.147.0"
-oxc_span = "0.147.0"
+oxc_span = "0.148.0"
 regress = "0.12.0"
 
 # Event loop. See spec/12-concurrency-and-io.md. libuv is not the contract, the phase ordering is.
