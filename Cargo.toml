@@ -33,7 +33,7 @@ oxc_allocator = "0.147.0"
 oxc_ast = "0.147.0"
 oxc_parser = "0.147.0"
 oxc_resolver = "11.24.3"
-oxc_semantic = "0.147.0"
+oxc_semantic = "0.148.0"
 oxc_span = "0.147.0"
 regress = "0.12.0"
 
