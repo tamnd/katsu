@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --all -- --check
 
   lint:
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   layers:
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       # The dependency direction in spec/03-architecture.md is a rule rather than a
       # suggestion, so it is a failing build rather than a paragraph nobody reads.
       - run: cargo run -p xtask -- layers
@@ -62,7 +62,7 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ${{ matrix.os }}
       - run: cargo test --workspace --all-features
@@ -95,7 +95,7 @@ jobs:
             args: -p katsu --features addons
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo check ${{ matrix.args }} --all-targets
 
   docs:
@@ -105,7 +105,7 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo doc --workspace --no-deps --all-features
 
   # The conformance ratchet from spec/14-quality-bar.md. It is here rather than on a nightly
@@ -121,8 +121,8 @@ jobs:
       SUITE: ac7b5f8c39c27b55176c20ead2a69b1402d0d1d3
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
-      - uses: actions/cache@v4.3.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/cache@v6.1.0
         id: suite
         with:
           path: vendor/test262
@@ -150,8 +150,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
-      - uses: actions/setup-node@v7.0.0
+      - uses: Swatinem/rust-cache@v2.9.3
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "26"
       - run: cargo run --release -p differential -- --count 2000 --seed 0
@@ -165,7 +165,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       # The same command the release runs, with the upload turned off. It checks the workspace
       # against what crates.io will accept, works out the order the crates go up in and asks the
       # registry which of them are already there, so the ordering code is exercised on every commit
@@ -193,7 +193,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: taiki-e/install-action@v2.87.0
+      - uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-deny
       - run: cargo deny check
@@ -205,7 +205,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo build --release -p katsu
       - name: Report binary size against the budget
         run: |
